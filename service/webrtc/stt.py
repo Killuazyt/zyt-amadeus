@@ -2,8 +2,33 @@ import logging
 import base64
 import json
 import numpy as np
+import urllib.error
 import urllib.request
 from openai import OpenAI
+
+
+def _to_mono_int16(audio_data: np.ndarray) -> np.ndarray:
+    """Normalize FastRTC audio frames into mono 16-bit PCM for WAV encoding."""
+    audio_array = np.asarray(audio_data)
+
+    if audio_array.ndim > 1:
+        if audio_array.shape[0] <= 2:
+            audio_array = audio_array.mean(axis=0)
+        else:
+            audio_array = audio_array.mean(axis=-1)
+
+    if np.issubdtype(audio_array.dtype, np.floating):
+        audio_array = np.nan_to_num(audio_array, nan=0.0, posinf=1.0, neginf=-1.0)
+        audio_array = np.clip(audio_array, -1.0, 1.0)
+        audio_array = (audio_array * 32767).astype(np.int16)
+    elif audio_array.dtype != np.int16:
+        audio_array = np.clip(
+            audio_array,
+            np.iinfo(np.int16).min,
+            np.iinfo(np.int16).max,
+        ).astype(np.int16)
+
+    return np.ascontiguousarray(audio_array)
 
 async def transcribe(
     audio: tuple[int, np.ndarray],
@@ -14,6 +39,7 @@ async def transcribe(
     """Transcribe audio using Whisper API."""
     try:
         sample_rate, audio_data = audio
+        pcm_audio = _to_mono_int16(audio_data)
 
         # Convert to WAV bytes
         import io
@@ -24,7 +50,7 @@ async def transcribe(
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
-            wf.writeframes(audio_data.tobytes())
+            wf.writeframes(pcm_audio.tobytes())
 
         audio_bytes.seek(0)
         audio_bytes.name = "audio.wav"
@@ -62,8 +88,13 @@ async def transcribe(
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=120) as response:
-                data = json.loads(response.read().decode("utf-8"))
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                logging.error("MiMo ASR HTTP %s: %s", e.code, error_body)
+                return ""
             return data["choices"][0]["message"]["content"].strip()
 
         client = OpenAI(api_key=api_key, base_url=base_url or None)

@@ -200,6 +200,10 @@ def echo(audio: tuple[int, np.ndarray], message: str, input_data: InputData):
     # STT
     prompt = run_async(transcribe, audio, whisper_config["api_key"], whisper_config["base_url"], whisper_config["model"])
     if not prompt:
+        yield AdditionalOutputs(json.dumps({
+            "type": "error",
+            "data": "Speech recognition failed. Please check the microphone and ASR configuration.",
+        }))
         return
 
     logging.info(f"STT: {prompt}")
@@ -246,9 +250,10 @@ def echo(audio: tuple[int, np.ndarray], message: str, input_data: InputData):
             yield chunk
 
 
-def startup_handler(webrtc_id: str):
-    session = get_user_session(webrtc_id)
-    yield AdditionalOutputs(json.dumps({"type": "connected", "data": webrtc_id}))
+def startup_handler(webrtc_id: str, input_data: InputData | None = None):
+    session_id = input_data.webrtc_id if input_data and input_data.webrtc_id else webrtc_id
+    get_user_session(session_id)
+    yield AdditionalOutputs(json.dumps({"type": "connected", "data": session_id}))
 
 
 # --- App setup ---
