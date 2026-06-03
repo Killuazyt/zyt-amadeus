@@ -85,12 +85,6 @@ export function useWebRTCChat() {
         remoteAudioRef.current = null
       }
     },
-    onWebrtcIdChange: (webrtcId) => {
-      sendConfigToServer(webrtcId).catch((err) => {
-        console.error('[WebRTC Chat] Config sync failed:', err)
-        toast.error('语音配置同步失败')
-      })
-    },
     onAudioStream: (stream) => {
       const audio = remoteAudioRef.current ?? new Audio()
       audio.autoplay = true
@@ -178,13 +172,16 @@ export function useWebRTCChat() {
 
   const connectVoice = useCallback(async () => {
     try {
-      await webrtc.connect()
+      const webrtcId = await webrtc.connect()
+      if (webrtcId) {
+        await sendConfigToServer(webrtcId)
+      }
     } catch (err) {
       console.error('[WebRTC Chat] Connect failed:', err)
       const message = err instanceof Error ? err.message : '语音连接失败'
       toast.error(message)
     }
-  }, [webrtc])
+  }, [sendConfigToServer, webrtc])
 
   const disconnectVoice = useCallback(() => {
     webrtc.disconnect()

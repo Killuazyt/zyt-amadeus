@@ -13,7 +13,7 @@ interface WebRTCState {
 }
 
 interface UseWebRTCReturn extends WebRTCState {
-  connect: () => Promise<void>
+  connect: () => Promise<string | null>
   disconnect: () => void
   toggleMicrophone: () => void
 }
@@ -65,7 +65,7 @@ class WebRTCClient {
     return true
   }
 
-  async connect() {
+  async connect(): Promise<string | null> {
     try {
       // Fetch ICE config from server
       const iceConfigResponse = await fetch(`${this.apiBaseUrl}/webrtc/ice-config`, {
@@ -116,11 +116,18 @@ class WebRTCClient {
         body: JSON.stringify({ sdp: offer.sdp, type: offer.type, webrtc_id: this.webrtcId }),
       })
       const serverResponse = await response.json()
+      if (!response.ok) {
+        throw new Error(serverResponse.error || `WebRTC offer failed: ${response.status}`)
+      }
+      if (!serverResponse?.sdp || !serverResponse?.type) {
+        throw new Error('WebRTC server returned an invalid SDP answer')
+      }
       await this.peerConnection.setRemoteDescription(serverResponse)
 
       // Connect to SSE event stream
       this.connectToEventStream()
       this.options.onConnected?.()
+      return this.webrtcId
     } catch (error) {
       this.disconnect()
       throw error
@@ -353,8 +360,9 @@ export function useWebRTC(options: WebRTCOptions = {}): UseWebRTCReturn {
   const connect = useCallback(async () => {
     if (webrtcRef.current) {
       setState(prev => ({ ...prev, error: null }))
-      await webrtcRef.current.connect()
+      return await webrtcRef.current.connect()
     }
+    return null
   }, [])
 
   const disconnect = useCallback(() => {

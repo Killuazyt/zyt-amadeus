@@ -19,9 +19,31 @@ app.post('/api/chat', chatHandler)
 
 const port = Number(process.env.PORT) || 3002
 const WEBRTC_API_URL = process.env.WEBRTC_API_URL || 'http://localhost:8001'
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'expect',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
 
 console.log(`Amadeus Service running on http://localhost:${port}`)
 console.log(`WebRTC API proxy: ${WEBRTC_API_URL}`)
+
+function readRequestBody(req: Parameters<typeof createServer>[0] extends (req: infer R, ...args: any[]) => any ? R : never) {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
 
 // Create HTTP server with proxy support
 const server = createServer(async (req, res) => {
@@ -45,15 +67,16 @@ const server = createServer(async (req, res) => {
     try {
       const headers: Record<string, string> = {}
       for (const [key, value] of Object.entries(req.headers)) {
-        if (value && typeof value === 'string') {
+        if (value && typeof value === 'string' && !HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
           headers[key] = value
         }
       }
+      const body = req.method !== 'GET' && req.method !== 'HEAD' ? await readRequestBody(req) : undefined
 
       const proxyRes = await fetch(targetUrl, {
         method: req.method,
         headers,
-        body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
+        body,
       })
 
       res.statusCode = proxyRes.status
@@ -71,7 +94,7 @@ const server = createServer(async (req, res) => {
       }
       res.end()
     } catch (err: any) {
-      console.error('Proxy error:', err.message)
+      console.error('Proxy error:', err.message, err.cause?.message || '')
       res.statusCode = 502
       res.end(JSON.stringify({ error: 'WebRTC service unavailable' }))
     }
