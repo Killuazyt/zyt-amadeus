@@ -1,0 +1,72 @@
+{
+  "app": {
+    "title": "Amadeus System",
+    "subtitle": "牧瀬紅莉栖"
+  },
+  "login": {
+    "title": "AMADEUS",
+    "subtitle": "SYSTEM ACCESS TERMINAL",
+    "username": "ユーザー識別",
+    "usernamePlaceholder": "名前を入力してください...",
+    "connect": "接続",
+    "tagline": "EL PSY CONGROO"
+  },
+  "chat": {
+    "inputPlaceholder": "メッセージを入力...",
+    "waiting": "待機中...",
+    "listening": "聞いています...",
+    "send": "送信",
+    "voice": "音声入力",
+    "noHistory": "会話履歴なし",
+    "clearHistory": "履歴をクリア",
+    "you": "You",
+    "amadeus": "Amadeus"
+  },
+  "toolbar": {
+    "connectVoice": "音声接続",
+    "disconnectVoice": "音声切断",
+    "mute": "ミュート",
+    "unmute": "ミュート解除",
+    "history": "会話履歴",
+    "settings": "設定"
+  },
+  "settings": {
+    "title": "SETTINGS",
+    "llm": "LLM 設定",
+    "tts": "TTS 設定",
+    "stt": "STT 設定",
+    "webrtc": "WebRTC 設定",
+    "language": "言語設定",
+    "personality": "人格設定",
+    "apiBaseUrl": "API Base URL",
+    "apiKey": "API Key",
+    "model": "Model",
+    "provider": "プロバイダー",
+    "customModel": "カスタムモデル",
+    "voiceId": "Voice ID",
+    "whisperModel": "Whisper Model",
+    "webrtcServer": "WebRTC Server",
+    "voiceLang": "音声出力言語",
+    "textLang": "テキスト出力言語",
+    "version": "AMADEUS SYSTEM v0.1.0"
+  },
+  "languages": {
+    "zh": "中文",
+    "en": "English",
+    "ja": "日本語"
+  },
+  "providers": {
+    "openai": "OpenAI",
+    "deepseek": "DeepSeek",
+    "mimo": "MiMo (Xiaomi)",
+    "custom": "カスタム"
+  },
+  "emotions": {
+    "normal": "通常",
+    "smile": "笑顔",
+    "blushing": "照れ",
+    "angry": "怒り",
+    "thinking": "考え中",
+    "sad": "悲しい"
+  }
+}

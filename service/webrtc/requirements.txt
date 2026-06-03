@@ -1,0 +1,7 @@
+openai>=1.0.0
+fastapi>=0.104.0
+python-dotenv>=1.0.0
+numpy
+fastrtc[vad,stt,tts]
+uvicorn
+pydantic
