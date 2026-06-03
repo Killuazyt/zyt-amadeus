@@ -1,9 +1,7 @@
-import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { chatHandler } from './chat'
 import { createServer } from 'http'
-import { createProxyMiddleware } from 'http-proxy-middleware'
 import 'dotenv/config'
 
 const app = new Hono()
@@ -38,7 +36,8 @@ const server = createServer(async (req, res) => {
     url.pathname.startsWith('/api/video-frame')
   ) {
     // Proxy to WebRTC service
-    const targetUrl = `${WEBRTC_API_URL}${req.url}`
+    const targetPath = `${url.pathname.replace(/^\/api/, '')}${url.search}`
+    const targetUrl = `${WEBRTC_API_URL}${targetPath}`
 
     try {
       const headers: Record<string, string> = {}

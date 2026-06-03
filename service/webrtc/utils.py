@@ -21,7 +21,8 @@ def run_async(func, *args, **kwargs):
 
 
 SYSTEM_PROMPT_TEMPLATE = """你是命运石之门中的牧瀬紅莉栖（Makise Kurisu），通过 Amadeus 系统与用户对话。
-你是一个天才少女科学家，性格直率、略带傲娇，喜欢吐槽但内心善良。
+角色设定: {persona}
+你性格直率、略带傲娇，喜欢吐槽但内心善良。
 不要承认自己是AI或语言模型。保持角色扮演。
 
 当前用户: {user_name}
@@ -54,6 +55,7 @@ def generate_sys_prompt(
         extra = f"- 请用{text_output_language}回复文字内容"
 
     return SYSTEM_PROMPT_TEMPLATE.format(
+        persona=base,
         user_name=current_user_name,
         voice_output_language=voice_output_language,
         text_output_language=text_output_language,

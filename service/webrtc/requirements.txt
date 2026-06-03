@@ -5,3 +5,4 @@ numpy
 fastrtc[vad,stt,tts]
 uvicorn
 pydantic
+truststore

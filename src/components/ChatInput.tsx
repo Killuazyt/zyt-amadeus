@@ -5,7 +5,12 @@ import { useChat } from '@/store/chatStore'
 import type { ChatMessage, Emotion } from '@/types/chat'
 import toast from 'react-hot-toast'
 
-export default function ChatInput() {
+interface Props {
+  isVoiceConnected?: boolean
+  onVoiceClick?: () => void | Promise<void>
+}
+
+export default function ChatInput({ isVoiceConnected = false, onVoiceClick }: Props) {
   const { t } = useTranslation()
   const [text, setText] = useState('')
   const {
@@ -155,10 +160,11 @@ export default function ChatInput() {
 
           <div className="flex items-center gap-2 shrink-0">
             <button
+              onClick={() => void onVoiceClick?.()}
               className="p-2 rounded-lg text-gray-400 hover:text-primary hover:bg-primary/10 transition-colors"
-              title={t('chat.voice')}
+              title={isVoiceConnected ? t('toolbar.disconnectVoice') : t('chat.voice')}
             >
-              <Mic size={18} />
+              <Mic size={18} className={isVoiceConnected ? 'text-primary' : ''} />
             </button>
             <button
               onClick={handleSend}

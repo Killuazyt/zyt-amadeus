@@ -8,14 +8,22 @@ import ChatHistory from '@/components/ChatHistory'
 import ConfigPanel from '@/components/ConfigPanel'
 import Toolbar from '@/components/Toolbar'
 import LoginOverlay from '@/components/LoginOverlay'
+import { useWebRTCChat } from '@/hooks/useWebRTCChat'
 
 export default function Home() {
   const { username, setUsername, emotion, motion } = useChat()
   const [historyOpen, setHistoryOpen] = useState(false)
   const [configOpen, setConfigOpen] = useState(false)
-  const [voiceConnected, setVoiceConnected] = useState(false)
-  const [micMuted, setMicMuted] = useState(false)
+  const voice = useWebRTCChat()
   const isLoggedIn = username !== null
+
+  async function toggleVoice() {
+    if (voice.isConnected) {
+      voice.disconnectVoice()
+    } else {
+      await voice.connectVoice()
+    }
+  }
 
   return (
     <div className="relative h-screen flex flex-col overflow-hidden">
@@ -33,13 +41,16 @@ export default function Home() {
           <Toolbar
             onOpenHistory={() => setHistoryOpen(true)}
             onOpenConfig={() => setConfigOpen(true)}
-            isConnected={voiceConnected}
-            isMicMuted={micMuted}
-            onToggleVoice={() => setVoiceConnected(!voiceConnected)}
-            onToggleMic={() => setMicMuted(!micMuted)}
+            isConnected={voice.isConnected}
+            isMicMuted={voice.isMicrophoneMuted}
+            onToggleVoice={toggleVoice}
+            onToggleMic={voice.toggleMicrophone}
           />
           <DialogBox />
-          <ChatInput />
+          <ChatInput
+            isVoiceConnected={voice.isConnected}
+            onVoiceClick={toggleVoice}
+          />
           <ChatHistory open={historyOpen} onClose={() => setHistoryOpen(false)} />
           <ConfigPanel open={configOpen} onClose={() => setConfigOpen(false)} />
         </>

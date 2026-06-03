@@ -9,10 +9,10 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "build:api": "cd ./service && pnpm build",
-    "start:api": "cd ./service && pnpm prod",
-    "build:electron": "pnpm build && pnpm build:api && electron-builder",
-    "start:electron": "pnpm build && pnpm build:api && electron electron/main.mjs"
+    "build:api": "npm --prefix ./service run build",
+    "start:api": "npm --prefix ./service run start",
+    "build:electron": "npm run build && npm run build:api && electron-builder",
+    "start:electron": "npm run build && npm run build:api && electron electron/main.mjs"
   },
   "dependencies": {
     "axios": "^1.7.7",
@@ -34,10 +34,14 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.2",
     "autoprefixer": "^10.4.20",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "eslint": "^9.11.1",
+    "globals": "^17.6.0",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.14",
     "typescript": "^5.5.3",
+    "typescript-eslint": "^8.60.1",
     "vite": "^5.4.8"
   },
   "main": "electron/main.mjs"

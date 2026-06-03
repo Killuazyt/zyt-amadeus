@@ -22,6 +22,8 @@ class InputData(BaseModel):
     whisper_base_url: Optional[str] = None
     whisper_model: Optional[str] = None
     ai_model: Optional[str] = None
+    tts_api_key: Optional[str] = None
+    tts_voice_id: Optional[str] = None
     voice_output_language: Optional[str] = "ja"
     text_output_language: Optional[str] = "zh"
     system_prompt: Optional[str] = None
@@ -111,6 +113,8 @@ async def use_builtin_service(data: BuiltinServiceRequest):
         whisper_base_url=os.environ.get("WHISPER_BASE_URL", ""),
         whisper_model=os.environ.get("WHISPER_MODEL", "whisper-1"),
         ai_model=data.ai_model or os.environ.get("LLM_MODEL", "gpt-4o"),
+        tts_api_key=os.environ.get("TTS_API_KEY", ""),
+        tts_voice_id=os.environ.get("TTS_VOICE_ID", ""),
         voice_output_language=data.voice_output_language or "ja",
         text_output_language=data.text_output_language or "zh",
         system_prompt=data.system_prompt or os.environ.get("SYSTEM_PROMPT", ""),

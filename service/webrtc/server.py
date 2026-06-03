@@ -5,6 +5,11 @@ Real-time voice conversation with AI via WebRTC
 
 import fastapi
 from fastapi.middleware.cors import CORSMiddleware
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 from fastrtc import ReplyOnPause, Stream, AdditionalOutputs
 import logging
 import time
@@ -60,6 +65,40 @@ rtc_configuration = {
         {"urls": "stun:stun.l.google.com:19302"},
     ]
 }
+
+
+def configure_silero_vad_download():
+    """Allow FastRTC's Silero VAD model to load in strict proxy environments."""
+    from pathlib import Path
+    import urllib.request
+    from fastrtc.pause_detection import silero
+
+    original_download = silero.SileroVADModel.download_model
+    default_path = Path(__file__).resolve().parent / "models" / "silero_vad.onnx"
+
+    @staticmethod
+    def download_model() -> str:
+        configured = os.getenv("SILERO_VAD_MODEL_PATH")
+        local_path = Path(configured) if configured else default_path
+
+        if local_path.exists():
+            return str(local_path)
+
+        try:
+            return original_download()
+        except Exception as exc:
+            logging.warning("Hugging Face VAD download failed, falling back to direct download: %s", exc)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(
+                "https://huggingface.co/freddyaboulton/silero-vad/resolve/main/silero_vad.onnx",
+                local_path,
+            )
+            return str(local_path)
+
+    silero.SileroVADModel.download_model = download_model
+
+
+configure_silero_vad_download()
 
 
 # --- Session management ---
@@ -137,6 +176,14 @@ def get_user_whisper_config(webrtc_id: str) -> dict:
     }
 
 
+def get_user_tts_config(webrtc_id: str) -> dict:
+    config = get_user_config(webrtc_id)
+    return {
+        "api_key": config.tts_api_key if config and config.tts_api_key else DEFAULT_TTS_API_KEY,
+        "voice_id": config.tts_voice_id if config and config.tts_voice_id else DEFAULT_TTS_VOICE_ID,
+    }
+
+
 # --- WebRTC handlers ---
 
 def echo(audio: tuple[int, np.ndarray], message: str, input_data: InputData):
@@ -180,9 +227,8 @@ def echo(audio: tuple[int, np.ndarray], message: str, input_data: InputData):
     session["messages"].append({"role": "assistant", "content": full_response})
 
     # TTS
-    tts_api_key = DEFAULT_TTS_API_KEY
-    voice_id = DEFAULT_TTS_VOICE_ID
-    for chunk in text_to_speech_stream(full_response, tts_api_key, voice_id):
+    tts_config = get_user_tts_config(input_data.webrtc_id)
+    for chunk in text_to_speech_stream(full_response, tts_config["api_key"], tts_config["voice_id"]):
         if chunk:
             yield chunk
 

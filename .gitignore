@@ -9,3 +9,4 @@ service/node_modules
 service/build
 service/webrtc/__pycache__
 service/webrtc/.env
+service/webrtc/models
