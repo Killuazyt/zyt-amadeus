@@ -23,15 +23,15 @@ interface AmadeusConfig {
 }
 
 const DEFAULT_CONFIG: AmadeusConfig = {
-  llmProvider: 'openai',
-  llmBaseUrl: 'https://api.openai.com/v1',
+  llmProvider: 'mimo',
+  llmBaseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
   llmApiKey: '',
-  llmModel: 'gpt-4o',
+  llmModel: 'mimo-v2.5-pro',
   whisperApiKey: '',
-  whisperBaseUrl: '',
-  whisperModel: 'whisper-1',
+  whisperBaseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+  whisperModel: 'mimo-v2.5-asr',
   ttsApiKey: '',
-  ttsVoiceId: '',
+  ttsVoiceId: '冰糖',
   webrtcUrl: 'http://localhost:8001',
   voiceOutputLanguage: 'ja',
   textOutputLanguage: 'zh',

@@ -22,6 +22,7 @@ from typing import Optional
 from openai import OpenAI
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from utils import run_async, generate_sys_prompt, generate_unique_user_id
 from ai import ai_stream, predict_emotion
@@ -29,16 +30,19 @@ from stt import transcribe
 from tts import text_to_speech_stream
 from routes import router, init_router, get_user_config, InputData
 
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 load_dotenv()
 
 # --- Default config ---
 DEFAULT_LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-DEFAULT_LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
-DEFAULT_WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
-DEFAULT_WHISPER_BASE_URL = os.getenv("WHISPER_BASE_URL", "")
-DEFAULT_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
-DEFAULT_TTS_API_KEY = os.getenv("TTS_API_KEY", "")
+DEFAULT_LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")
+DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "mimo-v2.5-pro")
+DEFAULT_WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", DEFAULT_LLM_API_KEY)
+DEFAULT_WHISPER_BASE_URL = os.getenv("WHISPER_BASE_URL", DEFAULT_LLM_BASE_URL)
+DEFAULT_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "mimo-v2.5-asr")
+DEFAULT_TTS_API_KEY = os.getenv("TTS_API_KEY", DEFAULT_LLM_API_KEY)
+DEFAULT_TTS_BASE_URL = os.getenv("TTS_BASE_URL", DEFAULT_LLM_BASE_URL)
+DEFAULT_TTS_MODEL = os.getenv("TTS_MODEL", "mimo-v2.5-tts")
 DEFAULT_TTS_VOICE_ID = os.getenv("TTS_VOICE_ID", "")
 DEFAULT_MEM0_API_KEY = os.getenv("MEM0_API_KEY", "")
 DEFAULT_TIME_LIMIT = int(os.getenv("TIME_LIMIT", "600"))
@@ -158,7 +162,8 @@ def get_user_openai_client(webrtc_id: str) -> OpenAI:
         config = get_user_config(webrtc_id)
         api_key = config.llm_api_key if config and config.llm_api_key else DEFAULT_LLM_API_KEY
         base_url = config.llm_base_url if config and config.llm_base_url else DEFAULT_LLM_BASE_URL
-        openai_clients[webrtc_id] = OpenAI(api_key=api_key, base_url=base_url)
+        default_headers = {"api-key": api_key} if "xiaomimimo.com" in base_url else None
+        openai_clients[webrtc_id] = OpenAI(api_key=api_key, base_url=base_url, default_headers=default_headers)
     return openai_clients[webrtc_id]
 
 
@@ -180,6 +185,8 @@ def get_user_tts_config(webrtc_id: str) -> dict:
     config = get_user_config(webrtc_id)
     return {
         "api_key": config.tts_api_key if config and config.tts_api_key else DEFAULT_TTS_API_KEY,
+        "base_url": config.llm_base_url if config and config.llm_base_url else DEFAULT_TTS_BASE_URL,
+        "model": DEFAULT_TTS_MODEL,
         "voice_id": config.tts_voice_id if config and config.tts_voice_id else DEFAULT_TTS_VOICE_ID,
     }
 
@@ -228,7 +235,13 @@ def echo(audio: tuple[int, np.ndarray], message: str, input_data: InputData):
 
     # TTS
     tts_config = get_user_tts_config(input_data.webrtc_id)
-    for chunk in text_to_speech_stream(full_response, tts_config["api_key"], tts_config["voice_id"]):
+    for chunk in text_to_speech_stream(
+        full_response,
+        tts_config["api_key"],
+        tts_config["voice_id"],
+        tts_config["model"],
+        tts_config["base_url"],
+    ):
         if chunk:
             yield chunk
 
@@ -306,7 +319,8 @@ def handle_config_update(webrtc_id, message, data):
         if webrtc_id in openai_clients and (data.llm_api_key or data.llm_base_url):
             api_key = data.llm_api_key or DEFAULT_LLM_API_KEY
             base_url = data.llm_base_url or DEFAULT_LLM_BASE_URL
-            openai_clients[webrtc_id] = OpenAI(api_key=api_key, base_url=base_url)
+            default_headers = {"api-key": api_key} if "xiaomimimo.com" in base_url else None
+            openai_clients[webrtc_id] = OpenAI(api_key=api_key, base_url=base_url, default_headers=default_headers)
 
 
 init_router(stream, rtc_configuration, handle_config_update)

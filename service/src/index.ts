@@ -2,7 +2,10 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { chatHandler } from './chat'
 import { createServer } from 'http'
-import 'dotenv/config'
+import { config as loadEnv } from 'dotenv'
+
+loadEnv()
+loadEnv({ path: '../.env' })
 
 const app = new Hono()
 
