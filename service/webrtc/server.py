@@ -260,8 +260,20 @@ def echo(audio: tuple[int, np.ndarray], input_data: InputData | None = None):
             yield chunk
 
 
-def startup_handler(webrtc_id: str, input_data: InputData | None = None):
-    session_id = input_data.webrtc_id if input_data and input_data.webrtc_id else webrtc_id
+def startup_handler(input_data: InputData | str | None = None):
+    if isinstance(input_data, InputData):
+        session_id = input_data.webrtc_id
+    else:
+        session_id = input_data
+
+    if not session_id:
+        logging.warning("WebRTC startup called before voice config was available")
+        yield AdditionalOutputs(json.dumps({
+            "type": "error",
+            "data": "Voice configuration is missing. Please reconnect voice.",
+        }))
+        return
+
     get_user_session(session_id)
     yield AdditionalOutputs(json.dumps({"type": "connected", "data": session_id}))
 
