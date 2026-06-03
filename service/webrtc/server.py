@@ -11,6 +11,7 @@ try:
 except ImportError:
     pass
 from fastrtc import ReplyOnPause, Stream, AdditionalOutputs
+from fastrtc.reply_on_pause import AlgoOptions
 import logging
 import time
 import asyncio
@@ -193,7 +194,16 @@ def get_user_tts_config(webrtc_id: str) -> dict:
 
 # --- WebRTC handlers ---
 
-def echo(audio: tuple[int, np.ndarray], message: str, input_data: InputData):
+def echo(audio: tuple[int, np.ndarray], input_data: InputData | None = None):
+    if input_data is None:
+        logging.error("WebRTC input config is missing; cannot process speech")
+        yield AdditionalOutputs(json.dumps({
+            "type": "error",
+            "data": "Voice configuration is missing. Please reconnect voice.",
+        }))
+        return
+
+    logging.info("Voice pause detected for WebRTC session: %s", input_data.webrtc_id)
     session = get_user_session(input_data.webrtc_id)
     whisper_config = get_user_whisper_config(input_data.webrtc_id)
 
@@ -261,6 +271,12 @@ def startup_handler(webrtc_id: str, input_data: InputData | None = None):
 reply_handler = ReplyOnPause(
     echo,
     startup_fn=startup_handler,
+    algo_options=AlgoOptions(
+        audio_chunk_duration=0.5,
+        started_talking_threshold=0.05,
+        speech_threshold=0.03,
+        max_continuous_speech_s=8,
+    ),
     can_interrupt=True,
 )
 

@@ -99,7 +99,7 @@ async def input_hook(data: InputData):
     user_configs[data.webrtc_id] = data
     if handle_config_update:
         handle_config_update(data.webrtc_id, "config_updated", data)
-    stream.set_input(data.webrtc_id, "config_updated", data)
+    stream.set_input(data.webrtc_id, data)
     return {"status": "success"}
 
 
@@ -123,5 +123,5 @@ async def use_builtin_service(data: BuiltinServiceRequest):
     user_configs[data.webrtc_id] = built_in_config
     if handle_config_update:
         handle_config_update(data.webrtc_id, "config_updated", built_in_config)
-    stream.set_input(data.webrtc_id, "config_updated", built_in_config)
+    stream.set_input(data.webrtc_id, built_in_config)
     return {"status": "success"}
