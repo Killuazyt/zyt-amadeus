@@ -37,12 +37,16 @@ def main() -> int:
 
     paths = AppPaths.for_current_user(args.local_app_data)
     paths.initialize()
-    SettingsRepository(paths.settings_file).load_or_create()
+    repository = SettingsRepository(paths.settings_file)
+    settings = repository.load_or_create()
     logger = configure_logging(paths.log_file, logger_name=f"amadeus.test.{args.instance_name}")
     controller = ApplicationController(
         application,
         instance,
         logger,
+        paths=paths,
+        settings_repository=repository,
+        settings=settings,
         tray_available=False,
     )
 

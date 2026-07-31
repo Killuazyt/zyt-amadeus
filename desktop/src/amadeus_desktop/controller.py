@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QScreen
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
+from amadeus_desktop.paths import AppDirectory, AppPaths
+from amadeus_desktop.pet_assets import PetAssetService
+from amadeus_desktop.pet_models import PetPosition
+from amadeus_desktop.pet_position import (
+    ScreenGeometry,
+    capture_position,
+    clamp_top_left,
+    nearest_screen,
+    restore_top_left,
+    screen_geometry,
+)
+from amadeus_desktop.settings import SettingsError, SettingsRepository
 from amadeus_desktop.single_instance import SingleInstance
 from amadeus_desktop.ui.control_window import ControlWindow
+from amadeus_desktop.ui.pet_window import PetWindow
 from amadeus_desktop.ui.tray import TrayController
 
 
@@ -20,47 +36,136 @@ class ApplicationController:
         instance_guard: SingleInstance,
         logger: logging.Logger,
         *,
+        paths: AppPaths,
+        settings_repository: SettingsRepository,
+        settings: dict[str, Any],
         tray_available: bool | None = None,
         status_message: str | None = None,
     ) -> None:
         self.application = application
         self.instance_guard = instance_guard
         self.logger = logger
+        self.paths = paths
+        self.settings_repository = settings_repository
+        self.settings = settings
         self._exiting = False
+        self._restore_scheduled = False
 
         if tray_available is None:
             tray_available = QSystemTrayIcon.isSystemTrayAvailable()
         self.tray_available = tray_available
+
+        pet_settings = settings["pet"]
+        service = PetAssetService(paths.directory(AppDirectory.PETS))
+        asset = service.load_active(pet_settings["active_pet_id"])
+        if asset.is_fallback:
+            logger.warning("Configured pet unavailable; using bundled fallback")
+            fallback_message = "当前桌宠资源不可用，已安全回退到内置通用宠物。"
+            status_message = (
+                f"{status_message}\n{fallback_message}" if status_message else fallback_message
+            )
+        self.pet_window = PetWindow(asset, scale_percent=pet_settings["scale_percent"])
+        self.pet_window.drag_finished.connect(self._on_pet_drag_finished)
+        self._restore_pet_position()
 
         self.window = ControlWindow(
             tray_available=tray_available,
             status_message=status_message,
         )
         self.window.exit_requested.connect(self.request_exit)
-        self.instance_guard.activation_requested.connect(self.show_control_window)
+        self.instance_guard.activation_requested.connect(self.show_pet)
 
         self.tray: TrayController | None = None
         if tray_available:
             self.tray = TrayController()
-            self.tray.toggle_requested.connect(self.toggle_control_window)
-            self.tray.show_requested.connect(self.show_control_window)
+            self.tray.toggle_requested.connect(self.toggle_pet)
+            self.tray.show_requested.connect(self.show_pet)
             self.tray.exit_requested.connect(self.request_exit)
-            self.window.visibility_changed.connect(self.tray.set_control_visible)
+            self.pet_window.visibility_changed.connect(self.tray.set_pet_visible)
             self.tray.show()
             self.window.hide()
+            self.pet_window.show_without_activate()
         else:
+            self.pet_window.show_without_activate()
             self.window.show_and_activate()
+
+        self.application.screenAdded.connect(self._on_screen_added)
+        self.application.screenRemoved.connect(self._on_screen_removed)
+        for screen in self.application.screens():
+            self._connect_screen(screen)
 
         self.application.aboutToQuit.connect(self._cleanup)
 
     def show_control_window(self) -> None:
         self.window.show_and_activate()
 
-    def toggle_control_window(self) -> None:
-        if self.window.isVisible():
-            self.window.hide()
+    def show_pet(self) -> None:
+        self._ensure_pet_visible()
+        self.pet_window.show_without_activate()
+
+    def toggle_pet(self) -> None:
+        if self.pet_window.isVisible():
+            self.pet_window.hide()
         else:
-            self.show_control_window()
+            self.show_pet()
+
+    def _screen_geometries(self) -> list[ScreenGeometry]:
+        primary = self.application.primaryScreen()
+        return [
+            screen_geometry(screen, primary=screen is primary)
+            for screen in self.application.screens()
+        ]
+
+    def _restore_pet_position(self) -> None:
+        position = PetPosition.from_document(self.settings["pet"].get("position"))
+        point = restore_top_left(position, self.pet_window.size(), self._screen_geometries())
+        self.pet_window.move(point)
+
+    def _ensure_pet_visible(self) -> None:
+        screens = self._screen_geometries()
+        if not screens:
+            return
+        center = self.pet_window.geometry().center()
+        target = nearest_screen(center, screens)
+        point = clamp_top_left(self.pet_window.pos(), self.pet_window.size(), target.available)
+        self.pet_window.move(point)
+
+    def _on_pet_drag_finished(self) -> None:
+        screens = self._screen_geometries()
+        if not screens:
+            return
+        target = nearest_screen(self.pet_window.geometry().center(), screens)
+        point = clamp_top_left(self.pet_window.pos(), self.pet_window.size(), target.available)
+        self.pet_window.move(point)
+        position = capture_position(point, self.pet_window.size(), target)
+        self.settings["pet"]["position"] = position.to_document()
+        try:
+            self.settings_repository.save(self.settings)
+        except SettingsError as exc:
+            self.logger.warning("Pet position could not be saved error_type=%s", type(exc).__name__)
+
+    def _connect_screen(self, screen: QScreen) -> None:
+        screen.geometryChanged.connect(self._schedule_restore)
+        screen.availableGeometryChanged.connect(self._schedule_restore)
+        screen.logicalDotsPerInchChanged.connect(self._schedule_restore)
+
+    def _on_screen_added(self, screen: QScreen) -> None:
+        self._connect_screen(screen)
+        self._schedule_restore()
+
+    def _on_screen_removed(self, screen: QScreen) -> None:
+        del screen
+        self._schedule_restore()
+
+    def _schedule_restore(self) -> None:
+        if self._restore_scheduled:
+            return
+        self._restore_scheduled = True
+        QTimer.singleShot(0, self._apply_scheduled_restore)
+
+    def _apply_scheduled_restore(self) -> None:
+        self._restore_scheduled = False
+        self._restore_pet_position()
 
     def request_exit(self) -> None:
         if self._exiting:
@@ -69,6 +174,7 @@ class ApplicationController:
         self.logger.info("Application exit requested")
         self.window.prepare_to_exit()
         self.window.hide()
+        self.pet_window.hide()
         if self.tray is not None:
             self.tray.hide()
         self.instance_guard.close()
@@ -79,4 +185,5 @@ class ApplicationController:
             self._exiting = True
             if self.tray is not None:
                 self.tray.hide()
+            self.pet_window.hide()
             self.instance_guard.close()

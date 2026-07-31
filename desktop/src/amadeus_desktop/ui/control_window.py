@@ -19,10 +19,10 @@ class ControlWindow(QWidget):
         self.setWindowTitle("Amadeus")
         self.setMinimumSize(360, 180)
 
-        title = QLabel("Amadeus 桌面应用基础")
+        title = QLabel("Amadeus 桌宠控制")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
 
-        status = QLabel(status_message or "P1 基础进程正在运行。桌宠与聊天将在后续阶段实现。")
+        status = QLabel(status_message or "P2 桌宠动作引擎正在运行。文字聊天将在 P3 实现。")
         status.setWordWrap(True)
 
         self.hide_button = QPushButton("隐藏窗口")

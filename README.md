@@ -2,7 +2,7 @@
 
 Amadeus is being rebuilt as a Windows 10/11 x64 desktop pet using Python 3.11 and PySide6. The active MVP uses one local desktop process and does not require Electron, Node, a browser UI, a local HTTP service, or WebRTC.
 
-The current `rewrite/desktop-pet-mvp` branch contains the completed P1 application foundation only: application lifecycle, local single-instance IPC, a minimal system tray, versioned local settings, local paths, and redacted rotating logs. Desktop-pet rendering, chat, model access, memory, and speech are not part of this foundation yet.
+The current `rewrite/desktop-pet-mvp` branch contains the P1 application foundation and the P2 desktop-pet engine: safe local resource import, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, a CC0 placeholder pet, and tray visibility controls. Chat, model access, memory, and speech are not implemented yet.
 
 ## Development
 
@@ -22,7 +22,7 @@ The module entry point is:
 .\desktop\.venv\Scripts\python.exe -m amadeus_desktop
 ```
 
-Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. P1 does not accept or store API credentials.
+Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. P2 does not accept or store API credentials.
 
 ## Repository history
 

@@ -36,7 +36,7 @@ class TrayController(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._menu = QMenu()
-        self.toggle_action = self._menu.addAction("显示控制窗口")
+        self.toggle_action = self._menu.addAction("隐藏宠物")
         self._menu.addSeparator()
         self.exit_action = self._menu.addAction("退出")
 
@@ -58,8 +58,8 @@ class TrayController(QObject):
     def hide(self) -> None:
         self._tray.hide()
 
-    def set_control_visible(self, visible: bool) -> None:
-        self.toggle_action.setText("隐藏控制窗口" if visible else "显示控制窗口")
+    def set_pet_visible(self, visible: bool) -> None:
+        self.toggle_action.setText("隐藏宠物" if visible else "显示宠物")
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:

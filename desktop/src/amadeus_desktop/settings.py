@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
+
+_SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "schema_version": CURRENT_SCHEMA_VERSION,
     "ui": {
         "language": "zh-CN",
+    },
+    "pet": {
+        "active_pet_id": "builtin-amadeus",
+        "scale_percent": 100,
+        "position": None,
     },
 }
 
@@ -61,8 +69,16 @@ def _migrate_v0_to_v1(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v1_to_v2(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 2
+    migrated.setdefault("pet", deepcopy(DEFAULT_SETTINGS["pet"]))
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
+    1: _migrate_v1_to_v2,
 }
 
 
@@ -154,6 +170,35 @@ class SettingsRepository:
         language = ui.get("language")
         if not isinstance(language, str) or not language.strip():
             raise InvalidSettingsError("ui.language must be a non-empty string.")
+
+        pet = settings.get("pet")
+        if not isinstance(pet, Mapping):
+            raise InvalidSettingsError("The pet settings section must be an object.")
+        pet_id = pet.get("active_pet_id")
+        if not isinstance(pet_id, str) or _SAFE_PET_ID.fullmatch(pet_id) is None:
+            raise InvalidSettingsError("pet.active_pet_id is invalid.")
+        scale = pet.get("scale_percent")
+        if isinstance(scale, bool) or not isinstance(scale, int) or not 50 <= scale <= 200:
+            raise InvalidSettingsError("pet.scale_percent must be between 50 and 200.")
+        position = pet.get("position")
+        if position is not None:
+            cls._validate_pet_position(position)
+
+    @staticmethod
+    def _validate_pet_position(position: Any) -> None:
+        if not isinstance(position, Mapping):
+            raise InvalidSettingsError("pet.position must be null or an object.")
+        if set(position) != {"screen_id", "x_ratio", "y_ratio"}:
+            raise InvalidSettingsError("pet.position contains unsupported fields.")
+        screen_id = position.get("screen_id")
+        if not isinstance(screen_id, str) or not screen_id.strip():
+            raise InvalidSettingsError("pet.position.screen_id must be a non-empty string.")
+        for key in ("x_ratio", "y_ratio"):
+            value = position.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise InvalidSettingsError(f"pet.position.{key} must be numeric.")
+            if not 0.0 <= float(value) <= 1.0:
+                raise InvalidSettingsError(f"pet.position.{key} must be between 0 and 1.")
 
     @classmethod
     def _reject_sensitive_keys(cls, value: Any) -> None:

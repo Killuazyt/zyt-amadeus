@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amadeus-desktop"
-version = "0.1.0.dev1"
-description = "Windows desktop foundation for the Amadeus companion application"
+version = "0.2.0.dev2"
+description = "Windows desktop-pet window and sprite engine for the Amadeus companion"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -26,9 +26,21 @@ dev = [
 
 [project.scripts]
 amadeus-desktop = "amadeus_desktop.__main__:main"
+amadeus-pet-import = "amadeus_desktop.tools.pet_import:main"
+amadeus-pet-preview = "amadeus_desktop.tools.pet_preview:main"
+amadeus-pet-acceptance = "amadeus_desktop.tools.pet_acceptance:main"
+amadeus-pet-snapshot = "amadeus_desktop.tools.pet_snapshot:main"
+amadeus-pet-runtime-probe = "amadeus_desktop.tools.pet_runtime_probe:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+amadeus_desktop = [
+    "resources/builtin_pet/*.json",
+    "resources/builtin_pet/*.png",
+    "resources/builtin_pet/*.txt",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
