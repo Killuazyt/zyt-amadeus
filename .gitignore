@@ -1,29 +1,21 @@
-node_modules
-dist
-build
-.env
-*.log
-.DS_Store
-Thumbs.db
-service/node_modules
-service/build
-service/webrtc/__pycache__
-service/webrtc/.env
-service/webrtc/models
-
-# Python desktop application
+# Python
 __pycache__/
 *.py[cod]
+.venv/
 desktop/.venv/
-desktop/.pytest_cache/
-desktop/.ruff_cache/
-desktop/.pip-tools-cache/
-desktop/.coverage
-desktop/htmlcov/
-desktop/build/
-desktop/dist/
-desktop/*.egg-info/
-desktop/src/*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.pip-tools-cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Secrets and local runtime output
+.env
+.env.*
+*.log
 
 # Local desktop data and imported/private assets
 desktop/local-data/
@@ -34,8 +26,15 @@ desktop/backups/
 desktop/models/
 desktop/pets/
 desktop/personas/
+desktop/imports/
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
