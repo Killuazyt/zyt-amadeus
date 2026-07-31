@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=75,<82", "wheel>=0.45,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amadeus-desktop"
+version = "0.1.0.dev1"
+description = "Windows desktop foundation for the Amadeus companion application"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "PySide6>=6.8,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2,<2",
+    "pip>=24,<26",
+    "pip-tools>=7.4,<8",
+    "pytest>=8.3,<10",
+    "pytest-qt>=4.4,<5",
+    "ruff>=0.9,<1",
+    "setuptools>=75,<82",
+    "wheel>=0.45,<1",
+]
+
+[project.scripts]
+amadeus-desktop = "amadeus_desktop.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+qt_api = "pyside6"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]

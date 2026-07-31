@@ -10,3 +10,32 @@ service/build
 service/webrtc/__pycache__
 service/webrtc/.env
 service/webrtc/models
+
+# Python desktop application
+__pycache__/
+*.py[cod]
+desktop/.venv/
+desktop/.pytest_cache/
+desktop/.ruff_cache/
+desktop/.pip-tools-cache/
+desktop/.coverage
+desktop/htmlcov/
+desktop/build/
+desktop/dist/
+desktop/*.egg-info/
+desktop/src/*.egg-info/
+
+# Local desktop data and imported/private assets
+desktop/local-data/
+desktop/config/
+desktop/data/
+desktop/logs/
+desktop/backups/
+desktop/models/
+desktop/pets/
+desktop/personas/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
