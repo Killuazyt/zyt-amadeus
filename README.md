@@ -2,9 +2,9 @@
 
 Amadeus is being rebuilt as a Windows 10/11 x64 desktop pet using Python 3.11 and PySide6. The active MVP uses one local desktop process and does not require Electron, Node, a browser UI, a local HTTP service, or WebRTC.
 
-The current `rewrite/desktop-pet-mvp` branch contains the P1 application foundation, the P2 desktop-pet engine, the P3 attached chat flow, the P4 secure text-model integration, and P5A local conversations plus auditable keyword memory. The pet supports safe local resource import, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, tray visibility controls, and a compact cancellable streaming chat panel.
+The canonical `main` branch contains the P1 application foundation, the P2 desktop-pet engine, the P3 attached chat flow, the P4 secure text-model integration, and the current P5A implementation of local conversations plus auditable keyword memory. The pet supports safe local resource import, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, tray visibility controls, and a compact cancellable streaming chat panel.
 
-P4 supports DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom OpenAI-compatible HTTPS endpoint. API credentials are stored only in Windows Credential Manager. P5A persists chat history and versioned user memories in a local SQLite database, provides safe Chinese FTS5 recall, and exposes model, history, and memory management pages. Offline embeddings, hybrid/vector recall, role knowledge, speech, screen observation, tool execution, and autonomous desktop actions are not included yet.
+P4 supports DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom OpenAI-compatible HTTPS endpoint. API credentials are stored only in Windows Credential Manager. P5A persists chat history and versioned user memories in a local SQLite database, provides safe Chinese FTS5 recall, and exposes model, history, and memory management pages. P5B has not started. Offline embeddings, hybrid/vector recall, role knowledge, speech, screen observation, tool execution, and autonomous desktop actions are not included yet.
 
 ## Development
 
@@ -28,4 +28,6 @@ Runtime data is stored under `%LOCALAPPDATA%\Amadeus`; P5A creates `data\amadeus
 
 ## Repository history
 
-The legacy browser/Electron/voice implementation remains available on the preserved `main` and `codex/fix-project-handoff` branches. The rewrite branch is intentionally clean and Python-only; rollback branches must not be force-pushed or deleted.
+`main` is the only supported development and release branch. After each explicitly requested phase passes its local acceptance gate, its reviewable commit is pushed directly to `main` and the matching `Desktop CI` run is verified before work proceeds.
+
+The immutable annotated tags `archive/legacy-main-44d1270` and `archive/legacy-web-voice-handoff-3ff9486` preserve the two legacy browser/Electron/voice rollback points. Restore work starts from one of those tags and returns through a normal commit on `main`; repository history and archive tags must not be rewritten or force-pushed.

@@ -3,12 +3,14 @@ name: Desktop CI
 on:
   workflow_dispatch:
   pull_request:
+    branches: [main]
     paths:
       - "desktop/**"
       - "README.md"
       - ".gitignore"
       - ".github/workflows/desktop-ci.yml"
   push:
+    branches: [main]
     paths:
       - "desktop/**"
       - "README.md"
