@@ -1,0 +1,1058 @@
+"""Transactional conversation, summary, and resumable-job repositories."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
+from uuid import uuid4
+
+from amadeus_desktop.database import SQLiteDatabase
+from amadeus_desktop.storage_models import (
+    DEFAULT_PROFILE_ID,
+    BackgroundJob,
+    BackgroundJobStatus,
+    Conversation,
+    ConversationStatus,
+    ConversationSummary,
+    MessagePage,
+    Profile,
+    StorageConflictError,
+    StorageNotFoundError,
+    StorageValidationError,
+    StoredMessage,
+    StoredMessageRole,
+    StoredMessageStatus,
+    SummaryProgress,
+    decode_utc,
+    encode_utc,
+    utc_now,
+)
+
+Clock = Callable[[], datetime]
+IdFactory = Callable[[], str]
+
+
+class ConversationStore:
+    """Synchronous repository to be called from the application's data thread."""
+
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        clock: Clock = utc_now,
+        id_factory: IdFactory | None = None,
+    ) -> None:
+        self._database = database
+        self._clock = clock
+        self._id_factory = id_factory or (lambda: uuid4().hex)
+
+    def ensure_default_profile(self, display_name: str = "用户") -> Profile:
+        return self.create_profile(
+            display_name=display_name,
+            profile_id=DEFAULT_PROFILE_ID,
+            if_missing=True,
+        )
+
+    def create_profile(
+        self,
+        display_name: str,
+        *,
+        profile_id: str | None = None,
+        if_missing: bool = False,
+    ) -> Profile:
+        profile_id = _required_identifier(profile_id or self._id_factory(), "profile_id")
+        display_name = _required_text(display_name, "display_name")
+        now = encode_utc(self._clock())
+        try:
+            with self._database.transaction() as connection:
+                if if_missing:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO profiles(id, display_name, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (profile_id, display_name, now, now),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO profiles(id, display_name, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (profile_id, display_name, now, now),
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("profile ID already exists") from exc
+        return self.get_profile(profile_id)
+
+    def get_profile(self, profile_id: str = DEFAULT_PROFILE_ID) -> Profile:
+        row = self._database.connection.execute(
+            "SELECT * FROM profiles WHERE id = ?", (profile_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageNotFoundError("profile does not exist")
+        return _profile_from_row(row)
+
+    def create_conversation(
+        self,
+        title: str = "新对话",
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        conversation_id: str | None = None,
+    ) -> Conversation:
+        if profile_id == DEFAULT_PROFILE_ID:
+            self.ensure_default_profile()
+        else:
+            self.get_profile(profile_id)
+        conversation_id = _required_identifier(
+            conversation_id or self._id_factory(), "conversation_id"
+        )
+        title = _required_text(title, "title")
+        now = encode_utc(self._clock())
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO conversations(
+                        id, profile_id, title, status, created_at, updated_at, last_activity_at
+                    ) VALUES (?, ?, ?, 'normal', ?, ?, ?)
+                    """,
+                    (conversation_id, profile_id, title, now, now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("conversation ID already exists") from exc
+        return self.get_conversation(conversation_id)
+
+    def get_or_create_active_conversation(
+        self, profile_id: str = DEFAULT_PROFILE_ID
+    ) -> Conversation:
+        if profile_id == DEFAULT_PROFILE_ID:
+            self.ensure_default_profile()
+        row = self._database.connection.execute(
+            """
+            SELECT * FROM conversations
+            WHERE profile_id = ? AND status = 'normal'
+            ORDER BY last_activity_at DESC, id DESC
+            LIMIT 1
+            """,
+            (profile_id,),
+        ).fetchone()
+        if row is None:
+            return self.create_conversation(profile_id=profile_id)
+        return _conversation_from_row(row)
+
+    def get_conversation(self, conversation_id: str) -> Conversation:
+        row = self._database.connection.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageNotFoundError("conversation does not exist")
+        return _conversation_from_row(row)
+
+    def list_conversations(
+        self,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        *,
+        include_archived: bool = False,
+        limit: int = 200,
+    ) -> tuple[Conversation, ...]:
+        _validate_limit(limit, maximum=1_000)
+        status_clause = "" if include_archived else "AND status = 'normal'"
+        rows = self._database.connection.execute(
+            f"""
+            SELECT * FROM conversations
+            WHERE profile_id = ? {status_clause}
+            ORDER BY last_activity_at DESC, id DESC
+            LIMIT ?
+            """,
+            (profile_id, limit),
+        ).fetchall()
+        return tuple(_conversation_from_row(row) for row in rows)
+
+    def rename_conversation(self, conversation_id: str, title: str) -> Conversation:
+        title = _required_text(title, "title")
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now, conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageNotFoundError("conversation does not exist")
+        return self.get_conversation(conversation_id)
+
+    def set_conversation_archived(self, conversation_id: str, archived: bool) -> Conversation:
+        now = encode_utc(self._clock())
+        status = ConversationStatus.ARCHIVED if archived else ConversationStatus.NORMAL
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET status = ?, updated_at = ? WHERE id = ?",
+                (status.value, now, conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageNotFoundError("conversation does not exist")
+        return self.get_conversation(conversation_id)
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete message bodies; memory source IDs survive as tombstones."""
+
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM conversations WHERE id = ?", (conversation_id,)
+            )
+        if cursor.rowcount == 1:
+            self._database.purge_deleted_content()
+        return cursor.rowcount == 1
+
+    def clear_conversations(self, profile_id: str = DEFAULT_PROFILE_ID) -> int:
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM conversations WHERE profile_id = ?", (profile_id,)
+            )
+        deleted = max(0, cursor.rowcount)
+        if deleted:
+            self._database.purge_deleted_content()
+        return deleted
+
+    def save_user_message(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        message_id: str,
+        content: str,
+        *,
+        created_at: datetime | None = None,
+        participates_in_memory: bool = True,
+    ) -> StoredMessage:
+        return self._insert_message(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            message_id=message_id,
+            role=StoredMessageRole.USER,
+            content=_required_text(content, "content", strip=False),
+            status=StoredMessageStatus.COMPLETED,
+            attempt=1,
+            created_at=created_at,
+            completed=True,
+            participates_in_memory=participates_in_memory,
+        )
+
+    def save_turn(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        user_message_id: str,
+        user_content: str,
+        assistant_message_id: str,
+        *,
+        attempt: int = 1,
+        participates_in_memory: bool = True,
+        created_at: datetime | None = None,
+    ) -> tuple[StoredMessage, StoredMessage]:
+        """Atomically commit a user message and its stable assistant placeholder."""
+
+        _required_identifier(turn_id, "turn_id")
+        _required_identifier(user_message_id, "user_message_id")
+        _required_identifier(assistant_message_id, "assistant_message_id")
+        user_content = _required_text(user_content, "user_content", strip=False)
+        if attempt < 1:
+            raise StorageValidationError("attempt must be positive")
+        now = encode_utc(created_at or self._clock())
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id, conversation_id, turn_id, role, content, status, attempt,
+                        participates_in_memory, created_at, updated_at, completed_at
+                    ) VALUES (?, ?, ?, 'user', ?, 'completed', 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_message_id,
+                        conversation_id,
+                        turn_id,
+                        user_content,
+                        int(participates_in_memory),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id, conversation_id, turn_id, role, content, status, attempt,
+                        participates_in_memory, created_at, updated_at, completed_at
+                    ) VALUES (?, ?, ?, 'assistant', '', 'pending', ?, 0, ?, ?, NULL)
+                    """,
+                    (assistant_message_id, conversation_id, turn_id, attempt, now, now),
+                )
+                connection.execute(
+                    """
+                    UPDATE conversations
+                    SET last_activity_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, conversation_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("message or turn role already exists") from exc
+        return self.get_message(user_message_id), self.get_message(assistant_message_id)
+
+    def create_assistant_placeholder(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        message_id: str,
+        *,
+        attempt: int = 1,
+        created_at: datetime | None = None,
+    ) -> StoredMessage:
+        if attempt < 1:
+            raise StorageValidationError("attempt must be positive")
+        return self._insert_message(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            message_id=message_id,
+            role=StoredMessageRole.ASSISTANT,
+            content="",
+            status=StoredMessageStatus.PENDING,
+            attempt=attempt,
+            created_at=created_at,
+            completed=False,
+            participates_in_memory=False,
+        )
+
+    def begin_assistant_attempt(self, message_id: str, attempt: int) -> StoredMessage:
+        if attempt < 2:
+            raise StorageValidationError("a retry attempt must be at least 2")
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT role, attempt FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageNotFoundError("message does not exist")
+            if row["role"] != StoredMessageRole.ASSISTANT.value:
+                raise StorageConflictError("only assistant messages can be retried")
+            if int(row["attempt"]) >= attempt:
+                raise StorageConflictError("attempt must increase monotonically")
+            connection.execute(
+                """
+                UPDATE messages
+                SET content = '', status = 'pending', attempt = ?, terminal_reason = NULL,
+                    failure_code = NULL, completed_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (attempt, now, message_id),
+            )
+        return self.get_message(message_id)
+
+    def checkpoint_assistant(self, message_id: str, content: str, *, attempt: int) -> StoredMessage:
+        """Persist the complete coalesced stream snapshot for the current attempt."""
+
+        if attempt < 1:
+            raise StorageValidationError("attempt must be positive")
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT role, status, attempt FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageNotFoundError("message does not exist")
+            if row["role"] != StoredMessageRole.ASSISTANT.value:
+                raise StorageConflictError("only assistant messages accept checkpoints")
+            if int(row["attempt"]) != attempt:
+                raise StorageConflictError("checkpoint belongs to a stale attempt")
+            if row["status"] not in {
+                StoredMessageStatus.PENDING.value,
+                StoredMessageStatus.STREAMING.value,
+            }:
+                raise StorageConflictError("terminal messages cannot accept checkpoints")
+            connection.execute(
+                """
+                UPDATE messages
+                SET content = ?, status = 'streaming', updated_at = ?
+                WHERE id = ?
+                """,
+                (content, now, message_id),
+            )
+            self._touch_conversation_for_message(connection, message_id, now)
+        return self.get_message(message_id)
+
+    def finalize_assistant(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        status: StoredMessageStatus | str,
+        terminal_reason: str,
+        attempt: int,
+        provider_name: str | None = None,
+        model_name: str | None = None,
+        failure_code: str | None = None,
+    ) -> StoredMessage:
+        status_value = str(status)
+        allowed = {
+            StoredMessageStatus.COMPLETED.value,
+            StoredMessageStatus.STOPPED.value,
+            StoredMessageStatus.FAILED.value,
+        }
+        if status_value not in allowed:
+            raise StorageValidationError("assistant terminal status is invalid")
+        if attempt < 1:
+            raise StorageValidationError("attempt must be positive")
+        terminal_reason = _required_text(terminal_reason, "terminal_reason")
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT role, attempt FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageNotFoundError("message does not exist")
+            if row["role"] != StoredMessageRole.ASSISTANT.value:
+                raise StorageConflictError("only assistant messages can be finalized")
+            if int(row["attempt"]) != attempt:
+                raise StorageConflictError("terminal update belongs to a stale attempt")
+            connection.execute(
+                """
+                UPDATE messages
+                SET content = ?, status = ?, terminal_reason = ?, provider_name = ?,
+                    model_name = ?, failure_code = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    content,
+                    status_value,
+                    terminal_reason,
+                    provider_name,
+                    model_name,
+                    failure_code,
+                    now,
+                    now,
+                    message_id,
+                ),
+            )
+            self._touch_conversation_for_message(connection, message_id, now)
+        return self.get_message(message_id)
+
+    def set_message_memory_eligibility(self, message_id: str, participates: bool) -> StoredMessage:
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE messages SET participates_in_memory = ?, updated_at = ? WHERE id = ?
+                """,
+                (int(participates), now, message_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageNotFoundError("message does not exist")
+        return self.get_message(message_id)
+
+    def recover_interrupted_messages(self) -> int:
+        """Terminalize persisted streams left active by an unclean process exit."""
+
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE messages
+                SET status = 'stopped', terminal_reason = 'shutdown',
+                    updated_at = ?, completed_at = ?
+                WHERE role = 'assistant' AND status IN ('pending', 'streaming')
+                """,
+                (now, now),
+            )
+        return max(0, cursor.rowcount)
+
+    def get_message(self, message_id: str) -> StoredMessage:
+        row = self._database.connection.execute(
+            "SELECT * FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageNotFoundError("message does not exist")
+        return _message_from_row(row)
+
+    def load_message_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 40,
+        before_sequence: int | None = None,
+    ) -> MessagePage:
+        _validate_limit(limit, maximum=500)
+        if before_sequence is not None and before_sequence <= 0:
+            raise StorageValidationError("before_sequence must be positive")
+        cursor_clause = "" if before_sequence is None else "AND sequence < ?"
+        params: list[object] = [conversation_id]
+        if before_sequence is not None:
+            params.append(before_sequence)
+        params.append(limit + 1)
+        rows = self._database.connection.execute(
+            f"""
+            SELECT * FROM messages
+            WHERE conversation_id = ? {cursor_clause}
+            ORDER BY sequence DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        has_older = len(rows) > limit
+        selected = rows[:limit]
+        items = tuple(_message_from_row(row) for row in reversed(selected))
+        next_cursor = items[0].sequence if has_older and items else None
+        return MessagePage(items=items, next_before_sequence=next_cursor)
+
+    def load_recent_messages(
+        self, conversation_id: str, *, limit: int = 20
+    ) -> tuple[StoredMessage, ...]:
+        return self.load_message_page(conversation_id, limit=limit).items
+
+    def load_recent_valid_messages(
+        self, conversation_id: str, *, limit: int = 20
+    ) -> tuple[StoredMessage, ...]:
+        """Return exactly the recent messages eligible for prompt/summary context."""
+
+        _validate_limit(limit, maximum=500)
+        rows = self._database.connection.execute(
+            """
+            SELECT * FROM messages
+            WHERE conversation_id = ?
+              AND ((role = 'user' AND status = 'completed')
+                   OR (role = 'assistant' AND status IN ('completed', 'stopped')
+                       AND LENGTH(content) > 0))
+            ORDER BY sequence DESC
+            LIMIT ?
+            """,
+            (conversation_id, limit),
+        ).fetchall()
+        return tuple(_message_from_row(row) for row in reversed(rows))
+
+    def load_message_context(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        limit: int = 40,
+    ) -> MessagePage:
+        """Return a chronological page ending at a provenance target message."""
+
+        _validate_limit(limit, maximum=500)
+        row = self._database.connection.execute(
+            "SELECT sequence, conversation_id FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        if row is None or row["conversation_id"] != conversation_id:
+            raise StorageNotFoundError("message does not belong to the conversation")
+        return self.load_message_page(
+            conversation_id,
+            limit=limit,
+            before_sequence=int(row["sequence"]) + 1,
+        )
+
+    def load_messages_after(
+        self,
+        conversation_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 200,
+    ) -> tuple[StoredMessage, ...]:
+        """Load valid incremental-summary messages in chronological order."""
+
+        if after_sequence < 0:
+            raise StorageValidationError("after_sequence must be non-negative")
+        _validate_limit(limit, maximum=2_000)
+        rows = self._database.connection.execute(
+            """
+            SELECT * FROM messages
+            WHERE conversation_id = ? AND sequence > ?
+              AND ((role = 'user' AND status = 'completed')
+                   OR (role = 'assistant' AND status IN ('completed', 'stopped')
+                       AND LENGTH(content) > 0))
+            ORDER BY sequence
+            LIMIT ?
+            """,
+            (conversation_id, after_sequence, limit),
+        ).fetchall()
+        return tuple(_message_from_row(row) for row in rows)
+
+    def save_summary(
+        self,
+        conversation_id: str,
+        content: str,
+        covers_through_sequence: int,
+        *,
+        message_count: int,
+        character_count: int,
+    ) -> ConversationSummary:
+        content = _required_text(content, "content")
+        if covers_through_sequence < 0 or message_count < 0 or character_count < 0:
+            raise StorageValidationError("summary counters must be non-negative")
+        summary_id = self._id_factory()
+        now = encode_utc(self._clock())
+        try:
+            with self._database.transaction() as connection:
+                if covers_through_sequence:
+                    covered = connection.execute(
+                        """
+                        SELECT 1 FROM messages
+                        WHERE conversation_id = ? AND sequence = ?
+                        """,
+                        (conversation_id, covers_through_sequence),
+                    ).fetchone()
+                    if covered is None:
+                        raise StorageValidationError(
+                            "summary cursor does not belong to the conversation"
+                        )
+                connection.execute(
+                    """
+                    INSERT INTO conversation_summaries(
+                        id, conversation_id, content, covers_through_sequence,
+                        message_count, character_count, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        summary_id,
+                        conversation_id,
+                        content,
+                        covers_through_sequence,
+                        message_count,
+                        character_count,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("summary cursor already exists") from exc
+        row = self._database.connection.execute(
+            "SELECT * FROM conversation_summaries WHERE id = ?", (summary_id,)
+        ).fetchone()
+        assert row is not None
+        return _summary_from_row(row)
+
+    def latest_summary(self, conversation_id: str) -> ConversationSummary | None:
+        row = self._database.connection.execute(
+            """
+            SELECT * FROM conversation_summaries
+            WHERE conversation_id = ?
+            ORDER BY covers_through_sequence DESC, created_at DESC
+            LIMIT 1
+            """,
+            (conversation_id,),
+        ).fetchone()
+        return None if row is None else _summary_from_row(row)
+
+    def summary_progress(self, conversation_id: str) -> SummaryProgress:
+        summary = self.latest_summary(conversation_id)
+        covered = summary.covers_through_sequence if summary is not None else 0
+        row = self._database.connection.execute(
+            """
+            SELECT COUNT(*) AS message_count,
+                   COALESCE(SUM(LENGTH(content)), 0) AS character_count,
+                   MAX(sequence) AS last_sequence
+            FROM messages
+            WHERE conversation_id = ? AND sequence > ?
+              AND ((role = 'user' AND status = 'completed')
+                   OR (role = 'assistant' AND status IN ('completed', 'stopped')
+                       AND LENGTH(content) > 0))
+            """,
+            (conversation_id, covered),
+        ).fetchone()
+        assert row is not None
+        return SummaryProgress(
+            message_count=int(row["message_count"]),
+            character_count=int(row["character_count"]),
+            last_sequence=None if row["last_sequence"] is None else int(row["last_sequence"]),
+        )
+
+    def _insert_message(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        message_id: str,
+        role: StoredMessageRole,
+        content: str,
+        status: StoredMessageStatus,
+        attempt: int,
+        created_at: datetime | None,
+        completed: bool,
+        participates_in_memory: bool,
+    ) -> StoredMessage:
+        _required_identifier(turn_id, "turn_id")
+        _required_identifier(message_id, "message_id")
+        now = encode_utc(created_at or self._clock())
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id, conversation_id, turn_id, role, content, status, attempt,
+                        participates_in_memory, created_at, updated_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        conversation_id,
+                        turn_id,
+                        role.value,
+                        content,
+                        status.value,
+                        attempt,
+                        int(participates_in_memory),
+                        now,
+                        now,
+                        now if completed else None,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE conversations
+                    SET last_activity_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, conversation_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("message or turn role already exists") from exc
+        return self.get_message(message_id)
+
+    @staticmethod
+    def _touch_conversation_for_message(
+        connection: sqlite3.Connection, message_id: str, now: str
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE conversations
+            SET last_activity_at = ?, updated_at = ?
+            WHERE id = (SELECT conversation_id FROM messages WHERE id = ?)
+            """,
+            (now, now, message_id),
+        )
+
+
+class BackgroundJobStore:
+    """Durable, idempotent job states for summary/extraction retry workers."""
+
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        clock: Clock = utc_now,
+        id_factory: IdFactory | None = None,
+    ) -> None:
+        self._database = database
+        self._clock = clock
+        self._id_factory = id_factory or (lambda: uuid4().hex)
+
+    def enqueue(
+        self,
+        kind: str,
+        dedupe_key: str,
+        *,
+        payload: Mapping[str, object] | None = None,
+        profile_id: str | None = None,
+        conversation_id: str | None = None,
+        message_id: str | None = None,
+        run_after: datetime | None = None,
+    ) -> BackgroundJob:
+        kind = _required_text(kind, "kind")
+        dedupe_key = _required_text(dedupe_key, "dedupe_key")
+        job_id = self._id_factory()
+        now = encode_utc(self._clock())
+        ready = encode_utc(run_after or self._clock())
+        payload_json = json.dumps(
+            dict(payload or {}), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        with self._database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO background_jobs(
+                    id, kind, dedupe_key, status, payload_json, profile_id,
+                    conversation_id, message_id, attempt_count, run_after,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    kind,
+                    dedupe_key,
+                    payload_json,
+                    profile_id,
+                    conversation_id,
+                    message_id,
+                    ready,
+                    now,
+                    now,
+                ),
+            )
+        row = self._database.connection.execute(
+            "SELECT * FROM background_jobs WHERE dedupe_key = ?", (dedupe_key,)
+        ).fetchone()
+        assert row is not None
+        return _job_from_row(row)
+
+    def recover_interrupted(self) -> int:
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE background_jobs
+                SET status = 'retry', run_after = ?, updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now, now),
+            )
+        return max(0, cursor.rowcount)
+
+    def claim_ready(
+        self,
+        *,
+        limit: int = 1,
+        kinds: Sequence[str] | None = None,
+    ) -> tuple[BackgroundJob, ...]:
+        _validate_limit(limit, maximum=100)
+        if kinds is not None and not kinds:
+            return ()
+        normalized_kinds = (
+            tuple(_required_text(kind, "kind") for kind in kinds) if kinds is not None else ()
+        )
+        kind_clause = ""
+        if normalized_kinds:
+            placeholders = ",".join("?" for _kind in normalized_kinds)
+            kind_clause = f"AND kind IN ({placeholders})"
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            parameters: list[object] = [now]
+            parameters.extend(normalized_kinds)
+            parameters.append(limit)
+            rows = connection.execute(
+                f"""
+                SELECT id FROM background_jobs
+                WHERE status IN ('pending', 'retry') AND run_after <= ?
+                    {kind_clause}
+                ORDER BY run_after, created_at, id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            job_ids = tuple(str(row["id"]) for row in rows)
+            for job_id in job_ids:
+                connection.execute(
+                    """
+                    UPDATE background_jobs
+                    SET status = 'running', attempt_count = attempt_count + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, job_id),
+                )
+            claimed = [
+                connection.execute(
+                    "SELECT * FROM background_jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                for job_id in job_ids
+            ]
+        return tuple(_job_from_row(row) for row in claimed if row is not None)
+
+    def mark_completed(self, job_id: str) -> BackgroundJob:
+        return self._set_terminal(job_id, BackgroundJobStatus.COMPLETED)
+
+    def mark_failed(self, job_id: str, *, error_code: str | None = None) -> BackgroundJob:
+        return self._set_terminal(job_id, BackgroundJobStatus.FAILED, error_code)
+
+    def mark_retry(
+        self,
+        job_id: str,
+        run_after: datetime,
+        *,
+        error_code: str | None = None,
+    ) -> BackgroundJob:
+        now = encode_utc(self._clock())
+        safe_code = _safe_error_code(error_code)
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE background_jobs
+                SET status = 'retry', run_after = ?, last_error_code = ?, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (encode_utc(run_after), safe_code, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageConflictError("only running jobs can be retried")
+        return self.get(job_id)
+
+    def retry_failed(
+        self,
+        job_id: str,
+        *,
+        run_after: datetime | None = None,
+        reset_attempts: bool = True,
+    ) -> BackgroundJob:
+        """Start a user-requested retry cycle for one terminal failed job."""
+
+        now_value = self._clock()
+        now = encode_utc(now_value)
+        attempt_expression = "0" if reset_attempts else "attempt_count"
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE background_jobs
+                SET status = 'retry', run_after = ?, last_error_code = NULL,
+                    attempt_count = {attempt_expression}, updated_at = ?
+                WHERE id = ? AND status = 'failed'
+                """,
+                (encode_utc(run_after or now_value), now, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageConflictError("only failed jobs can be retried manually")
+        return self.get(job_id)
+
+    def get(self, job_id: str) -> BackgroundJob:
+        row = self._database.connection.execute(
+            "SELECT * FROM background_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageNotFoundError("background job does not exist")
+        return _job_from_row(row)
+
+    def list_failed(self, *, limit: int = 100) -> tuple[BackgroundJob, ...]:
+        _validate_limit(limit, maximum=1_000)
+        rows = self._database.connection.execute(
+            """
+            SELECT * FROM background_jobs
+            WHERE status = 'failed'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return tuple(_job_from_row(row) for row in rows)
+
+    def _set_terminal(
+        self,
+        job_id: str,
+        status: BackgroundJobStatus,
+        error_code: str | None = None,
+    ) -> BackgroundJob:
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE background_jobs
+                SET status = ?, last_error_code = ?, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (status.value, _safe_error_code(error_code), now, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageConflictError("only running jobs can be terminalized")
+        return self.get(job_id)
+
+
+def _required_identifier(value: str, field: str) -> str:
+    value = str(value).strip()
+    if not value or len(value) > 200:
+        raise StorageValidationError(f"{field} must be a non-empty identifier")
+    return value
+
+
+def _required_text(value: str, field: str, *, strip: bool = True) -> str:
+    if not isinstance(value, str):
+        raise StorageValidationError(f"{field} must be text")
+    result = value.strip() if strip else value
+    if not result or not value.strip():
+        raise StorageValidationError(f"{field} must not be blank")
+    return result
+
+
+def _validate_limit(limit: int, *, maximum: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
+        raise StorageValidationError(f"limit must be between 1 and {maximum}")
+
+
+def _safe_error_code(error_code: str | None) -> str | None:
+    if error_code is None:
+        return None
+    return str(error_code).replace("\r", " ").replace("\n", " ")[:128]
+
+
+def _required_datetime(value: str) -> datetime:
+    decoded = decode_utc(value)
+    assert decoded is not None
+    return decoded
+
+
+def _profile_from_row(row: sqlite3.Row) -> Profile:
+    return Profile(
+        profile_id=str(row["id"]),
+        display_name=str(row["display_name"]),
+        created_at=_required_datetime(row["created_at"]),
+        updated_at=_required_datetime(row["updated_at"]),
+    )
+
+
+def _conversation_from_row(row: sqlite3.Row) -> Conversation:
+    return Conversation(
+        conversation_id=str(row["id"]),
+        profile_id=str(row["profile_id"]),
+        title=str(row["title"]),
+        status=ConversationStatus(row["status"]),
+        created_at=_required_datetime(row["created_at"]),
+        updated_at=_required_datetime(row["updated_at"]),
+        last_activity_at=_required_datetime(row["last_activity_at"]),
+    )
+
+
+def _message_from_row(row: sqlite3.Row) -> StoredMessage:
+    return StoredMessage(
+        sequence=int(row["sequence"]),
+        message_id=str(row["id"]),
+        conversation_id=str(row["conversation_id"]),
+        turn_id=str(row["turn_id"]),
+        role=StoredMessageRole(row["role"]),
+        content=str(row["content"]),
+        status=StoredMessageStatus(row["status"]),
+        attempt=int(row["attempt"]),
+        terminal_reason=row["terminal_reason"],
+        provider_name=row["provider_name"],
+        model_name=row["model_name"],
+        failure_code=row["failure_code"],
+        participates_in_memory=bool(row["participates_in_memory"]),
+        created_at=_required_datetime(row["created_at"]),
+        updated_at=_required_datetime(row["updated_at"]),
+        completed_at=decode_utc(row["completed_at"]),
+    )
+
+
+def _summary_from_row(row: sqlite3.Row) -> ConversationSummary:
+    return ConversationSummary(
+        summary_id=str(row["id"]),
+        conversation_id=str(row["conversation_id"]),
+        content=str(row["content"]),
+        covers_through_sequence=int(row["covers_through_sequence"]),
+        message_count=int(row["message_count"]),
+        character_count=int(row["character_count"]),
+        created_at=_required_datetime(row["created_at"]),
+    )
+
+
+def _job_from_row(row: sqlite3.Row) -> BackgroundJob:
+    payload = json.loads(row["payload_json"])
+    if not isinstance(payload, dict):
+        raise StorageValidationError("background job payload is not an object")
+    return BackgroundJob(
+        job_id=str(row["id"]),
+        kind=str(row["kind"]),
+        dedupe_key=str(row["dedupe_key"]),
+        status=BackgroundJobStatus(row["status"]),
+        payload=payload,
+        profile_id=row["profile_id"],
+        conversation_id=row["conversation_id"],
+        message_id=row["message_id"],
+        attempt_count=int(row["attempt_count"]),
+        run_after=_required_datetime(row["run_after"]),
+        last_error_code=row["last_error_code"],
+        created_at=_required_datetime(row["created_at"]),
+        updated_at=_required_datetime(row["updated_at"]),
+    )

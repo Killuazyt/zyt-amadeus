@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QMessageBox
+
+from amadeus_desktop.ui.memory_page import MemoryPage
+
+
+@dataclass(frozen=True)
+class MemoryView:
+    memory_id: str
+    memory_type: str
+    status: str
+    content: str
+    topic_key: str
+    importance: float
+    confidence: float
+    pinned: bool
+    version: int
+    created_at: str
+    updated_at: str
+
+
+def make_page(qtbot) -> MemoryPage:
+    page = MemoryPage()
+    qtbot.addWidget(page)
+    return page
+
+
+def sample_memory(*, archived: bool = False) -> MemoryView:
+    return MemoryView(
+        memory_id="memory-1",
+        memory_type="preference",
+        status="archived" if archived else "active",
+        content="用户不喜欢太甜的咖啡",
+        topic_key="drink.coffee.sweetness",
+        importance=0.8,
+        confidence=0.91,
+        pinned=False,
+        version=2,
+        created_at="2026-07-01",
+        updated_at="2026-08-01",
+    )
+
+
+def test_enabled_and_search_signals_only_reflect_user_actions(qtbot) -> None:
+    page = make_page(qtbot)
+    enabled: list[bool] = []
+    searches: list[tuple[str, str, str, str]] = []
+    page.enabled_changed.connect(enabled.append)
+    page.search_requested.connect(lambda *values: searches.append(values))
+    assert page.status_combo.findData("superseded") == -1
+    assert page.sort_combo.findData("recalled_desc") == -1
+
+    page.set_memory_enabled(False)
+    assert enabled == []
+    assert "不会提炼" in page.enabled_notice.text()
+
+    page.enabled_check.click()
+    page.search_edit.setText(" 咖啡 ")
+    page.type_combo.setCurrentIndex(page.type_combo.findData("preference"))
+    page.status_combo.setCurrentIndex(page.status_combo.findData("active"))
+    page.sort_combo.setCurrentIndex(page.sort_combo.findData("importance_desc"))
+    page.search_button.click()
+
+    assert enabled == [True]
+    assert searches[-1] == ("咖啡", "preference", "active", "importance_desc")
+
+
+def test_memory_detail_edit_pin_archive_and_restore_emit_ids(qtbot) -> None:
+    page = make_page(qtbot)
+    edited: list[tuple[str, str]] = []
+    pinned: list[tuple[str, bool]] = []
+    archived: list[str] = []
+    restored: list[str] = []
+    page.edit_requested.connect(lambda memory_id, content: edited.append((memory_id, content)))
+    page.pin_requested.connect(lambda memory_id, value: pinned.append((memory_id, value)))
+    page.archive_requested.connect(archived.append)
+    page.restore_requested.connect(restored.append)
+
+    page.set_memories(iter([sample_memory()]))
+    assert page.current_memory_id == "memory-1"
+    assert page.detail_edit.toPlainText() == "用户不喜欢太甜的咖啡"
+    assert "偏好" in page.detail_title_label.text()
+    assert "最近召回" not in page.detail_meta_label.text()
+    assert page.restore_button.isHidden()
+
+    page.detail_edit.setPlainText("  用户现在喜欢微甜咖啡  ")
+    page.save_edit_button.click()
+    page.pin_button.click()
+    page.archive_button.click()
+
+    assert edited == [("memory-1", "用户现在喜欢微甜咖啡")]
+    assert pinned == [("memory-1", True)]
+    assert archived == ["memory-1"]
+
+    page.set_memories([sample_memory(archived=True)], selected_id="memory-1")
+    assert page.archive_button.isHidden()
+    assert not page.restore_button.isHidden()
+    page.restore_button.click()
+    assert restored == ["memory-1"]
+
+
+def test_sources_show_body_or_tombstone_and_only_live_source_can_jump(qtbot) -> None:
+    page = make_page(qtbot)
+    page.set_memories([sample_memory()])
+    opened: list[tuple[str, str]] = []
+    page.source_requested.connect(
+        lambda conversation_id, message_id: opened.append((conversation_id, message_id))
+    )
+    page.set_sources(
+        "memory-1",
+        [
+            {
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+                "content": "我不喜欢太甜的咖啡",
+                "created_at": "2026-07-01",
+                "method": "自动提炼",
+            },
+            {
+                "conversation_id": "conversation-2",
+                "message_id": "message-2",
+                "deleted": True,
+                "content": "不得保留的正文",
+            },
+            {
+                "method": "manual",
+                "available": False,
+                "version_number": 2,
+            },
+        ],
+    )
+
+    assert page.source_preview.toPlainText() == "我不喜欢太甜的咖啡"
+    page.open_source_button.click()
+    assert opened == [("conversation-1", "message-1")]
+
+    page.source_list.setCurrentRow(1)
+    assert "正文已永久清除" in page.source_preview.toPlainText()
+    assert "不得保留" not in page.source_preview.toPlainText()
+    assert not page.open_source_button.isEnabled()
+    page.source_list.itemDoubleClicked.emit(page.source_list.item(1))
+    assert opened == [("conversation-1", "message-1")]
+
+    page.source_list.setCurrentRow(2)
+    assert "手工编辑" in page.source_list.item(2).text()
+    assert "记忆页手工编辑" in page.source_preview.toPlainText()
+    assert not page.open_source_button.isEnabled()
+
+
+def test_permanent_memory_delete_requires_confirmation(monkeypatch, qtbot) -> None:
+    page = make_page(qtbot)
+    page.set_memories([sample_memory()])
+    deleted: list[str] = []
+    prompts: list[str] = []
+    page.delete_requested.connect(deleted.append)
+
+    def decline(*args, **kwargs):
+        prompts.append(str(args[2]))
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", decline)
+    page.delete_button.click()
+    assert deleted == []
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    page.delete_button.click()
+    assert deleted == ["memory-1"]
+    assert "全部版本" in prompts[0]
+    assert "原始聊天不会" in prompts[0]
+
+
+def test_failed_task_retry_uses_stable_task_id(qtbot) -> None:
+    page = make_page(qtbot)
+    retried: list[str] = []
+    page.retry_task_requested.connect(retried.append)
+
+    page.set_failed_tasks(
+        [
+            {
+                "task_id": "job-1",
+                "task_type": "memory_extraction",
+                "attempt_count": 3,
+                "safe_error": "结构校验失败",
+            }
+        ]
+    )
+    assert not page.retry_task_button.isEnabled()
+    page.failed_task_view.setCurrentItem(page.failed_task_view.topLevelItem(0))
+    qtbot.mouseClick(page.retry_task_button, Qt.MouseButton.LeftButton)
+
+    assert retried == ["job-1"]
+    assert "结构校验失败" in page.failed_task_view.topLevelItem(0).text(2)

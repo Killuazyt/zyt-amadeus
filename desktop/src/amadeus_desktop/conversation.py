@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
@@ -35,7 +37,36 @@ EMPTY_RESPONSE_TEXT = "供应商未返回可显示的文本，请重试。"
 USER_STOPPED_TEXT = "用户已停止"
 COMPLETED_TEXT = "回复完成"
 SHUTDOWN_TEXT = "应用退出时已停止"
+PERSISTENCE_ERROR_TEXT = "本地数据无法安全保存，本轮未发送。"
 MAX_VISIBLE_RESPONSE_CHARS = 1024 * 1024
+
+
+@runtime_checkable
+class ConversationPersistence(Protocol):
+    """Asynchronous persistence boundary implemented by the P5A data session."""
+
+    def prepare_new_turn(
+        self,
+        turn: ConversationTurn,
+        on_success: Callable[[tuple[PromptMessage, ...]], None],
+        on_failure: Callable[[str], None],
+    ) -> bool: ...
+
+    def prepare_retry(
+        self,
+        turn: ConversationTurn,
+        on_success: Callable[[tuple[PromptMessage, ...]], None],
+        on_failure: Callable[[str], None],
+    ) -> bool: ...
+
+    def checkpoint_assistant(self, turn: ConversationTurn) -> None: ...
+
+    def finalize_turn(
+        self,
+        turn: ConversationTurn,
+        on_success: Callable[[], None],
+        on_failure: Callable[[str], None],
+    ) -> bool: ...
 
 
 class _ProviderWorker(QObject):
@@ -104,6 +135,13 @@ class _RequestContext:
     terminal_state: ConversationState | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingFinalization:
+    request_id: str
+    turn_id: str
+    state: ConversationState
+
+
 class ConversationCoordinator(QObject):
     """Own in-memory turns and serialize cancellable provider attempts."""
 
@@ -120,6 +158,7 @@ class ConversationCoordinator(QObject):
         *,
         first_chunk_timeout_ms: int = 15_000,
         stream_idle_timeout_ms: int = 30_000,
+        persistence: ConversationPersistence | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -128,11 +167,17 @@ class ConversationCoordinator(QObject):
         if stream_idle_timeout_ms <= 0:
             raise ValueError("stream_idle_timeout_ms must be positive")
         self._provider = provider
+        self._persistence = persistence
         self._state = ConversationState.IDLE
         self._turns: list[ConversationTurn] = []
         self._contexts: dict[str, _RequestContext] = {}
         self._active_request_id: str | None = None
         self._shutting_down = False
+        self._pending_preparation_turn_id: str | None = None
+        self._pending_preparation_request_id: str | None = None
+        self._preparation_generation = 0
+        self._pending_checkpoint_turn: ConversationTurn | None = None
+        self._pending_finalization: _PendingFinalization | None = None
 
         self._first_chunk_timer = QTimer(self)
         self._first_chunk_timer.setSingleShot(True)
@@ -143,6 +188,11 @@ class ConversationCoordinator(QObject):
         self._stream_idle_timer.setSingleShot(True)
         self._stream_idle_timer.setInterval(stream_idle_timeout_ms)
         self._stream_idle_timer.timeout.connect(self._on_stream_idle_timeout)
+
+        self._checkpoint_timer = QTimer(self)
+        self._checkpoint_timer.setSingleShot(True)
+        self._checkpoint_timer.setInterval(500)
+        self._checkpoint_timer.timeout.connect(self._flush_checkpoint)
 
     @property
     def state(self) -> ConversationState:
@@ -158,6 +208,8 @@ class ConversationCoordinator(QObject):
 
     @property
     def is_active(self) -> bool:
+        if self._pending_preparation_turn_id is not None or self._pending_finalization is not None:
+            return True
         context = self._active_context()
         return context is not None and context.terminal_state is None
 
@@ -167,7 +219,11 @@ class ConversationCoordinator(QObject):
 
     @property
     def has_active_timers(self) -> bool:
-        return self._first_chunk_timer.isActive() or self._stream_idle_timer.isActive()
+        return (
+            self._first_chunk_timer.isActive()
+            or self._stream_idle_timer.isActive()
+            or self._checkpoint_timer.isActive()
+        )
 
     def set_provider(self, provider: ChatProvider) -> bool:
         """Switch providers only while the coordinator is fully idle."""
@@ -175,6 +231,8 @@ class ConversationCoordinator(QObject):
         if (
             self._shutting_down
             or self._active_request_id is not None
+            or self._pending_preparation_turn_id is not None
+            or self._pending_finalization is not None
             or self._state is not ConversationState.IDLE
         ):
             return False
@@ -184,7 +242,13 @@ class ConversationCoordinator(QObject):
     def send_message(self, text: str) -> ConversationTurn | None:
         """Append a new in-memory turn and start exactly one provider attempt."""
 
-        if self._shutting_down or self._active_request_id is not None or not text.strip():
+        if (
+            self._shutting_down
+            or self._active_request_id is not None
+            or self._pending_preparation_turn_id is not None
+            or self._pending_finalization is not None
+            or not text.strip()
+        ):
             return None
         turn = ConversationTurn(
             turn_id=uuid4().hex,
@@ -203,13 +267,18 @@ class ConversationCoordinator(QObject):
         )
         self._turns.append(turn)
         self.turn_added.emit(turn)
-        self._start_attempt(turn)
+        self._prepare_attempt(turn, is_retry=False)
         return turn
 
     def retry(self, turn_id: str) -> bool:
         """Retry a failed turn without adding or replacing either message ID."""
 
-        if self._shutting_down or self._active_request_id is not None:
+        if (
+            self._shutting_down
+            or self._active_request_id is not None
+            or self._pending_preparation_turn_id is not None
+            or self._pending_finalization is not None
+        ):
             return False
         index = self._turn_index(turn_id)
         if index is None:
@@ -233,13 +302,40 @@ class ConversationCoordinator(QObject):
         )
         self._turns[index] = retried
         self.turn_updated.emit(retried)
-        self._start_attempt(retried)
+        self._prepare_attempt(retried, is_retry=True)
         return True
 
     def stop(self) -> bool:
         """Stop the active attempt while preserving its current assistant text."""
 
         context = self._active_context()
+        if context is None and self._pending_preparation_turn_id is not None:
+            turn = self._turn(self._pending_preparation_turn_id)
+            if turn is None:
+                return False
+            self._preparation_generation += 1
+            self._pending_preparation_turn_id = None
+            request_id = self._pending_preparation_request_id or uuid4().hex
+            self._pending_preparation_request_id = None
+            self._active_request_id = None
+            updated = replace(
+                turn,
+                assistant_message=replace(
+                    turn.assistant_message,
+                    status=MessageStatus.STOPPED,
+                ),
+                terminal_reason=TurnTerminalReason.USER_STOPPED,
+                status_text=USER_STOPPED_TEXT,
+            )
+            self._replace_turn(updated)
+            self.turn_updated.emit(updated)
+            self._set_state(ConversationState.STOPPED)
+            self._persist_terminal_result(
+                request_id,
+                updated,
+                ConversationState.STOPPED,
+            )
+            return True
         if context is None or context.terminal_state is not None:
             return False
         self._terminalize(
@@ -261,6 +357,31 @@ class ConversationCoordinator(QObject):
             raise ValueError("wait_ms must be non-negative")
         self._shutting_down = True
         self._stop_timers()
+        pending_turn_id = self._pending_preparation_turn_id
+        if pending_turn_id is not None:
+            self._preparation_generation += 1
+            self._pending_preparation_turn_id = None
+            request_id = self._pending_preparation_request_id or uuid4().hex
+            self._pending_preparation_request_id = None
+            self._active_request_id = None
+            turn = self._turn(pending_turn_id)
+            if turn is not None:
+                updated = replace(
+                    turn,
+                    assistant_message=replace(
+                        turn.assistant_message,
+                        status=MessageStatus.STOPPED,
+                    ),
+                    terminal_reason=TurnTerminalReason.SHUTDOWN,
+                    status_text=SHUTDOWN_TEXT,
+                )
+                self._replace_turn(updated)
+                self.turn_updated.emit(updated)
+                self._persist_terminal_result(
+                    request_id,
+                    updated,
+                    ConversationState.STOPPED,
+                )
         active = self._active_context()
         if active is not None and active.terminal_state is None:
             self._terminalize(
@@ -291,17 +412,109 @@ class ConversationCoordinator(QObject):
                 self._contexts.pop(request_id, None)
                 context.thread.deleteLater()
         self._active_request_id = None
+        self._flush_checkpoint()
         self._set_state(ConversationState.IDLE)
         return clean and not self.has_running_worker
 
-    def _start_attempt(self, turn: ConversationTurn) -> None:
+    def restore_turns(self, turns: tuple[ConversationTurn, ...]) -> bool:
+        """Replace the idle presentation snapshot with one persisted page."""
+
+        if self._shutting_down or self.is_active or self._state is not ConversationState.IDLE:
+            return False
+        self._turns = list(turns)
+        return True
+
+    def _prepare_attempt(self, turn: ConversationTurn, *, is_retry: bool) -> None:
         self._set_state(ConversationState.SENDING)
         request_id = uuid4().hex
+        if self._persistence is None:
+            self._start_attempt(
+                turn,
+                self._prompt_messages(turn.turn_id),
+                request_id=request_id,
+            )
+            return
+        self._preparation_generation += 1
+        generation = self._preparation_generation
+        self._pending_preparation_turn_id = turn.turn_id
+        self._pending_preparation_request_id = request_id
+        self._active_request_id = request_id
+
+        def prepared(messages: tuple[PromptMessage, ...]) -> None:
+            if (
+                self._shutting_down
+                or generation != self._preparation_generation
+                or self._pending_preparation_turn_id != turn.turn_id
+            ):
+                return
+            self._pending_preparation_turn_id = None
+            self._pending_preparation_request_id = None
+            current = self._turn(turn.turn_id)
+            if current is not None:
+                self._start_attempt(current, messages, request_id=request_id)
+
+        def failed(_category: str) -> None:
+            if (
+                self._shutting_down
+                or generation != self._preparation_generation
+                or self._pending_preparation_turn_id != turn.turn_id
+            ):
+                return
+            self._pending_preparation_turn_id = None
+            self._pending_preparation_request_id = None
+            self._active_request_id = None
+            current = self._turn(turn.turn_id)
+            if current is None:
+                return
+            updated = replace(
+                current,
+                assistant_message=replace(
+                    current.assistant_message,
+                    status=MessageStatus.FAILED,
+                    error=PERSISTENCE_ERROR_TEXT,
+                ),
+                terminal_reason=TurnTerminalReason.LOCAL_PERSISTENCE_ERROR,
+                provider_error_code="local_persistence",
+                status_text=PERSISTENCE_ERROR_TEXT,
+                error=PERSISTENCE_ERROR_TEXT,
+            )
+            self._replace_turn(updated)
+            self.turn_updated.emit(updated)
+            self._set_state(ConversationState.FAILED)
+            self.error_occurred.emit(request_id, updated.turn_id, PERSISTENCE_ERROR_TEXT)
+            self.request_finished.emit(request_id, updated, ConversationState.FAILED)
+            QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
+
+        def queue_prepared(messages: tuple[PromptMessage, ...]) -> None:
+            QTimer.singleShot(0, self, lambda: prepared(messages))
+
+        def queue_failed(category: str) -> None:
+            QTimer.singleShot(0, self, lambda: failed(category))
+
+        try:
+            accepted = (
+                self._persistence.prepare_retry(turn, queue_prepared, queue_failed)
+                if is_retry
+                else self._persistence.prepare_new_turn(turn, queue_prepared, queue_failed)
+            )
+        except Exception:  # noqa: BLE001 - persistence details must not reach UI/logs
+            accepted = False
+        if not accepted:
+            queue_failed("not_accepting")
+
+    def _start_attempt(
+        self,
+        turn: ConversationTurn,
+        messages: tuple[PromptMessage, ...],
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        request_id = request_id or uuid4().hex
         request = ChatRequest(
             request_id=request_id,
             turn_id=turn.turn_id,
             attempt=turn.attempt,
-            messages=self._prompt_messages(turn.turn_id),
+            messages=messages,
         )
         cancellation = CancellationToken()
         thread = QThread(self)
@@ -372,6 +585,9 @@ class ConversationCoordinator(QObject):
         )
         updated = replace(turn, assistant_message=assistant)
         self._replace_turn(updated)
+        self._pending_checkpoint_turn = updated
+        if not self._checkpoint_timer.isActive():
+            self._checkpoint_timer.start()
         self.chunk_received.emit(request_id, context.turn_id, chunk)
         self.turn_updated.emit(updated)
         self._stream_idle_timer.start()
@@ -487,7 +703,8 @@ class ConversationCoordinator(QObject):
             )
         self._active_request_id = None
         self._stop_timers()
-        self._set_state(ConversationState.IDLE)
+        if self._pending_finalization is None:
+            self._set_state(ConversationState.IDLE)
 
     def _terminalize_failure(
         self,
@@ -539,9 +756,86 @@ class ConversationCoordinator(QObject):
             error=error,
         )
         self._replace_turn(updated)
+        self._flush_checkpoint()
         self.turn_updated.emit(updated)
         self._set_state(state)
-        self.request_finished.emit(context.request_id, updated, state)
+        self._persist_terminal_result(context.request_id, updated, state)
+
+    def _persist_terminal_result(
+        self,
+        request_id: str,
+        turn: ConversationTurn,
+        state: ConversationState,
+    ) -> None:
+        if self._persistence is None:
+            self.request_finished.emit(request_id, turn, state)
+            QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
+            return
+        pending = _PendingFinalization(request_id, turn.turn_id, state)
+        self._pending_finalization = pending
+
+        def succeeded() -> None:
+            QTimer.singleShot(
+                0,
+                self,
+                lambda: self._on_finalization_succeeded(request_id),
+            )
+
+        def failed(category: str) -> None:
+            QTimer.singleShot(
+                0,
+                self,
+                lambda: self._on_finalization_failed(request_id, category),
+            )
+
+        try:
+            accepted = self._persistence.finalize_turn(turn, succeeded, failed)
+        except Exception:  # noqa: BLE001 - persistence details stay behind the boundary
+            accepted = False
+        if not accepted:
+            failed("not_accepting")
+
+    def _on_finalization_succeeded(self, request_id: str) -> None:
+        pending = self._pending_finalization
+        if pending is None or pending.request_id != request_id:
+            return
+        self._pending_finalization = None
+        if self._shutting_down:
+            return
+        turn = self._turn(pending.turn_id)
+        if turn is not None:
+            self.request_finished.emit(request_id, turn, pending.state)
+        QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
+
+    def _on_finalization_failed(self, request_id: str, _category: str) -> None:
+        pending = self._pending_finalization
+        if pending is None or pending.request_id != request_id:
+            return
+        self._pending_finalization = None
+        if self._shutting_down:
+            return
+        turn = self._turn(pending.turn_id)
+        if turn is None:
+            QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
+            return
+        updated = replace(
+            turn,
+            assistant_message=replace(
+                turn.assistant_message,
+                status=MessageStatus.FAILED,
+                error=PERSISTENCE_ERROR_TEXT,
+            ),
+            terminal_reason=TurnTerminalReason.LOCAL_PERSISTENCE_ERROR,
+            provider_error_code="local_persistence",
+            status_text=PERSISTENCE_ERROR_TEXT,
+            error=PERSISTENCE_ERROR_TEXT,
+        )
+        self._replace_turn(updated)
+        self.turn_updated.emit(updated)
+        self._set_state(ConversationState.FAILED)
+        self.error_occurred.emit(request_id, updated.turn_id, PERSISTENCE_ERROR_TEXT)
+        self.request_finished.emit(request_id, updated, ConversationState.FAILED)
+        QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
 
     def _matching_active_context(self, request_id: str) -> _RequestContext | None:
         if self._shutting_down or self._active_request_id != request_id:
@@ -574,6 +868,23 @@ class ConversationCoordinator(QObject):
     def _stop_timers(self) -> None:
         self._first_chunk_timer.stop()
         self._stream_idle_timer.stop()
+
+    @Slot()
+    def _flush_checkpoint(self) -> None:
+        self._checkpoint_timer.stop()
+        turn = self._pending_checkpoint_turn
+        self._pending_checkpoint_turn = None
+        if turn is not None and self._persistence is not None:
+            self._persistence.checkpoint_assistant(turn)
+
+    @Slot()
+    def _return_to_idle_if_inactive(self) -> None:
+        if (
+            self._active_request_id is None
+            and self._pending_preparation_turn_id is None
+            and self._pending_finalization is None
+        ):
+            self._set_state(ConversationState.IDLE)
 
     def _set_state(self, state: ConversationState) -> None:
         if state is self._state:

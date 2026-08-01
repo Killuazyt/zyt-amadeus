@@ -302,7 +302,7 @@ class OpenAICompatibleChatProvider:
             cancellation.raise_if_cancelled()
             secret = self._read_secret()
             headers = self._auth_headers(secret)
-            payload = self._build_payload(request.messages)
+            payload = self._build_payload(request)
             timeout = httpx.Timeout(
                 self.config.request_timeout_seconds,
                 connect=self.config.connect_timeout_seconds,
@@ -386,16 +386,27 @@ class OpenAICompatibleChatProvider:
             raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
         return headers
 
-    def _build_payload(self, messages: tuple[PromptMessage, ...]) -> dict[str, object]:
+    def _build_payload(self, request: ChatRequest) -> dict[str, object]:
+        temperature = (
+            self.config.temperature
+            if request.options.temperature is None
+            else request.options.temperature
+        )
+        max_output_tokens = (
+            self.config.max_output_tokens
+            if request.options.max_output_tokens is None
+            else min(request.options.max_output_tokens, self.config.max_output_tokens)
+        )
         payload: dict[str, object] = {
             "model": self.config.model,
             "messages": [
-                {"role": message.role.value, "content": message.content} for message in messages
+                {"role": message.role.value, "content": message.content}
+                for message in request.messages
             ],
-            "temperature": self.config.temperature,
+            "temperature": temperature,
             "top_p": self.config.top_p,
             "stream": self.config.stream_enabled,
-            self.config.token_limit_field.value: self.config.max_output_tokens,
+            self.config.token_limit_field.value: max_output_tokens,
         }
         if self.config.preset in {
             ProviderPreset.DEEPSEEK_PAYG,

@@ -1,14 +1,16 @@
 # Amadeus Desktop
 
-P4 adds secure OpenAI-compatible text providers on top of the tested P1 application foundation,
-P2 desktop-pet engine, and P3 attached chat flow. The application includes safe local pet import,
-fixed-clock animation, transparent hit testing, manual drag placement, multi-screen recovery, a
-bundled CC0 placeholder pet, cancellable chat states, and the system tray lifecycle.
+P5A adds persistent local conversations and auditable FTS5 memory on top of the tested P1
+application foundation, P2 desktop-pet engine, P3 attached chat flow, and P4 secure text-model
+integration. The application includes safe local pet import, fixed-clock animation, transparent
+hit testing, manual drag placement, multi-screen recovery, a bundled CC0 placeholder pet,
+cancellable chat states, and the system tray lifecycle.
 
 P4 provides DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom HTTPS provider. API
-credentials are stored only in Windows Credential Manager, while messages remain in memory for
-the current process. SQLite history, long-term memory, speech, screen observation, tool execution,
-and automation are not included.
+credentials are stored only in Windows Credential Manager. P5A stores conversations, summaries,
+immutable memory versions, provenance, jobs, and keyword indexes in SQLite; it also exposes model,
+history, and memory management pages. P5B offline vectors and role knowledge are not present.
+Speech, screen observation, tool execution, and automation remain outside the MVP.
 
 ## Development commands
 
@@ -59,5 +61,6 @@ The deterministic local provider is development-only and must be requested expli
 ```
 
 Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. Imported pets are copied into its `pets`
-directory; the source package is never modified. Provider settings contain only a fixed credential
-reference; API credentials are stored by Windows Credential Manager and are never written to JSON.
+directory; the source package is never modified. P5A stores its SQLite database at
+`data\amadeus.sqlite3`. Provider settings contain only a fixed credential reference; API credentials
+are stored by Windows Credential Manager and are never written to JSON or SQLite.

@@ -9,7 +9,13 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from amadeus_desktop.chat_models import ChatRequest, PromptMessage, PromptRole
+from amadeus_desktop.chat_models import (
+    ChatRequest,
+    GenerationOptions,
+    GenerationPurpose,
+    PromptMessage,
+    PromptRole,
+)
 from amadeus_desktop.chat_provider import (
     _MAX_RESPONSE_BYTES,
     _MAX_SSE_EVENT_CHARS,
@@ -57,6 +63,42 @@ def collect(provider, token: CancellationToken | None = None) -> list[str]:
         return [chunk async for chunk in provider.stream(request(), token or CancellationToken())]
 
     return asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"temperature": True},
+        {"temperature": float("nan")},
+        {"temperature": "0.1"},
+        {"max_output_tokens": True},
+        {"max_output_tokens": 1.5},
+        {"max_output_tokens": 0},
+    ],
+)
+def test_generation_options_reject_non_strict_numbers(options: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        GenerationOptions(**options)  # type: ignore[arg-type]
+
+
+def test_background_generation_options_override_within_configured_cap() -> None:
+    provider = OpenAICompatibleChatProvider(
+        ProviderConfig.default(),
+        InMemoryCredentialStore("invalid-fake-key"),
+    )
+    background_request = replace(
+        request(),
+        options=GenerationOptions(
+            purpose=GenerationPurpose.MEMORY_EXTRACTION,
+            temperature=0.1,
+            max_output_tokens=256,
+        ),
+    )
+
+    payload = provider._build_payload(background_request)
+
+    assert payload["temperature"] == 0.1
+    assert payload[ProviderConfig.default().token_limit_field.value] == 256
 
 
 @pytest.mark.parametrize(

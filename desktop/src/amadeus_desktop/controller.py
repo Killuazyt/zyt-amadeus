@@ -11,6 +11,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QScreen
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
+from amadeus_desktop.background_generation import BackgroundGenerationRunner
 from amadeus_desktop.chat_geometry import calculate_chat_panel_placement
 from amadeus_desktop.chat_models import ConversationState
 from amadeus_desktop.chat_provider import (
@@ -25,6 +26,18 @@ from amadeus_desktop.credential_store import (
     CredentialStore,
     CredentialStoreError,
     WinCredentialStore,
+)
+from amadeus_desktop.data_runtime import SerialDataThread
+from amadeus_desktop.local_data_service import (
+    ConversationSnapshot,
+    LocalDataService,
+    MemoryListSnapshot,
+    OlderMessagesSnapshot,
+    create_local_data_stores,
+)
+from amadeus_desktop.memory_job_coordinator import (
+    JobRepositoryBundle,
+    MemoryJobCoordinator,
 )
 from amadeus_desktop.paths import AppDirectory, AppPaths
 from amadeus_desktop.pet_assets import PetAssetService
@@ -44,6 +57,7 @@ from amadeus_desktop.ui.chat_panel import ChatPanel
 from amadeus_desktop.ui.control_window import ControlWindow
 from amadeus_desktop.ui.model_settings import ModelSettingsWindow
 from amadeus_desktop.ui.pet_window import PetWindow
+from amadeus_desktop.ui.settings_window import SettingsWindow
 from amadeus_desktop.ui.tray import TrayController
 
 
@@ -68,6 +82,7 @@ class ApplicationController:
         connection_tester: ProviderConnectionTester | None = None,
         first_chunk_timeout_ms: int = 15_000,
         stream_idle_timeout_ms: int = 30_000,
+        background_jobs_enabled: bool | None = None,
     ) -> None:
         self.application = application
         self.instance_guard = instance_guard
@@ -79,6 +94,14 @@ class ApplicationController:
         self._restore_scheduled = False
         self._chat_reposition_scheduled = False
         self._turn_started_at: dict[str, float] = {}
+        self._data_initialized = False
+        self._data_writable = False
+        self._pending_initial_message: str | None = None
+        self._conversation_switch_pending = False
+        self._provider_switch_pending = False
+        self._pending_provider_configuration: ProviderConfig | None = None
+        self._pending_provider_secret: str | None = None
+        self._provider_switch_generation = 0
         self._mock_chat = mock_chat
         self._settings_trusted = allow_saved_provider
         self.credential_store = credential_store or WinCredentialStore()
@@ -120,6 +143,7 @@ class ApplicationController:
         self._restore_pet_position()
 
         self.chat_panel = ChatPanel()
+        self.chat_panel.set_storage_availability(False)
         explicit_provider = chat_provider is not None
         if chat_provider is not None:
             selected_provider = chat_provider
@@ -137,16 +161,65 @@ class ApplicationController:
         else:
             selected_provider = UnconfiguredChatProvider()
         self._active_chat_provider = selected_provider
+        if background_jobs_enabled is None:
+            background_jobs_enabled = not explicit_provider
+        self._background_jobs_enabled = bool(background_jobs_enabled)
         provider_ready = (
             has_provider_secret
             and allow_saved_provider
             and settings.get("provider_enabled") is True
         )
         self._chat_available = explicit_provider or mock_chat or provider_ready
+        self.data_runtime = SerialDataThread(
+            lambda: create_local_data_stores(
+                self.paths.database_file,
+                self.paths.migration_backup_directory,
+            ),
+            resource_close=lambda stores: stores.close(),
+            parent=application,
+        )
+        self.data_service = LocalDataService(
+            self.data_runtime,
+            memory_enabled=bool(settings["memory"]["enabled"]),
+            parent=application,
+        )
+        self.background_generation = BackgroundGenerationRunner(
+            selected_provider,
+            parent=application,
+        )
+        self.background_generation.idle.connect(self._on_background_provider_idle)
+        self.memory_jobs = MemoryJobCoordinator(
+            self.data_runtime,
+            self.background_generation,
+            lambda resource: JobRepositoryBundle(
+                resource.conversations,
+                resource.jobs,
+                resource.memories,
+            ),
+            memory_enabled=bool(settings["memory"]["enabled"]),
+            parent=application,
+        )
+        self.data_service.jobs_enqueued.connect(self.memory_jobs.poll)
+        self.memory_jobs.job_failed.connect(
+            lambda _job_id, _kind, _category: self.data_service.refresh_memories()
+        )
+        self.memory_jobs.scheduler_error.connect(
+            lambda category: self.logger.warning(
+                "Background memory scheduler error_type=%s", category
+            )
+        )
+        if mock_chat or isinstance(selected_provider, ScriptedChatProvider):
+            self.data_service.set_provider_metadata("explicit_mock", "scripted")
+        else:
+            self.data_service.set_provider_metadata(
+                self.provider_config.preset.value,
+                self.provider_config.model,
+            )
         self.conversation = ConversationCoordinator(
             selected_provider,
             first_chunk_timeout_ms=first_chunk_timeout_ms,
             stream_idle_timeout_ms=stream_idle_timeout_ms,
+            persistence=self.data_service,
             parent=application,
         )
         self.pet_window.clicked.connect(self.toggle_chat)
@@ -167,6 +240,11 @@ class ApplicationController:
             tester=connection_tester,
         )
         self.model_settings_window.save_requested.connect(self._save_provider_configuration)
+        self.settings_window = SettingsWindow(self.model_settings_window)
+        self.history_page = self.settings_window.history_page
+        self.memory_page = self.settings_window.memory_page
+        self.memory_page.set_memory_enabled(bool(settings["memory"]["enabled"]))
+        self._connect_data_ui()
 
         self.window = ControlWindow(
             tray_available=tray_available,
@@ -183,6 +261,7 @@ class ApplicationController:
             self.tray.show_requested.connect(self.show_pet)
             self.tray.exit_requested.connect(self.request_exit)
             self.tray.model_settings_requested.connect(self.show_model_settings)
+            self.tray.memory_requested.connect(self.show_memory_settings)
             self.pet_window.visibility_changed.connect(self.tray.set_pet_visible)
             self.tray.show()
             self.window.hide()
@@ -209,14 +288,277 @@ class ApplicationController:
             self._connect_screen(screen)
 
         self.application.aboutToQuit.connect(self._cleanup)
+        self.data_service.start()
 
     def show_control_window(self) -> None:
         self.window.show_and_activate()
 
     def show_model_settings(self) -> None:
-        """Open the one reusable P4-only model settings window."""
+        """Deep-link to the model page in the reusable P5 settings shell."""
 
-        self.model_settings_window.show_and_activate()
+        self.settings_window.show_and_activate("model")
+
+    def show_history_settings(self) -> None:
+        self.settings_window.show_and_activate("history")
+        self.data_service.refresh_history()
+
+    def show_memory_settings(self) -> None:
+        self.settings_window.show_and_activate("memory")
+        self.data_service.refresh_memories()
+
+    def _connect_data_ui(self) -> None:
+        self.data_service.startup_loaded.connect(self._on_data_startup_loaded)
+        self.data_service.startup_failed.connect(self._on_data_startup_failed)
+        self.data_service.write_availability_changed.connect(
+            self._on_data_write_availability_changed
+        )
+        self.data_service.conversation_loaded.connect(self._on_persisted_conversation_loaded)
+        self.data_service.older_messages_loaded.connect(self._on_older_messages_loaded)
+        self.data_service.history_loaded.connect(self.history_page.set_conversations)
+        self.data_service.memories_loaded.connect(self._on_memories_loaded)
+        self.data_service.memory_sources_loaded.connect(self.memory_page.set_sources)
+        self.data_service.source_context_loaded.connect(self._on_source_context_loaded)
+        self.data_service.operation_failed.connect(self._on_data_operation_failed)
+
+        self.chat_panel.load_older_requested.connect(self.data_service.load_older_messages)
+        self.history_page.refresh_requested.connect(self.data_service.refresh_history)
+        self.history_page.conversation_selected.connect(self._request_conversation_switch)
+        self.history_page.new_conversation_requested.connect(self._request_new_conversation)
+        self.history_page.rename_conversation_requested.connect(
+            self.data_service.rename_conversation
+        )
+        self.history_page.delete_conversation_requested.connect(self._request_delete_conversation)
+        self.history_page.clear_history_requested.connect(self._request_clear_history)
+        self.history_page.load_older_messages_requested.connect(
+            self._request_older_history_messages
+        )
+
+        self.memory_page.refresh_requested.connect(self.data_service.refresh_memories)
+        self.memory_page.search_requested.connect(self._request_memory_search)
+        self.memory_page.memory_selected.connect(self.data_service.load_memory_sources)
+        self.memory_page.enabled_changed.connect(self._set_memory_enabled)
+        self.memory_page.edit_requested.connect(self.data_service.edit_memory)
+        self.memory_page.pin_requested.connect(self.data_service.set_memory_pinned)
+        self.memory_page.archive_requested.connect(self.data_service.archive_memory)
+        self.memory_page.restore_requested.connect(self.data_service.restore_memory)
+        self.memory_page.delete_requested.connect(self.data_service.delete_memory)
+        self.memory_page.source_requested.connect(self.data_service.load_source_context)
+        self.memory_page.retry_task_requested.connect(self.data_service.retry_failed_job)
+
+    def _on_data_startup_loaded(self, snapshot_object: object) -> None:
+        if not isinstance(snapshot_object, ConversationSnapshot):
+            self._on_data_startup_failed("InvalidStartupSnapshot")
+            return
+        self._data_initialized = True
+        self._data_writable = not snapshot_object.read_only
+        self._apply_conversation_snapshot(snapshot_object)
+        self.chat_panel.set_storage_availability(
+            self._data_writable,
+            read_only=not self._data_writable,
+        )
+        self.memory_page.set_memory_enabled(self.data_service.memory_enabled)
+        self.data_service.refresh_memories()
+        if self._background_jobs_enabled and self._data_writable:
+            self.memory_jobs.start()
+        if snapshot_object.read_only:
+            self.logger.warning(
+                "Local database opened read-only migration_error=%s",
+                snapshot_object.migration_error_category or "unknown",
+            )
+        pending = self._pending_initial_message
+        self._pending_initial_message = None
+        if pending is not None and self._data_writable:
+            self._send_chat_message(pending)
+
+    def _on_data_startup_failed(self, category: str) -> None:
+        self._data_initialized = True
+        self._data_writable = False
+        self._pending_initial_message = None
+        self.chat_panel.set_storage_availability(False, read_only=True)
+        self.logger.warning("Local database unavailable error_type=%s", category)
+
+    def _on_data_write_availability_changed(self, writable: bool) -> None:
+        self._data_writable = writable
+        if not writable and self.memory_jobs.is_accepting:
+            # Fail closed without waiting on the Qt thread.  A migration or
+            # persistence failure must not leave the scheduler polling writes
+            # against a query-only/unavailable database.
+            self.memory_jobs.shutdown(wait_ms=0)
+        if self._data_initialized:
+            self.chat_panel.set_storage_availability(writable, read_only=not writable)
+
+    def _apply_conversation_snapshot(self, snapshot: ConversationSnapshot) -> bool:
+        if not self.conversation.restore_turns(snapshot.turns):
+            self.chat_panel.set_status("当前回复尚未结束，暂时不能切换会话。", kind="error")
+            return False
+        self.chat_panel.clear_messages()
+        for turn in snapshot.turns:
+            self.chat_panel.add_turn(turn)
+        self.chat_panel.set_message_pagination(has_older=snapshot.next_before_sequence is not None)
+        selected_id = (
+            None if snapshot.conversation is None else snapshot.conversation.conversation_id
+        )
+        self.history_page.set_conversations(snapshot.conversations, selected_id)
+        if selected_id is not None:
+            self.history_page.set_messages(
+                selected_id,
+                snapshot.messages,
+                has_older=snapshot.next_before_sequence is not None,
+            )
+        return True
+
+    def _on_persisted_conversation_loaded(self, snapshot_object: object) -> None:
+        self._conversation_switch_pending = False
+        if not isinstance(snapshot_object, ConversationSnapshot):
+            self._on_data_operation_failed("conversation", "InvalidConversationSnapshot")
+            return
+        self._apply_conversation_snapshot(snapshot_object)
+
+    def _on_older_messages_loaded(self, snapshot_object: object) -> None:
+        if not isinstance(snapshot_object, OlderMessagesSnapshot):
+            return
+        if snapshot_object.conversation_id != self.data_service.current_conversation_id:
+            return
+        self.chat_panel.prepend_turns(snapshot_object.turns)
+        self.chat_panel.set_message_pagination(
+            has_older=snapshot_object.next_before_sequence is not None
+        )
+        self.history_page.set_messages(
+            snapshot_object.conversation_id,
+            snapshot_object.messages,
+            prepend=True,
+            has_older=snapshot_object.next_before_sequence is not None,
+        )
+
+    def _request_conversation_switch(self, conversation_id: str) -> None:
+        if not self._can_change_conversation():
+            self.data_service.refresh_history()
+            return
+        self._conversation_switch_pending = True
+        self.data_service.switch_conversation(conversation_id)
+
+    def _request_new_conversation(self) -> None:
+        if not self._can_change_conversation():
+            return
+        self._conversation_switch_pending = True
+        self.data_service.create_conversation()
+
+    def _request_delete_conversation(self, conversation_id: str) -> None:
+        if not self._can_change_conversation():
+            return
+        self._conversation_switch_pending = True
+        self.data_service.delete_conversation(conversation_id)
+
+    def _request_clear_history(self) -> None:
+        if not self._can_change_conversation():
+            return
+        self._conversation_switch_pending = True
+        self.data_service.clear_conversations()
+
+    def _request_older_history_messages(self, conversation_id: str) -> None:
+        if conversation_id == self.data_service.current_conversation_id:
+            self.data_service.load_older_messages()
+
+    def _can_change_conversation(self) -> bool:
+        if (
+            self._conversation_switch_pending
+            or self.conversation.state is not ConversationState.IDLE
+            or self.conversation.is_active
+        ):
+            self.history_page.set_status("请等当前回复结束后再管理会话。", error=True)
+            return False
+        return True
+
+    def _request_memory_search(
+        self,
+        query: str,
+        kind: str,
+        status: str,
+        sort: str,
+    ) -> None:
+        self.data_service.refresh_memories(
+            query,
+            kind,
+            status,
+            sort,
+            pinned=self.memory_page.pinned_filter,
+        )
+
+    def _on_memories_loaded(self, snapshot_object: object) -> None:
+        if not isinstance(snapshot_object, MemoryListSnapshot):
+            self.memory_page.set_status("记忆列表返回了无效数据。", error=True)
+            return
+        selected = self.memory_page.current_memory_id
+        self.memory_page.set_memories(snapshot_object.rows, selected)
+        self.memory_page.set_failed_tasks(snapshot_object.failed_jobs)
+        self.memory_page.set_status(f"已加载 {len(snapshot_object.rows)} 条本地记忆。")
+
+    def _set_memory_enabled(self, enabled: bool) -> None:
+        previous = bool(self.settings["memory"]["enabled"])
+        if enabled == previous:
+            return
+        candidate = deepcopy(self.settings)
+        candidate["memory"]["enabled"] = enabled
+        try:
+            self.settings_repository.save(candidate)
+        except SettingsError as exc:
+            self.logger.warning(
+                "Memory setting could not be saved error_type=%s", type(exc).__name__
+            )
+            self.memory_page.set_memory_enabled(previous)
+            self.memory_page.set_status("长期记忆开关保存失败，设置未改变。", error=True)
+            return
+        self.settings.clear()
+        self.settings.update(candidate)
+        self.data_service.set_memory_enabled(enabled)
+        self.memory_jobs.set_memory_enabled(enabled)
+        self.memory_page.set_memory_enabled(enabled)
+        self.memory_page.set_status(
+            "长期记忆已启用。" if enabled else "长期记忆已停用；聊天与摘要仍会保存。"
+        )
+
+    def _on_source_context_loaded(
+        self,
+        snapshot_object: object,
+        message_id: str,
+    ) -> None:
+        if not isinstance(snapshot_object, ConversationSnapshot):
+            return
+        conversation_id = (
+            ""
+            if snapshot_object.conversation is None
+            else snapshot_object.conversation.conversation_id
+        )
+        self.settings_window.show_and_activate("history")
+        self.history_page.set_conversations(snapshot_object.conversations, conversation_id)
+        self.history_page.set_messages(
+            conversation_id,
+            snapshot_object.messages,
+            has_older=snapshot_object.next_before_sequence is not None,
+        )
+        self.history_page.focus_message(message_id)
+
+    def _on_data_operation_failed(self, operation: str, category: str) -> None:
+        self.logger.warning(
+            "Local data operation failed operation=%s error_type=%s",
+            operation,
+            category,
+        )
+        self._conversation_switch_pending = False
+        message = "本地数据操作失败，请稍后重试。"
+        if operation in {"finalize", "checkpoint"}:
+            self.chat_panel.set_status(message, kind="error")
+        if operation.startswith("memory") or operation in {
+            "edit_memory",
+            "pin_memory",
+            "archive_memory",
+            "restore_memory",
+            "delete_memory",
+            "retry_job",
+        }:
+            self.memory_page.set_status(message, error=True)
+        else:
+            self.history_page.set_status(message, error=True)
 
     def _read_provider_secret(self) -> str | None:
         return self.credential_store.read_secret()
@@ -268,7 +610,7 @@ class ApplicationController:
         config_object: object,
         secret_object: object,
     ) -> None:
-        """Apply WinCred + JSON as a fail-closed transaction after a passed test."""
+        """Pause background generation without blocking Qt, then save fail-closed."""
 
         if not isinstance(config_object, ProviderConfig):
             self.model_settings_window.apply_save_result(
@@ -284,6 +626,12 @@ class ApplicationController:
                 message="供应商配置不安全或格式无效，未保存。",
             )
             return
+        if self._provider_switch_pending:
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="已有模型配置正在安全保存，请稍候。",
+            )
+            return
         if self.conversation.state is not ConversationState.IDLE or self.conversation.is_active:
             self.model_settings_window.apply_save_result(
                 success=False,
@@ -291,6 +639,111 @@ class ApplicationController:
             )
             return
         secret = secret_object if isinstance(secret_object, str) and secret_object else None
+        if secret is None and (
+            not self._settings_trusted
+            or self.settings.get("provider_enabled") is not True
+            or config_object.credential_scope != self.provider_config.credential_scope
+        ):
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="供应商、地址或鉴权方式已变化，请输入对应的新 API 密钥并重新测试。",
+            )
+            return
+
+        self._provider_switch_pending = True
+        self._provider_switch_generation += 1
+        generation = self._provider_switch_generation
+        if not self._background_jobs_enabled:
+            self._perform_provider_configuration_transaction(
+                config_object,
+                secret,
+                resume_background=False,
+            )
+            return
+        if self.memory_jobs.pause(wait_ms=0):
+            self._perform_provider_configuration_transaction(
+                config_object,
+                secret,
+                resume_background=True,
+            )
+            return
+
+        self._pending_provider_configuration = config_object
+        self._pending_provider_secret = secret
+        self.model_settings_window.status_label.setText(
+            "正在等待后台记忆任务安全停止；界面仍可使用。"
+        )
+        QTimer.singleShot(
+            2_000,
+            self.application,
+            lambda: self._on_provider_switch_timeout(generation),
+        )
+
+    def _on_background_provider_idle(self) -> None:
+        config = self._pending_provider_configuration
+        if not self._provider_switch_pending or config is None:
+            return
+        secret = self._pending_provider_secret
+        self._pending_provider_configuration = None
+        self._pending_provider_secret = None
+        self._provider_switch_generation += 1
+        self._perform_provider_configuration_transaction(
+            config,
+            secret,
+            resume_background=True,
+        )
+
+    def _on_provider_switch_timeout(self, generation: int) -> None:
+        if (
+            not self._provider_switch_pending
+            or generation != self._provider_switch_generation
+            or self._pending_provider_configuration is None
+        ):
+            return
+        self._pending_provider_configuration = None
+        self._pending_provider_secret = None
+        self._provider_switch_pending = False
+        self._provider_switch_generation += 1
+        self.memory_jobs.resume()
+        self.model_settings_window.apply_save_result(
+            success=False,
+            message="后台记忆任务未能及时停止，模型配置未更改。",
+        )
+
+    def _perform_provider_configuration_transaction(
+        self,
+        config_object: ProviderConfig,
+        secret: str | None,
+        *,
+        resume_background: bool,
+    ) -> None:
+        """Apply WinCred + JSON only after no background request owns the provider."""
+
+        try:
+            self._perform_provider_configuration_transaction_inner(config_object, secret)
+        finally:
+            self._pending_provider_configuration = None
+            self._pending_provider_secret = None
+            self._provider_switch_pending = False
+            self._provider_switch_generation += 1
+            if resume_background:
+                self.memory_jobs.resume()
+
+    def _perform_provider_configuration_transaction_inner(
+        self,
+        config_object: ProviderConfig,
+        secret: str | None,
+    ) -> None:
+        if (
+            self._exiting
+            or self.conversation.state is not ConversationState.IDLE
+            or self.conversation.is_active
+        ):
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="当前状态已变化，模型配置未更改。",
+            )
+            return
         if secret is None and (
             not self._settings_trusted
             or self.settings.get("provider_enabled") is not True
@@ -338,6 +791,7 @@ class ApplicationController:
         disabled_marker_saved = False
         credential_write_attempted = False
         provider_switched = False
+        background_provider_switched = False
         try:
             candidate_provider = OpenAICompatibleChatProvider(
                 config_object,
@@ -353,15 +807,24 @@ class ApplicationController:
                 if not self.conversation.set_provider(disabled_provider):
                     raise SettingsError("Provider could not be disabled while saving.")
                 provider_switched = True
+                if not self.background_generation.set_provider(disabled_provider):
+                    raise SettingsError("Background provider could not be disabled while saving.")
+                background_provider_switched = True
             if secret is not None:
                 credential_write_attempted = True
                 self.credential_store.write_secret(secret)
             if not self._mock_chat and not self.conversation.set_provider(candidate_provider):
                 raise SettingsError("Provider could not be switched while saving.")
+            if not self._mock_chat and not self.background_generation.set_provider(
+                candidate_provider
+            ):
+                raise SettingsError("Background provider could not be switched while saving.")
             self.settings_repository.save(candidate_settings)
         except (CredentialStoreError, SettingsError, ValueError) as exc:
             if provider_switched:
                 self.conversation.set_provider(disabled_provider)
+            if background_provider_switched:
+                self.background_generation.set_provider(disabled_provider)
             settings_restored, credential_restored = self._restore_provider_transaction(
                 settings_snapshot,
                 previous_secret,
@@ -371,14 +834,25 @@ class ApplicationController:
             provider_restored = not provider_switched or self.conversation.set_provider(
                 previous_provider
             )
-            restored = settings_restored and credential_restored and provider_restored
+            background_provider_restored = (
+                not background_provider_switched
+                or self.background_generation.set_provider(previous_provider)
+            )
+            restored = (
+                settings_restored
+                and credential_restored
+                and provider_restored
+                and background_provider_restored
+            )
             self.logger.warning(
                 "Provider configuration save failed error_type=%s settings_rollback=%s "
-                "credential_rollback=%s provider_rollback=%s",
+                "credential_rollback=%s provider_rollback=%s "
+                "background_provider_rollback=%s",
                 type(exc).__name__,
                 settings_restored,
                 credential_restored,
                 provider_restored,
+                background_provider_restored,
             )
             message = (
                 "配置保存失败，原配置已恢复。"
@@ -398,6 +872,7 @@ class ApplicationController:
                     self._chat_available = False
                     safe_provider = UnconfiguredChatProvider()
                     self.conversation.set_provider(safe_provider)
+                    self.background_generation.set_provider(safe_provider)
                     self._active_chat_provider = safe_provider
                     self.chat_panel.set_provider_mode("unconfigured")
             self.model_settings_window.apply_save_result(success=False, message=message)
@@ -410,6 +885,10 @@ class ApplicationController:
             self._active_chat_provider = candidate_provider
         self._settings_trusted = True
         self._chat_available = True
+        self.data_service.set_provider_metadata(
+            config_object.preset.value,
+            config_object.model,
+        )
         if self._mock_chat:
             self.chat_panel.set_provider_mode("mock")
         else:
@@ -453,8 +932,21 @@ class ApplicationController:
             self.show_pet()
 
     def _send_chat_message(self, text: str) -> None:
+        if self._provider_switch_pending:
+            self.chat_panel.set_status("对话模型切换中，请稍候。", kind="error")
+            return
         if not self._chat_available:
             self.chat_panel.set_status("请先配置并测试对话模型。", kind="error")
+            return
+        if not self._data_initialized:
+            self._pending_initial_message = text
+            self.chat_panel.set_status("正在初始化本地聊天数据，稍后会自动发送。")
+            return
+        if not self._data_writable:
+            self.chat_panel.set_status("本地数据当前无法安全写入，消息未发送。", kind="error")
+            return
+        if self._conversation_switch_pending:
+            self.chat_panel.set_status("会话切换中，请稍候。", kind="error")
             return
         started = time.perf_counter()
         turn = self.conversation.send_message(text)
@@ -464,8 +956,17 @@ class ApplicationController:
             self._turn_started_at[turn.turn_id] = started
 
     def _retry_chat_turn(self, turn_id: str) -> None:
+        if self._provider_switch_pending:
+            self.chat_panel.set_status("对话模型切换中，请稍候。", kind="error")
+            return
         if not self._chat_available:
             self.chat_panel.set_status("请先配置并测试对话模型。", kind="error")
+            return
+        if not self._data_initialized or not self._data_writable:
+            self.chat_panel.set_status("本地数据当前无法安全写入，无法重试。", kind="error")
+            return
+        if self._conversation_switch_pending:
+            self.chat_panel.set_status("会话切换中，请稍候。", kind="error")
             return
         started = time.perf_counter()
         if not self.conversation.retry(turn_id):
@@ -512,6 +1013,8 @@ class ApplicationController:
         )
 
     def _on_conversation_state_changed(self, state: ConversationState) -> None:
+        if self._background_jobs_enabled:
+            self.memory_jobs.set_foreground_active(state is not ConversationState.IDLE)
         self.chat_panel.set_conversation_state(state)
         animation = self.pet_window.animation
         if state is ConversationState.SENDING:
@@ -648,7 +1151,7 @@ class ApplicationController:
         self.window.prepare_to_exit()
         self.window.hide()
         self.chat_panel.hide()
-        self.model_settings_window.hide()
+        self.settings_window.hide()
         self.pet_window.hide()
         if self.tray is not None:
             self.tray.close()
@@ -662,26 +1165,41 @@ class ApplicationController:
                 self.tray.close()
             self._shutdown_background_tasks()
             self.chat_panel.hide()
-            self.model_settings_window.hide()
+            self.settings_window.hide()
             self.pet_window.hide()
             self.instance_guard.close()
 
-    def _shutdown_background_tasks(self, timeout_ms: int = 2_000) -> bool:
-        """Cancel both worker families and share one bounded exit deadline."""
+    def _shutdown_background_tasks(self, timeout_ms: int = 5_000) -> bool:
+        """Cancel network work, persist terminal states, then drain the data thread."""
 
+        self._pending_provider_configuration = None
+        self._pending_provider_secret = None
+        self._provider_switch_pending = False
+        self._provider_switch_generation += 1
         deadline = time.monotonic() + max(0, timeout_ms) / 1_000
+        background_clean = self.memory_jobs.shutdown(
+            wait_ms=max(0, round((deadline - time.monotonic()) * 1000))
+        )
         # Start cancellation for the connection test before waiting on conversation cleanup.
         self.model_settings_window.cancel_test()
         remaining_ms = max(0, round((deadline - time.monotonic()) * 1_000))
         conversation_clean = self.conversation.shutdown(wait_ms=remaining_ms)
         remaining_ms = max(0, round((deadline - time.monotonic()) * 1_000))
-        settings_clean = self.model_settings_window.shutdown(wait_ms=remaining_ms)
+        settings_clean = self.settings_window.shutdown(wait_ms=remaining_ms)
+        remaining_ms = max(0, round((deadline - time.monotonic()) * 1000))
+        data_clean = self.data_service.shutdown(wait_ms=remaining_ms)
         if not conversation_clean:
             self.logger.error(
                 "Conversation worker did not stop within the shared shutdown deadline"
+            )
+        if not background_clean:
+            self.logger.error(
+                "Background memory worker did not stop within the shared shutdown deadline"
             )
         if not settings_clean:
             self.logger.error(
                 "Provider connection test did not stop within the shared shutdown deadline"
             )
-        return conversation_clean and settings_clean
+        if not data_clean:
+            self.logger.error("Local data thread did not stop within the shutdown deadline")
+        return background_clean and conversation_clean and settings_clean and data_clean

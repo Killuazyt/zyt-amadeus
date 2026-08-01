@@ -46,6 +46,18 @@ class AppPaths:
     def log_file(self) -> Path:
         return self.directory(AppDirectory.LOGS) / "amadeus.log"
 
+    @property
+    def database_file(self) -> Path:
+        """Return the single local SQLite database used by P5 and later phases."""
+
+        return self.directory(AppDirectory.DATA) / "amadeus.sqlite3"
+
+    @property
+    def migration_backup_directory(self) -> Path:
+        """Return the private directory reserved for automatic migration backups."""
+
+        return self.directory(AppDirectory.BACKUPS) / "migrations"
+
     def initialize(self) -> None:
         """Create only the directories needed during P1 startup."""
 

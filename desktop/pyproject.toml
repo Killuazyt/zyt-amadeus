@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amadeus-desktop"
-version = "0.4.0.dev4"
-description = "Windows desktop pet with secure OpenAI-compatible text chat"
+version = "0.5.0.dev5"
+description = "Windows desktop pet with secure chat and auditable local memory"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [

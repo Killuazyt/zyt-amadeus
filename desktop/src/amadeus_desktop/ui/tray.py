@@ -34,6 +34,7 @@ class TrayController(QObject):
     toggle_requested = Signal()
     show_requested = Signal()
     model_settings_requested = Signal()
+    memory_requested = Signal()
     exit_requested = Signal()
 
     def __init__(
@@ -46,6 +47,7 @@ class TrayController(QObject):
         self._menu = QMenu()
         self.toggle_action = self._menu.addAction("隐藏宠物")
         self.model_settings_action = self._menu.addAction("对话模型设置…")
+        self.memory_action = self._menu.addAction("记忆管理…")
         self._menu.addSeparator()
         self.exit_action = self._menu.addAction("退出")
 
@@ -55,6 +57,7 @@ class TrayController(QObject):
 
         self.toggle_action.triggered.connect(self.toggle_requested.emit)
         self.model_settings_action.triggered.connect(self.model_settings_requested.emit)
+        self.memory_action.triggered.connect(self.memory_requested.emit)
         self.exit_action.triggered.connect(self.exit_requested.emit)
         self._tray.activated.connect(self._on_activated)
 

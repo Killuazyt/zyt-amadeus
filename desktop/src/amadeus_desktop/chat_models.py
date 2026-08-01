@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 
@@ -33,6 +34,43 @@ class PromptRole(StrEnum):
     ASSISTANT = "assistant"
 
 
+class GenerationPurpose(StrEnum):
+    """Why a provider request is being made.
+
+    The value is deliberately provider-neutral so background generation can
+    share the P4 provider boundary without being mistaken for visible chat.
+    """
+
+    MAIN_CONVERSATION = "main_conversation"
+    CONVERSATION_SUMMARY = "conversation_summary"
+    MEMORY_EXTRACTION = "memory_extraction"
+    STRUCTURE_REPAIR = "structure_repair"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationOptions:
+    """Optional per-request generation limits for foreground/background work."""
+
+    purpose: GenerationPurpose = GenerationPurpose.MAIN_CONVERSATION
+    temperature: float | None = None
+    max_output_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.temperature is not None and (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not math.isfinite(self.temperature)
+            or not 0 <= self.temperature <= 2
+        ):
+            raise ValueError("temperature must be a finite number between 0 and 2")
+        if self.max_output_tokens is not None and (
+            isinstance(self.max_output_tokens, bool)
+            or not isinstance(self.max_output_tokens, int)
+            or self.max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
+
+
 class MessageStatus(StrEnum):
     """Persistence-independent status of one in-memory message."""
 
@@ -52,6 +90,7 @@ class TurnTerminalReason(StrEnum):
     STREAM_IDLE_TIMEOUT = "stream_idle_timeout"
     PROVIDER_ERROR = "provider_error"
     EMPTY_RESPONSE = "empty_response"
+    LOCAL_PERSISTENCE_ERROR = "local_persistence_error"
     SHUTDOWN = "shutdown"
 
 
@@ -96,3 +135,4 @@ class ChatRequest:
     turn_id: str
     attempt: int
     messages: tuple[PromptMessage, ...]
+    options: GenerationOptions = field(default_factory=GenerationOptions)

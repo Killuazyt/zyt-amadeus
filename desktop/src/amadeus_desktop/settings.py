@@ -14,7 +14,7 @@ from typing import Any
 
 from amadeus_desktop.provider_config import ProviderConfig, ProviderConfigError
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -30,6 +30,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "provider_enabled": False,
     "provider": ProviderConfig.default().to_mapping(),
+    "memory": {
+        "enabled": True,
+    },
 }
 
 _FORBIDDEN_SETTING_KEYS = {
@@ -97,10 +100,18 @@ def _migrate_v2_to_v3(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v3_to_v4(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 4
+    migrated.setdefault("memory", deepcopy(DEFAULT_SETTINGS["memory"]))
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
+    3: _migrate_v3_to_v4,
 }
 
 
@@ -269,6 +280,14 @@ class SettingsRepository:
             raise InvalidSettingsError("The provider settings section is invalid.") from exc
         if not isinstance(settings.get("provider_enabled"), bool):
             raise InvalidSettingsError("provider_enabled must be a boolean.")
+
+        memory = settings.get("memory")
+        if not isinstance(memory, Mapping):
+            raise InvalidSettingsError("The memory settings section must be an object.")
+        if set(memory) != {"enabled"}:
+            raise InvalidSettingsError("The memory settings section contains unsupported fields.")
+        if not isinstance(memory.get("enabled"), bool):
+            raise InvalidSettingsError("memory.enabled must be a boolean.")
 
     @staticmethod
     def _validate_pet_position(position: Any) -> None:

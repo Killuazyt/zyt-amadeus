@@ -68,6 +68,10 @@ def add_controller_widgets(qtbot, controller: ApplicationController) -> None:
 
 
 def send_from_panel(qtbot, controller: ApplicationController, text: str) -> None:
+    qtbot.waitUntil(
+        lambda: controller._data_initialized and controller._data_writable,
+        timeout=2_000,
+    )
     controller.show_chat()
     controller.chat_panel.input.setPlainText(text)
     qtbot.keyClick(controller.chat_panel.input, Qt.Key.Key_Return)

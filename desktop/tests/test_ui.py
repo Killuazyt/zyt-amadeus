@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from copy import deepcopy
 from dataclasses import replace
 
 import pytest
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
+from amadeus_desktop.chat_models import ChatRequest, PromptMessage, PromptRole
 from amadeus_desktop.chat_provider import (
     CancellationRequested,
     CancellationToken,
@@ -137,6 +139,21 @@ class BlockingConnectionTester:
             raise CancellationRequested from exc
         finally:
             cancellation.unbind_current_task()
+
+
+class SlowCancellationProvider:
+    def __init__(self, delay_seconds: float = 0.25) -> None:
+        self.delay_seconds = delay_seconds
+        self.started = threading.Event()
+
+    async def stream(self, _request, _cancellation):
+        self.started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            # Model a provider that needs bounded cleanup after cancellation.
+            await asyncio.sleep(self.delay_seconds)
+        yield "late synthetic output"
 
 
 def test_generic_icon_requires_no_external_asset(qapp) -> None:
@@ -349,7 +366,65 @@ def test_successful_provider_transaction_enables_real_provider(
         assert persisted["provider_enabled"] is True
         assert store.read_secret() == "new-invalid-test-key"
         assert controller.chat_panel.provider_mode == "provider"
+        assert not controller.memory_jobs.is_paused
+        assert not controller.background_generation.is_paused
     finally:
+        controller.request_exit()
+
+
+def test_provider_switch_waits_for_slow_background_cancel_without_blocking_qt(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    store = InMemoryCredentialStore()
+    controller = make_controller(
+        qapp,
+        tmp_path,
+        tray_available=False,
+        credential_store=store,
+    )
+    slow_provider = SlowCancellationProvider()
+    heartbeats = 0
+    timer = QTimer()
+    timer.setInterval(10)
+
+    def heartbeat() -> None:
+        nonlocal heartbeats
+        heartbeats += 1
+
+    timer.timeout.connect(heartbeat)
+    request = ChatRequest(
+        request_id="background-switch-test",
+        turn_id="background-switch-test",
+        attempt=1,
+        messages=(PromptMessage(PromptRole.USER, "synthetic"),),
+    )
+    try:
+        assert controller.background_generation.set_provider(slow_provider)
+        assert controller.background_generation.start(
+            request,
+            on_success=lambda _content: None,
+            on_failure=lambda _category: None,
+        )
+        qtbot.waitUntil(slow_provider.started.is_set, timeout=1_000)
+        timer.start()
+
+        started = time.perf_counter()
+        controller._save_provider_configuration(
+            controller.provider_config,
+            "new-invalid-test-key",
+        )
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.1
+        assert controller._provider_switch_pending
+        qtbot.waitUntil(lambda: not controller._provider_switch_pending, timeout=2_000)
+        assert heartbeats >= 5
+        assert controller.settings["provider_enabled"] is True
+        assert store.read_secret() == "new-invalid-test-key"
+    finally:
+        timer.stop()
         controller.request_exit()
 
 

@@ -191,6 +191,7 @@ class ChatPanel(QWidget):
     retry_requested = Signal(str)
     hide_requested = Signal()
     configure_requested = Signal()
+    load_older_requested = Signal()
     visibility_changed = Signal(bool)
 
     def __init__(self) -> None:
@@ -209,7 +210,10 @@ class ChatPanel(QWidget):
         self._message_order: list[str] = []
         self._bubble_resize_scheduled = False
         self._chat_enabled = True
+        self._storage_ready = True
         self._provider_mode = "mock"
+        self._has_older_messages = False
+        self._loading_older_messages = False
 
         self.setObjectName("chatPanel")
         self.setWindowTitle("Amadeus 对话")
@@ -266,6 +270,7 @@ class ChatPanel(QWidget):
         self.empty_state.setWordWrap(True)
         self.message_layout.addWidget(self.empty_state)
         self.scroll_area.setWidget(self.message_container)
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
 
         self.status_label = QLabel("就绪")
         self.status_label.setObjectName("conversationStatus")
@@ -346,7 +351,19 @@ class ChatPanel(QWidget):
         self.provider_banner.style().polish(self.provider_banner)
         self.empty_state.setText(empty)
         self.input.setPlaceholderText(placeholder)
-        self.input.setEnabled(self._chat_enabled)
+        self.input.setEnabled(self._chat_enabled and self._storage_ready)
+        self._sync_retry_enabled()
+        self._sync_action_enabled()
+
+    def set_storage_availability(self, ready: bool, *, read_only: bool = False) -> None:
+        """Allow queued startup input, but disable writes after fail-closed opening."""
+
+        self._storage_ready = not read_only
+        self.input.setEnabled(self._chat_enabled and self._storage_ready)
+        if read_only:
+            self.set_status("本地数据库处于只读保护状态，无法发送新消息。", kind="error")
+        elif not ready:
+            self.set_status("正在初始化本地聊天数据…", kind="working")
         self._sync_retry_enabled()
         self._sync_action_enabled()
 
@@ -388,6 +405,25 @@ class ChatPanel(QWidget):
         self.status_label.setProperty("kind", kind)
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
+
+    def set_message_pagination(self, *, has_older: bool, loading: bool = False) -> None:
+        """Advertise whether reaching the top should request another 40 rows."""
+
+        self._has_older_messages = has_older
+        self._loading_older_messages = loading
+        if has_older and not loading:
+            QTimer.singleShot(
+                0,
+                self,
+                lambda: self._on_scroll_value_changed(self.scroll_area.verticalScrollBar().value()),
+            )
+
+    @Slot(int)
+    def _on_scroll_value_changed(self, value: int) -> None:
+        if value > 0 or not self._has_older_messages or self._loading_older_messages:
+            return
+        self._loading_older_messages = True
+        self.load_older_requested.emit()
 
     def append_message(
         self,
@@ -568,7 +604,12 @@ class ChatPanel(QWidget):
         self.hide()
 
     def _request_send(self) -> None:
-        if not self._chat_enabled or self._turn_locked or self._send_pending:
+        if (
+            not self._chat_enabled
+            or not self._storage_ready
+            or self._turn_locked
+            or self._send_pending
+        ):
             return
         text = self.input.toPlainText()
         if not text.strip():
@@ -598,7 +639,7 @@ class ChatPanel(QWidget):
             self._request_send()
 
     def _sync_action_enabled(self) -> None:
-        if not self._chat_enabled:
+        if not self._chat_enabled or not self._storage_ready:
             self.action_button.setEnabled(False)
             return
         if self._conversation_active:
@@ -612,7 +653,9 @@ class ChatPanel(QWidget):
 
     def _sync_retry_enabled(self) -> None:
         for bubble in self._messages.values():
-            bubble.set_retry_enabled(self._chat_enabled and not self._turn_locked)
+            bubble.set_retry_enabled(
+                self._chat_enabled and self._storage_ready and not self._turn_locked
+            )
 
     def _create_bubble(
         self,
