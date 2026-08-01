@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amadeus-desktop"
-version = "0.2.0.dev2"
-description = "Windows desktop-pet window and sprite engine for the Amadeus companion"
+version = "0.3.0.dev3"
+description = "Windows desktop pet with an attached local-simulation chat interface"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [

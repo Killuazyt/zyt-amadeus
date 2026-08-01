@@ -85,6 +85,12 @@ class AnimationController(QObject):
         self._transient_state = state
         self._resolve_state()
 
+    def clear_transient(self) -> None:
+        """Cancel only short feedback while preserving ongoing activities."""
+
+        self._transient_state = None
+        self._resolve_state()
+
     def clear(self) -> None:
         self._active_states.clear()
         self._transient_state = None

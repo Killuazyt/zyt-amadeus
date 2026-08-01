@@ -60,3 +60,13 @@ def test_transient_action_returns_to_active_state(qapp, qtbot) -> None:
 
     assert controller.state == "error"
     qtbot.waitUntil(lambda: controller.state == "waiting", timeout=2000)
+
+
+def test_clear_transient_preserves_active_state(qapp) -> None:
+    controller = make_controller()
+    controller.set_activity("waiting", True)
+    controller.trigger("error")
+
+    controller.clear_transient()
+
+    assert controller.state == "waiting"

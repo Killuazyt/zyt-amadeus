@@ -168,3 +168,42 @@ def test_drag_keeps_original_mouse_anchor(qapp, qtbot, tmp_path) -> None:
     )
 
     assert window.pos() == start_position + QPoint(75, -20)
+
+
+def test_click_only_emits_intent_and_does_not_choose_feedback(qapp, qtbot, tmp_path) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+    clicks: list[bool] = []
+    window.clicked.connect(lambda: clicks.append(True))
+    point = window.pos() + window.rect().center()
+
+    send_mouse(
+        window,
+        QEvent.Type.MouseButtonPress,
+        point,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+    )
+    send_mouse(
+        window,
+        QEvent.Type.MouseButtonRelease,
+        point,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+    )
+
+    assert clicks == [True]
+    assert window.animation.state == "idle"
+
+
+def test_position_signal_follows_programmatic_moves(qapp, qtbot, tmp_path) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+    positions: list[QPoint] = []
+    window.position_changed.connect(positions.append)
+    window.show()
+    qtbot.waitUntil(window.isVisible)
+
+    window.move(240, 180)
+
+    qtbot.waitUntil(lambda: bool(positions) and positions[-1] == QPoint(240, 180))

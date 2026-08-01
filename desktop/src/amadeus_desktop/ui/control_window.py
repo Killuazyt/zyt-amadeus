@@ -1,4 +1,4 @@
-"""Minimal ordinary control window used before the desktop pet exists."""
+"""Fallback ordinary control window used when the system tray is unavailable."""
 
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ class ControlWindow(QWidget):
         title = QLabel("Amadeus 桌宠控制")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
 
-        status = QLabel(status_message or "P2 桌宠动作引擎正在运行。文字聊天将在 P3 实现。")
+        status = QLabel(
+            status_message or "P3 桌宠与本地模拟文字聊天正在运行；当前不会连接真实模型。"
+        )
         status.setWordWrap(True)
 
         self.hide_button = QPushButton("隐藏窗口")

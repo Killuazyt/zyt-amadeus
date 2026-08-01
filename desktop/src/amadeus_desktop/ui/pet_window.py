@@ -8,6 +8,7 @@ from PySide6.QtGui import (
     QHideEvent,
     QImage,
     QMouseEvent,
+    QMoveEvent,
     QPainter,
     QPaintEvent,
     QPixmap,
@@ -31,6 +32,7 @@ class PetWindow(QWidget):
     drag_started = Signal()
     drag_direction_changed = Signal(str)
     drag_finished = Signal(object)
+    position_changed = Signal(object)
     visibility_changed = Signal(bool)
 
     def __init__(
@@ -215,12 +217,15 @@ class PetWindow(QWidget):
             self.drag_finished.emit(self.pos())
         else:
             self.clicked.emit()
-            self.animation.trigger("greeting")
         self._press_global = None
         self._press_window_position = None
         self._last_global = None
         self._dragging = False
         event.accept()
+
+    def moveEvent(self, event: QMoveEvent) -> None:  # noqa: N802 - Qt API name
+        super().moveEvent(event)
+        self.position_changed.emit(self.pos())
 
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt API name
         super().showEvent(event)

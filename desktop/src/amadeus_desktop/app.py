@@ -1,4 +1,4 @@
-"""Composition root for the P1 desktop application."""
+"""Composition root for the Amadeus desktop application."""
 
 from __future__ import annotations
 

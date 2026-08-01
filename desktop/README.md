@@ -1,11 +1,13 @@
 # Amadeus Desktop
 
-P2 provides the Python 3.11 + PySide6 desktop-pet window and sprite engine on top of the tested P1
-application foundation. It includes safe local pet import, a versioned pet manifest, legacy
-8×9 sprite compatibility, fixed-clock animation, transparent hit testing, manual drag placement,
-multi-screen recovery, a bundled CC0 placeholder pet, and the system tray lifecycle.
+P3 adds an attached text-chat panel and deterministic local streaming simulation on top of the
+tested P1 application foundation and P2 desktop-pet engine. The application includes safe local
+pet import, fixed-clock animation, transparent hit testing, manual drag placement, multi-screen
+recovery, a bundled CC0 placeholder pet, cancellable chat states, and the system tray lifecycle.
 
-It does not contain chat, model providers, memory, speech, screen observation, or automation.
+The P3 provider is local and synthetic: it makes no network request and stores messages only for
+the current process. Real model providers, credentials, SQLite history, long-term memory, speech,
+screen observation, and automation are not included.
 
 ## Development commands
 
@@ -50,4 +52,4 @@ The application entry point is:
 ```
 
 Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. Imported pets are copied into its `pets`
-directory; the source package is never modified. No API credentials are accepted or stored by P2.
+directory; the source package is never modified. No API credentials are accepted or stored by P3.
