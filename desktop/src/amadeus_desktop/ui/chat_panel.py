@@ -1,4 +1,4 @@
-"""Focusable, pet-attached chat panel for the P3 local conversation flow."""
+"""Focusable, pet-attached chat panel for the P4 conversation flow."""
 
 from __future__ import annotations
 
@@ -190,6 +190,7 @@ class ChatPanel(QWidget):
     stop_requested = Signal()
     retry_requested = Signal(str)
     hide_requested = Signal()
+    configure_requested = Signal()
     visibility_changed = Signal(bool)
 
     def __init__(self) -> None:
@@ -207,6 +208,8 @@ class ChatPanel(QWidget):
         self._messages: dict[str, MessageBubble] = {}
         self._message_order: list[str] = []
         self._bubble_resize_scheduled = False
+        self._chat_enabled = True
+        self._provider_mode = "mock"
 
         self.setObjectName("chatPanel")
         self.setWindowTitle("Amadeus 对话")
@@ -218,6 +221,11 @@ class ChatPanel(QWidget):
 
         title = QLabel("Amadeus")
         title.setObjectName("panelTitle")
+        self.configure_button = QPushButton("模型设置")
+        self.configure_button.setObjectName("configureButton")
+        self.configure_button.setAccessibleName("打开对话模型设置")
+        self.configure_button.setAutoDefault(False)
+        self.configure_button.clicked.connect(self.configure_requested.emit)
         self.close_button = QPushButton("×")
         self.close_button.setObjectName("closeButton")
         self.close_button.setAccessibleName("收起聊天面板")
@@ -228,11 +236,15 @@ class ChatPanel(QWidget):
         header.setContentsMargins(0, 0, 0, 0)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.configure_button)
         header.addWidget(self.close_button)
 
-        self.mock_banner = QLabel("本地模拟模式 · 不会连接网络或使用 API 密钥")
-        self.mock_banner.setObjectName("mockBanner")
-        self.mock_banner.setWordWrap(True)
+        self.provider_banner = QLabel("本地模拟模式 · 不会连接网络或使用 API 密钥")
+        self.provider_banner.setObjectName("providerBanner")
+        self.provider_banner.setProperty("mode", "mock")
+        self.provider_banner.setWordWrap(True)
+        # Kept as a compatibility alias for the P3 UI checks.
+        self.mock_banner = self.provider_banner
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("messageScroll")
@@ -284,7 +296,7 @@ class ChatPanel(QWidget):
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(9)
         layout.addLayout(header)
-        layout.addWidget(self.mock_banner)
+        layout.addWidget(self.provider_banner)
         layout.addWidget(self.scroll_area, 1)
         layout.addWidget(self.status_label)
         layout.addLayout(composer)
@@ -304,6 +316,39 @@ class ChatPanel(QWidget):
 
     def message_widget(self, message_id: str) -> MessageBubble | None:
         return self._messages.get(message_id)
+
+    @property
+    def provider_mode(self) -> str:
+        return self._provider_mode
+
+    def set_provider_mode(self, mode: str, *, provider_name: str | None = None) -> None:
+        """Present explicit mock, configured provider, or unconfigured modes."""
+
+        if mode not in {"mock", "provider", "unconfigured"}:
+            raise ValueError(f"Unsupported chat provider mode: {mode}")
+        self._provider_mode = mode
+        self._chat_enabled = mode != "unconfigured"
+        if mode == "mock":
+            banner = "本地模拟模式 · 不会连接网络或使用 API 密钥"
+            empty = "还没有消息。\n输入文字，验证本地模拟流式对话。"
+            placeholder = "输入消息；Enter 发送，Shift+Enter 换行"
+        elif mode == "provider":
+            banner = f"真实模型 · {provider_name or '已配置供应商'}"
+            empty = "还没有消息。\n输入文字开始对话。"
+            placeholder = "输入消息；Enter 发送，Shift+Enter 换行"
+        else:
+            banner = "尚未配置对话模型 · 请先打开模型设置并通过连接测试"
+            empty = "尚未配置可用的对话模型。\n点击右上角“模型设置”完成配置。"
+            placeholder = "请先配置对话模型"
+        self.provider_banner.setText(banner)
+        self.provider_banner.setProperty("mode", mode)
+        self.provider_banner.style().unpolish(self.provider_banner)
+        self.provider_banner.style().polish(self.provider_banner)
+        self.empty_state.setText(empty)
+        self.input.setPlaceholderText(placeholder)
+        self.input.setEnabled(self._chat_enabled)
+        self._sync_retry_enabled()
+        self._sync_action_enabled()
 
     def show_and_focus(self) -> None:
         self.show()
@@ -523,7 +568,7 @@ class ChatPanel(QWidget):
         self.hide()
 
     def _request_send(self) -> None:
-        if self._turn_locked or self._send_pending:
+        if not self._chat_enabled or self._turn_locked or self._send_pending:
             return
         text = self.input.toPlainText()
         if not text.strip():
@@ -553,6 +598,9 @@ class ChatPanel(QWidget):
             self._request_send()
 
     def _sync_action_enabled(self) -> None:
+        if not self._chat_enabled:
+            self.action_button.setEnabled(False)
+            return
         if self._conversation_active:
             self.action_button.setEnabled(not self._stop_pending)
         elif self._turn_locked:
@@ -564,7 +612,7 @@ class ChatPanel(QWidget):
 
     def _sync_retry_enabled(self) -> None:
         for bubble in self._messages.values():
-            bubble.set_retry_enabled(not self._turn_locked)
+            bubble.set_retry_enabled(self._chat_enabled and not self._turn_locked)
 
     def _create_bubble(
         self,
@@ -731,12 +779,30 @@ QPushButton#closeButton {
     min-height: 28px;
 }
 QPushButton#closeButton:hover { color: #f8fafc; background: #1e293b; border-radius: 6px; }
-QLabel#mockBanner {
+QPushButton#configureButton {
+    background: transparent;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #cbd5e1;
+    padding: 4px 8px;
+}
+QPushButton#configureButton:hover { color: #f8fafc; border-color: #22d3ee; }
+QLabel#providerBanner {
     background: #172554;
     border: 1px solid #1d4ed8;
     border-radius: 7px;
     color: #bfdbfe;
     padding: 7px 9px;
+}
+QLabel#providerBanner[mode="provider"] {
+    background: #052e16;
+    border-color: #15803d;
+    color: #bbf7d0;
+}
+QLabel#providerBanner[mode="unconfigured"] {
+    background: #451a03;
+    border-color: #b45309;
+    color: #fed7aa;
 }
 QScrollArea#messageScroll, QWidget#messageContainer { background: transparent; }
 QLabel#emptyState { color: #94a3b8; padding: 30px 18px; }

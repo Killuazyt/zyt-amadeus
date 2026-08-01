@@ -18,7 +18,9 @@ from amadeus_desktop.single_instance import DEFAULT_SERVER_NAME, SingleInstance
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv if argv is None else argv)
-    application = QApplication(arguments)
+    mock_chat = "--mock-chat" in arguments[1:]
+    qt_arguments = [argument for argument in arguments if argument != "--mock-chat"]
+    application = QApplication(qt_arguments)
     application.setApplicationName("Amadeus")
     application.setApplicationDisplayName("Amadeus")
     application.setApplicationVersion(__version__)
@@ -35,6 +37,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("Application starting version=%s", __version__)
 
     status_message: str | None = None
+    settings_trusted = True
     repository = SettingsRepository(paths.settings_file)
     try:
         settings = repository.load_or_create()
@@ -42,6 +45,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.warning("Settings unavailable error_type=%s", type(exc).__name__)
         status_message = "设置文件无法读取，当前使用临时默认值；原文件没有被覆盖。详情请查看日志。"
         settings = deepcopy(DEFAULT_SETTINGS)
+        settings_trusted = False
 
     controller = ApplicationController(
         application,
@@ -51,6 +55,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings_repository=repository,
         settings=settings,
         status_message=status_message,
+        mock_chat=mock_chat,
+        allow_saved_provider=settings_trusted,
     )
     exit_code = application.exec()
     controller._cleanup()

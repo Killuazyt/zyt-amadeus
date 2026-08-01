@@ -1,7 +1,8 @@
-"""Qt-safe conversation coordinator for the P3 simulated chat vertical slice."""
+"""Qt-safe conversation coordinator for cancellable P4 text providers."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, replace
 from uuid import uuid4
@@ -16,13 +17,17 @@ from amadeus_desktop.chat_models import (
     MessageRole,
     MessageStatus,
     PromptMessage,
+    PromptRole,
     TurnTerminalReason,
 )
 from amadeus_desktop.chat_provider import (
     CancellationRequested,
     CancellationToken,
     ChatProvider,
+    ChatProviderError,
+    ProviderErrorCode,
 )
+from amadeus_desktop.persona import build_persona_system_prompt
 
 FIRST_CHUNK_TIMEOUT_TEXT = "等待回复首段超时，请重试。"
 STREAM_IDLE_TIMEOUT_TEXT = "回复流式输出超时，请重试。"
@@ -30,13 +35,14 @@ EMPTY_RESPONSE_TEXT = "供应商未返回可显示的文本，请重试。"
 USER_STOPPED_TEXT = "用户已停止"
 COMPLETED_TEXT = "回复完成"
 SHUTDOWN_TEXT = "应用退出时已停止"
+MAX_VISIBLE_RESPONSE_CHARS = 1024 * 1024
 
 
 class _ProviderWorker(QObject):
     chunk_ready = Signal(str, str)
     completed = Signal(str)
     cancelled = Signal(str)
-    failed = Signal(str, str)
+    failed = Signal(str, str, str)
     done = Signal()
 
     def __init__(
@@ -53,21 +59,39 @@ class _ProviderWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            for chunk in self._provider.stream(self._request, self._cancellation):
-                self._cancellation.raise_if_cancelled()
-                if not isinstance(chunk, str):
-                    raise TypeError("provider chunks must be strings")
-                if chunk:
-                    self.chunk_ready.emit(self._request.request_id, chunk)
-            self._cancellation.raise_if_cancelled()
+            asyncio.run(self._consume())
             self.completed.emit(self._request.request_id)
         except CancellationRequested:
             self.cancelled.emit(self._request.request_id)
-        except Exception as exc:  # noqa: BLE001 - provider boundary normalizes all failures
-            message = str(exc).strip() or type(exc).__name__
-            self.failed.emit(self._request.request_id, message)
+        except ChatProviderError as exc:
+            self.failed.emit(
+                self._request.request_id,
+                exc.code.value,
+                exc.safe_message,
+            )
+        except Exception:  # noqa: BLE001 - raw provider errors must never reach UI/logs
+            self.failed.emit(
+                self._request.request_id,
+                ProviderErrorCode.PROTOCOL.value,
+                "供应商任务失败，请重试。",
+            )
         finally:
             self.done.emit()
+
+    async def _consume(self) -> None:
+        self._cancellation.bind_current_task()
+        try:
+            async for chunk in self._provider.stream(self._request, self._cancellation):
+                self._cancellation.raise_if_cancelled()
+                if not isinstance(chunk, str):
+                    raise ChatProviderError("供应商返回了无效文本片段，请重试。")
+                if chunk:
+                    self.chunk_ready.emit(self._request.request_id, chunk)
+            self._cancellation.raise_if_cancelled()
+        except asyncio.CancelledError as exc:
+            raise CancellationRequested from exc
+        finally:
+            self._cancellation.unbind_current_task()
 
 
 @dataclass(slots=True)
@@ -145,6 +169,18 @@ class ConversationCoordinator(QObject):
     def has_active_timers(self) -> bool:
         return self._first_chunk_timer.isActive() or self._stream_idle_timer.isActive()
 
+    def set_provider(self, provider: ChatProvider) -> bool:
+        """Switch providers only while the coordinator is fully idle."""
+
+        if (
+            self._shutting_down
+            or self._active_request_id is not None
+            or self._state is not ConversationState.IDLE
+        ):
+            return False
+        self._provider = provider
+        return True
+
     def send_message(self, text: str) -> ConversationTurn | None:
         """Append a new in-memory turn and start exactly one provider attempt."""
 
@@ -191,6 +227,7 @@ class ConversationCoordinator(QObject):
             ),
             attempt=previous.attempt + 1,
             terminal_reason=None,
+            provider_error_code=None,
             status_text=None,
             error=None,
         )
@@ -290,17 +327,20 @@ class ConversationCoordinator(QObject):
         thread.start()
 
     def _prompt_messages(self, current_turn_id: str) -> tuple[PromptMessage, ...]:
-        messages: list[PromptMessage] = []
+        recent_messages: list[PromptMessage] = []
         for turn in self._turns:
-            messages.append(PromptMessage(MessageRole.USER, turn.user_message.content))
+            recent_messages.append(PromptMessage(PromptRole.USER, turn.user_message.content))
             if (
                 turn.turn_id != current_turn_id
                 and turn.assistant_message.status is MessageStatus.COMPLETED
             ):
-                messages.append(
-                    PromptMessage(MessageRole.ASSISTANT, turn.assistant_message.content)
+                recent_messages.append(
+                    PromptMessage(PromptRole.ASSISTANT, turn.assistant_message.content)
                 )
-        return tuple(messages)
+        return (
+            PromptMessage(PromptRole.SYSTEM, build_persona_system_prompt()),
+            *recent_messages[-20:],
+        )
 
     @Slot(str, str)
     def _on_chunk(self, request_id: str, chunk: str) -> None:
@@ -309,6 +349,17 @@ class ConversationCoordinator(QObject):
             return
         turn = self._turn(context.turn_id)
         if turn is None:
+            return
+        if len(turn.assistant_message.content) + len(chunk) > MAX_VISIBLE_RESPONSE_CHARS:
+            self._terminalize_failure(
+                context,
+                reason=TurnTerminalReason.PROVIDER_ERROR,
+                provider_error_code=ProviderErrorCode.PROTOCOL.value,
+                error=ChatProviderError(ProviderErrorCode.PROTOCOL).safe_message,
+            )
+            context.cancellation.cancel()
+            context.thread.requestInterruption()
+            context.thread.quit()
             return
         if self._state is ConversationState.WAITING_FIRST_CHUNK:
             self._first_chunk_timer.stop()
@@ -337,6 +388,7 @@ class ConversationCoordinator(QObject):
             self._terminalize_failure(
                 context,
                 reason=TurnTerminalReason.EMPTY_RESPONSE,
+                provider_error_code=ProviderErrorCode.PROTOCOL.value,
                 error=EMPTY_RESPONSE_TEXT,
             )
             return
@@ -361,14 +413,15 @@ class ConversationCoordinator(QObject):
             status_text=USER_STOPPED_TEXT,
         )
 
-    @Slot(str, str)
-    def _on_failed(self, request_id: str, error: str) -> None:
+    @Slot(str, str, str)
+    def _on_failed(self, request_id: str, provider_error_code: str, error: str) -> None:
         context = self._matching_active_context(request_id)
         if context is None:
             return
         self._terminalize_failure(
             context,
             reason=TurnTerminalReason.PROVIDER_ERROR,
+            provider_error_code=provider_error_code,
             error=error,
         )
 
@@ -384,6 +437,7 @@ class ConversationCoordinator(QObject):
         self._terminalize_failure(
             context,
             reason=TurnTerminalReason.FIRST_CHUNK_TIMEOUT,
+            provider_error_code=ProviderErrorCode.TIMEOUT.value,
             error=FIRST_CHUNK_TIMEOUT_TEXT,
         )
         context.cancellation.cancel()
@@ -402,6 +456,7 @@ class ConversationCoordinator(QObject):
         self._terminalize_failure(
             context,
             reason=TurnTerminalReason.STREAM_IDLE_TIMEOUT,
+            provider_error_code=ProviderErrorCode.TIMEOUT.value,
             error=STREAM_IDLE_TIMEOUT_TEXT,
         )
         context.cancellation.cancel()
@@ -427,6 +482,7 @@ class ConversationCoordinator(QObject):
             self._terminalize_failure(
                 context,
                 reason=TurnTerminalReason.PROVIDER_ERROR,
+                provider_error_code=ProviderErrorCode.PROTOCOL.value,
                 error="供应商任务意外结束，请重试。",
             )
         self._active_request_id = None
@@ -438,6 +494,7 @@ class ConversationCoordinator(QObject):
         context: _RequestContext,
         *,
         reason: TurnTerminalReason,
+        provider_error_code: str,
         error: str,
     ) -> None:
         self._terminalize(
@@ -446,6 +503,7 @@ class ConversationCoordinator(QObject):
             message_status=MessageStatus.FAILED,
             reason=reason,
             status_text=error,
+            provider_error_code=provider_error_code,
             error=error,
         )
         self.error_occurred.emit(context.request_id, context.turn_id, error)
@@ -458,6 +516,7 @@ class ConversationCoordinator(QObject):
         message_status: MessageStatus,
         reason: TurnTerminalReason,
         status_text: str,
+        provider_error_code: str | None = None,
         error: str | None = None,
     ) -> None:
         if context.terminal_state is not None:
@@ -475,6 +534,7 @@ class ConversationCoordinator(QObject):
                 error=error,
             ),
             terminal_reason=reason,
+            provider_error_code=provider_error_code,
             status_text=status_text,
             error=error,
         )

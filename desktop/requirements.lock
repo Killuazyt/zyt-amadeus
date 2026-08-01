@@ -4,6 +4,22 @@
 #
 #    pip-compile --output-file=requirements.lock --strip-extras pyproject.toml
 #
+anyio==4.14.2
+    # via httpx
+certifi==2026.7.22
+    # via
+    #   httpcore
+    #   httpx
+h11==0.16.0
+    # via httpcore
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via amadeus-desktop (pyproject.toml)
+idna==3.18
+    # via
+    #   anyio
+    #   httpx
 pyside6==6.11.1
     # via amadeus-desktop (pyproject.toml)
 pyside6-addons==6.11.1
@@ -12,8 +28,12 @@ pyside6-essentials==6.11.1
     # via
     #   pyside6
     #   pyside6-addons
+pywin32==312
+    # via amadeus-desktop (pyproject.toml)
 shiboken6==6.11.1
     # via
     #   pyside6
     #   pyside6-addons
     #   pyside6-essentials
+typing-extensions==4.16.0
+    # via anyio

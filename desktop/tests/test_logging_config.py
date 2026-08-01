@@ -8,13 +8,14 @@ from amadeus_desktop.logging_config import close_logger, configure_logging, reda
 
 def test_redaction_covers_headers_and_common_token_prefixes() -> None:
     source = (
-        "Authorization: Bearer sk-example123456 api-key=tp-example654321 api_key: ordinary-value"
+        "Authorization: Bearer sk-invalid-test-example "
+        "api-key=tp-invalid-test-example api_key: ordinary-value"
     )
 
     redacted = redact_log_text(source)
 
-    assert "example123456" not in redacted
-    assert "example654321" not in redacted
+    assert "sk-invalid-test-example" not in redacted
+    assert "tp-invalid-test-example" not in redacted
     assert "ordinary-value" not in redacted
     assert redacted.count("[REDACTED]") == 3
 
@@ -23,11 +24,11 @@ def test_logger_redacts_message_arguments(tmp_path: Path) -> None:
     log_file = tmp_path / "logs" / "amadeus.log"
     logger = configure_logging(log_file, logger_name="amadeus.test.redaction")
 
-    logger.info("request %s", "Authorization=Bearer sk-never-write-this")
+    logger.info("request %s", "Authorization=Bearer sk-invalid-test-never-write")
     close_logger(logger)
 
     content = log_file.read_text(encoding="utf-8")
-    assert "never-write-this" not in content
+    assert "sk-invalid-test-never-write" not in content
     assert "[REDACTED]" in content
 
 

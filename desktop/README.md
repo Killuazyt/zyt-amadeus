@@ -1,13 +1,14 @@
 # Amadeus Desktop
 
-P3 adds an attached text-chat panel and deterministic local streaming simulation on top of the
-tested P1 application foundation and P2 desktop-pet engine. The application includes safe local
-pet import, fixed-clock animation, transparent hit testing, manual drag placement, multi-screen
-recovery, a bundled CC0 placeholder pet, cancellable chat states, and the system tray lifecycle.
+P4 adds secure OpenAI-compatible text providers on top of the tested P1 application foundation,
+P2 desktop-pet engine, and P3 attached chat flow. The application includes safe local pet import,
+fixed-clock animation, transparent hit testing, manual drag placement, multi-screen recovery, a
+bundled CC0 placeholder pet, cancellable chat states, and the system tray lifecycle.
 
-The P3 provider is local and synthetic: it makes no network request and stores messages only for
-the current process. Real model providers, credentials, SQLite history, long-term memory, speech,
-screen observation, and automation are not included.
+P4 provides DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom HTTPS provider. API
+credentials are stored only in Windows Credential Manager, while messages remain in memory for
+the current process. SQLite history, long-term memory, speech, screen observation, tool execution,
+and automation are not included.
 
 ## Development commands
 
@@ -51,5 +52,12 @@ The application entry point is:
 .\.venv\Scripts\python.exe -m amadeus_desktop
 ```
 
+The deterministic local provider is development-only and must be requested explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m amadeus_desktop --mock-chat
+```
+
 Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. Imported pets are copied into its `pets`
-directory; the source package is never modified. No API credentials are accepted or stored by P3.
+directory; the source package is never modified. Provider settings contain only a fixed credential
+reference; API credentials are stored by Windows Credential Manager and are never written to JSON.

@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amadeus-desktop"
-version = "0.3.0.dev3"
-description = "Windows desktop pet with an attached local-simulation chat interface"
+version = "0.4.0.dev4"
+description = "Windows desktop pet with secure OpenAI-compatible text chat"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "PySide6>=6.8,<7",
+    "httpx>=0.28,<1",
+    "pywin32==312",
 ]
 
 [project.optional-dependencies]

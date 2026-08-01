@@ -61,6 +61,32 @@ def test_panel_is_focusable_tool_window_with_independent_mock_banner(panel) -> N
     assert "本地模拟模式" in panel.mock_banner.text()
 
 
+def test_provider_modes_are_explicit_and_unconfigured_mode_blocks_send(panel, qtbot) -> None:
+    sent: list[str] = []
+    opened: list[bool] = []
+    panel.send_requested.connect(sent.append)
+    panel.configure_requested.connect(lambda: opened.append(True))
+
+    panel.set_provider_mode("unconfigured")
+    panel.input.setPlainText("不得发送")
+    qtbot.keyClick(panel.input, Qt.Key.Key_Return)
+
+    assert panel.provider_mode == "unconfigured"
+    assert "尚未配置" in panel.provider_banner.text()
+    assert not panel.input.isEnabled()
+    assert not panel.action_button.isEnabled()
+    assert sent == []
+    qtbot.mouseClick(panel.configure_button, Qt.MouseButton.LeftButton)
+    assert opened == [True]
+
+    panel.set_provider_mode("provider", provider_name="DeepSeek · example-model")
+    assert panel.input.isEnabled()
+    assert "DeepSeek" in panel.provider_banner.text()
+
+    panel.set_provider_mode("mock")
+    assert "本地模拟模式" in panel.provider_banner.text()
+
+
 def test_panel_paints_an_opaque_styled_background(panel, qtbot) -> None:
     panel.show()
     qtbot.waitUntil(panel.isVisible)

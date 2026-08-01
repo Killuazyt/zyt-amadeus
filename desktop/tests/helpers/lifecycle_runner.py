@@ -9,6 +9,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from amadeus_desktop.controller import ApplicationController
+from amadeus_desktop.credential_store import InMemoryCredentialStore
 from amadeus_desktop.logging_config import close_logger, configure_logging
 from amadeus_desktop.paths import AppPaths
 from amadeus_desktop.settings import SettingsRepository
@@ -48,6 +49,7 @@ def main() -> int:
         settings_repository=repository,
         settings=settings,
         tray_available=False,
+        credential_store=InMemoryCredentialStore(),
     )
 
     def on_activation() -> None:

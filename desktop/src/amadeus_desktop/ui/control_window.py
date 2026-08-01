@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 class ControlWindow(QWidget):
     exit_requested = Signal()
+    model_settings_requested = Signal()
     visibility_changed = Signal(bool)
 
     def __init__(self, *, tray_available: bool, status_message: str | None = None) -> None:
@@ -22,10 +23,11 @@ class ControlWindow(QWidget):
         title = QLabel("Amadeus 桌宠控制")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
 
-        status = QLabel(
-            status_message or "P3 桌宠与本地模拟文字聊天正在运行；当前不会连接真实模型。"
-        )
+        status = QLabel(status_message or "P4 文字对话已支持安全配置真实模型。")
         status.setWordWrap(True)
+
+        self.model_settings_button = QPushButton("对话模型设置")
+        self.model_settings_button.clicked.connect(self.model_settings_requested.emit)
 
         self.hide_button = QPushButton("隐藏窗口")
         self.hide_button.setVisible(tray_available)
@@ -38,6 +40,7 @@ class ControlWindow(QWidget):
         layout.addWidget(title)
         layout.addWidget(status)
         layout.addStretch(1)
+        layout.addWidget(self.model_settings_button)
         layout.addWidget(self.hide_button)
         layout.addWidget(self.exit_button)
 

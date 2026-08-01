@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from amadeus_desktop.provider_config import ProviderConfig, ProviderPreset
 from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
     DEFAULT_SETTINGS,
@@ -55,8 +56,29 @@ def test_schema_v1_migrates_to_pet_defaults(tmp_path: Path) -> None:
 
     loaded = SettingsRepository(path).load()
 
-    assert loaded["schema_version"] == 2
+    assert loaded["schema_version"] == CURRENT_SCHEMA_VERSION
     assert loaded["pet"] == DEFAULT_SETTINGS["pet"]
+
+
+def test_schema_v2_migrates_to_deepseek_provider_default(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "ui": {"language": "zh-CN"},
+                "pet": DEFAULT_SETTINGS["pet"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["schema_version"] == CURRENT_SCHEMA_VERSION
+    assert ProviderConfig.from_mapping(loaded["provider"]).preset is ProviderPreset.DEEPSEEK_PAYG
+    assert loaded["provider_enabled"] is False
+    assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
 
 @pytest.mark.parametrize("scale", [49, 201, True, "100"])
@@ -104,6 +126,19 @@ def test_corrupt_json_is_not_overwritten(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == original
 
 
+def test_snapshot_restores_exact_unparsed_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = b'{"schema_version":99,"future":"\xff"}'
+    path.write_bytes(original)
+    repository = SettingsRepository(path)
+    snapshot = repository.capture_snapshot()
+    path.write_bytes(b'{"schema_version":3}')
+
+    repository.restore_snapshot(snapshot)
+
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -132,6 +167,23 @@ def test_sensitive_setting_keys_are_rejected(tmp_path: Path, key: str) -> None:
 
 def test_credential_reference_is_allowed(tmp_path: Path) -> None:
     document = deepcopy(DEFAULT_SETTINGS)
-    document["provider"] = {"credential_ref": "windows-credential-manager-id"}
 
     SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+def test_arbitrary_credential_reference_is_rejected(tmp_path: Path) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document["provider"]["credential_ref"] = "user-controlled-target"
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+def test_provider_config_convenience_methods_round_trip(tmp_path: Path) -> None:
+    repository = SettingsRepository(tmp_path / "settings.json")
+    config = ProviderConfig.for_preset(ProviderPreset.MIMO_PAYG, model="mimo-v2.5-pro")
+
+    saved = repository.save_provider_config(config)
+
+    assert saved["provider"] == config.to_mapping()
+    assert repository.load_provider_config() == config

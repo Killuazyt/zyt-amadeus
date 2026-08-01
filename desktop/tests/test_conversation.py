@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable
+from collections.abc import AsyncIterator
 
 import pytest
 
 from amadeus_desktop.chat_models import (
     ChatRequest,
     ConversationState,
-    MessageRole,
     MessageStatus,
+    PromptRole,
     TurnTerminalReason,
 )
 from amadeus_desktop.chat_provider import (
     CancellationToken,
     ChatProviderError,
+    ProviderErrorCode,
     ScriptedChatProvider,
     ScriptedScenario,
 )
-from amadeus_desktop.conversation import ConversationCoordinator
+from amadeus_desktop.conversation import MAX_VISIBLE_RESPONSE_CHARS, ConversationCoordinator
 
 
 @pytest.fixture
@@ -62,11 +63,11 @@ def test_normal_stream_runs_off_ui_and_visits_all_states(
         def __init__(self) -> None:
             self.worker_thread_id: int | None = None
 
-        def stream(
+        async def stream(
             self,
             request: ChatRequest,
             cancellation: CancellationToken,
-        ) -> Iterable[str]:
+        ) -> AsyncIterator[str]:
             del request
             cancellation.raise_if_cancelled()
             self.worker_thread_id = threading.get_ident()
@@ -184,6 +185,7 @@ def test_first_chunk_timeout_cancels_never_returning_provider(
     assert failed.assistant_message.content == ""
     assert failed.assistant_message.status is MessageStatus.FAILED
     assert failed.terminal_reason is TurnTerminalReason.FIRST_CHUNK_TIMEOUT
+    assert failed.provider_error_code == ProviderErrorCode.TIMEOUT.value
     assert failed.error == "等待回复首段超时，请重试。"
     assert failures[0][1] == failed.turn_id
 
@@ -207,7 +209,33 @@ def test_partial_provider_error_preserves_text_and_allows_failure_ui(
     assert failed.assistant_message.content == "中断前片段"
     assert failed.assistant_message.status is MessageStatus.FAILED
     assert failed.terminal_reason is TurnTerminalReason.PROVIDER_ERROR
-    assert failed.error == "本地模拟流式中断。"
+    assert failed.provider_error_code == ProviderErrorCode.PROTOCOL.value
+    assert failed.error == "模型服务返回了无法识别的数据。"
+
+
+def test_provider_error_code_is_preserved_for_privacy_safe_evidence(
+    qtbot,
+    coordinator_factory,
+) -> None:
+    class AuthenticationFailureProvider:
+        async def stream(
+            self,
+            request: ChatRequest,
+            cancellation: CancellationToken,
+        ) -> AsyncIterator[str]:
+            del request
+            cancellation.raise_if_cancelled()
+            raise ChatProviderError(ProviderErrorCode.AUTHENTICATION)
+            yield  # pragma: no cover - keep this an async generator
+
+    coordinator = coordinator_factory(AuthenticationFailureProvider())
+    coordinator.send_message("鉴权分类")
+    wait_until_idle(qtbot, coordinator)
+
+    failed = coordinator.turns[0]
+    assert failed.terminal_reason is TurnTerminalReason.PROVIDER_ERROR
+    assert failed.provider_error_code == ProviderErrorCode.AUTHENTICATION.value
+    assert failed.error == "模型服务鉴权失败，请检查密钥。"
 
 
 def test_stream_idle_timeout_preserves_partial_text(qtbot, coordinator_factory) -> None:
@@ -237,11 +265,11 @@ def test_failed_retry_reuses_turn_and_message_ids_without_duplicate_user(
             self.requests: list[ChatRequest] = []
             self._lock = threading.Lock()
 
-        def stream(
+        async def stream(
             self,
             request: ChatRequest,
             cancellation: CancellationToken,
-        ) -> Iterable[str]:
+        ) -> AsyncIterator[str]:
             cancellation.raise_if_cancelled()
             with self._lock:
                 self.requests.append(request)
@@ -277,9 +305,11 @@ def test_failed_retry_reuses_turn_and_message_ids_without_duplicate_user(
     assert completed.assistant_message.content == "重试成功"
     assert completed.assistant_message.status is MessageStatus.COMPLETED
     second_prompt = provider.requests[1].messages
-    assert [(message.role, message.content) for message in second_prompt] == [
-        (MessageRole.USER, "只发送一次")
+    assert [(message.role, message.content) for message in second_prompt[1:]] == [
+        (PromptRole.USER, "只发送一次")
     ]
+    assert second_prompt[0].role is PromptRole.SYSTEM
+    assert "看见屏幕" in second_prompt[0].content
 
 
 def test_late_event_for_terminal_request_is_ignored(qtbot, coordinator_factory) -> None:
@@ -364,3 +394,52 @@ def test_fifty_rounds_have_unique_ids_and_no_state_leak(
     assert coordinator.active_request_id is None
     assert not coordinator.has_running_worker
     assert not coordinator.has_active_timers
+
+
+def test_provider_can_only_switch_when_fully_idle(qtbot, coordinator_factory) -> None:
+    first = ScriptedChatProvider(ScriptedScenario.NEVER)
+    second = ScriptedChatProvider(ScriptedScenario.NEVER)
+    coordinator = coordinator_factory(first, first_chunk_timeout_ms=500)
+
+    assert coordinator.set_provider(second)
+    coordinator.send_message("第一次")
+    qtbot.waitUntil(lambda: second.call_count == 1)
+    assert not coordinator.set_provider(first)
+    assert coordinator.stop()
+    wait_until_idle(qtbot, coordinator)
+    assert coordinator.set_provider(first)
+
+
+def test_prompt_contains_system_boundary_and_only_twenty_recent_messages(
+    qtbot,
+    coordinator_factory,
+) -> None:
+    provider = ScriptedChatProvider(chunks=("回答",), first_delay_ms=0, chunk_delay_ms=0)
+    coordinator = coordinator_factory(provider)
+
+    for index in range(11):
+        coordinator.send_message(f"消息 {index}")
+        wait_until_idle(qtbot, coordinator)
+
+    prompt = provider.requests[-1].messages
+    assert prompt[0].role is PromptRole.SYSTEM
+    assert "麦克风" in prompt[0].content
+    assert len(prompt) == 21
+    assert prompt[-1].role is PromptRole.USER
+    assert prompt[-1].content == "消息 10"
+
+
+def test_ui_boundary_rejects_oversized_visible_chunk(qtbot, coordinator_factory) -> None:
+    provider = ScriptedChatProvider(ScriptedScenario.NEVER)
+    coordinator = coordinator_factory(provider, first_chunk_timeout_ms=1_000)
+    coordinator.send_message("超限保护")
+    request_id = coordinator.active_request_id
+    assert request_id is not None
+
+    coordinator._on_chunk(request_id, "x" * (MAX_VISIBLE_RESPONSE_CHARS + 1))
+    wait_until_idle(qtbot, coordinator)
+
+    failed = coordinator.turns[0]
+    assert failed.assistant_message.content == ""
+    assert failed.terminal_reason is TurnTerminalReason.PROVIDER_ERROR
+    assert failed.provider_error_code == ProviderErrorCode.PROTOCOL.value

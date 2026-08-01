@@ -8,10 +8,13 @@ import re
 import tempfile
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CURRENT_SCHEMA_VERSION = 2
+from amadeus_desktop.provider_config import ProviderConfig, ProviderConfigError
+
+CURRENT_SCHEMA_VERSION = 3
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -25,6 +28,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "scale_percent": 100,
         "position": None,
     },
+    "provider_enabled": False,
+    "provider": ProviderConfig.default().to_mapping(),
 }
 
 _FORBIDDEN_SETTING_KEYS = {
@@ -57,6 +62,14 @@ class UnsupportedSettingsVersionError(SettingsError):
     """Raised when settings were written by a newer application version."""
 
 
+@dataclass(frozen=True, slots=True)
+class SettingsFileSnapshot:
+    """Opaque pre-transaction bytes used only for exact atomic rollback."""
+
+    existed: bool
+    content: bytes | None
+
+
 def _migrate_v0_to_v1(source: dict[str, Any]) -> dict[str, Any]:
     language = source.get("language", "zh-CN")
     migrated = deepcopy(source)
@@ -76,9 +89,18 @@ def _migrate_v1_to_v2(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v2_to_v3(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 3
+    migrated.setdefault("provider_enabled", False)
+    migrated.setdefault("provider", deepcopy(DEFAULT_SETTINGS["provider"]))
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 
@@ -155,6 +177,63 @@ class SettingsRepository:
                 temporary_path.unlink(missing_ok=True)
             raise SettingsError("Settings could not be saved atomically.") from exc
 
+    def capture_snapshot(self) -> SettingsFileSnapshot:
+        """Capture the exact current file without parsing or normalizing it."""
+
+        try:
+            if not self.path.exists():
+                return SettingsFileSnapshot(False, None)
+            return SettingsFileSnapshot(True, self.path.read_bytes())
+        except OSError as exc:
+            raise SettingsError("Settings could not be snapshotted safely.") from exc
+
+    def restore_snapshot(self, snapshot: SettingsFileSnapshot) -> None:
+        """Restore exact pre-transaction bytes using an atomic replacement."""
+
+        if not isinstance(snapshot, SettingsFileSnapshot):
+            raise SettingsError("Settings snapshot is invalid.")
+        if not snapshot.existed:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise SettingsError("Settings snapshot could not be restored.") from exc
+            return
+        if snapshot.content is None:
+            raise SettingsError("Settings snapshot is incomplete.")
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".rollback.tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(snapshot.content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.path)
+        except OSError as exc:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise SettingsError("Settings snapshot could not be restored.") from exc
+
+    def load_provider_config(self) -> ProviderConfig:
+        """Load the active non-sensitive provider configuration."""
+
+        return ProviderConfig.from_mapping(self.load()["provider"])
+
+    def save_provider_config(self, config: ProviderConfig) -> dict[str, Any]:
+        """Atomically replace only the active provider configuration."""
+
+        settings = self.load_or_create()
+        settings["provider"] = config.validated().to_mapping()
+        self.save(settings)
+        return settings
+
     @classmethod
     def _validate(cls, settings: Mapping[str, Any]) -> None:
         version = settings.get("schema_version")
@@ -183,6 +262,13 @@ class SettingsRepository:
         position = pet.get("position")
         if position is not None:
             cls._validate_pet_position(position)
+
+        try:
+            ProviderConfig.from_mapping(settings.get("provider"))
+        except ProviderConfigError as exc:
+            raise InvalidSettingsError("The provider settings section is invalid.") from exc
+        if not isinstance(settings.get("provider_enabled"), bool):
+            raise InvalidSettingsError("provider_enabled must be a boolean.")
 
     @staticmethod
     def _validate_pet_position(position: Any) -> None:

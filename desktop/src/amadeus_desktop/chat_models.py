@@ -1,4 +1,4 @@
-"""In-memory chat models shared by the P3 UI and provider boundary."""
+"""In-memory chat models shared by the P4 UI and provider boundary."""
 
 from __future__ import annotations
 
@@ -19,8 +19,16 @@ class ConversationState(StrEnum):
 
 
 class MessageRole(StrEnum):
-    """Roles accepted by the provider-neutral text chat protocol."""
+    """User-visible roles used by the in-memory chat presentation model."""
 
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+class PromptRole(StrEnum):
+    """Roles accepted by an OpenAI-compatible prompt."""
+
+    SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
 
@@ -67,6 +75,7 @@ class ConversationTurn:
     assistant_message: ChatMessage
     attempt: int = 1
     terminal_reason: TurnTerminalReason | None = None
+    provider_error_code: str | None = None
     status_text: str | None = None
     error: str | None = None
 
@@ -75,7 +84,7 @@ class ConversationTurn:
 class PromptMessage:
     """Minimal immutable message passed to a background provider worker."""
 
-    role: MessageRole
+    role: PromptRole
     content: str
 
 
