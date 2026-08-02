@@ -71,7 +71,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'isolated version import failed' }
       - name: Build FTS-degraded onedir
         shell: powershell
-        run: .\scripts\build-onedir.ps1 -Mode Degraded
+        run: |
+          $pythonPath = (Get-Command python -ErrorAction Stop).Source
+          .\scripts\build-onedir.ps1 -Mode Degraded -PythonPath $pythonPath
       - name: Smoke FTS-degraded onedir
         shell: powershell
         run: |

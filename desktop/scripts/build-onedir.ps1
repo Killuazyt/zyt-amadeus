@@ -2,6 +2,7 @@ param(
     [ValidateSet('Degraded', 'Bundled')]
     [string]$Mode = 'Degraded',
     [string]$ModelPath = '',
+    [string]$PythonPath = '',
     [ValidateRange(1, 20)]
     [int]$LifecycleCycles = 1
 )
@@ -9,7 +10,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $DesktopRoot = Split-Path -Parent $PSScriptRoot
-$PythonPath = Join-Path $DesktopRoot '.venv\Scripts\python.exe'
+if ([string]::IsNullOrWhiteSpace($PythonPath)) {
+    $PythonPath = Join-Path $DesktopRoot '.venv\Scripts\python.exe'
+}
+$PythonPath = [IO.Path]::GetFullPath($PythonPath)
 $SpecPath = Join-Path $DesktopRoot 'packaging\amadeus-desktop.spec'
 $BuildRoot = [IO.Path]::GetFullPath((Join-Path $DesktopRoot 'build'))
 $DistPath = [IO.Path]::GetFullPath((Join-Path $BuildRoot 'onedir-dist'))
@@ -18,7 +22,7 @@ $OutputPath = Join-Path $DistPath 'Amadeus'
 $BuildCacheRoot = [IO.Path]::GetFullPath((Join-Path $BuildRoot 'isolated-cache'))
 
 if (-not (Test-Path -LiteralPath $PythonPath)) {
-    throw 'Desktop virtual environment is missing. Run scripts\bootstrap.ps1 first.'
+    throw 'Selected Python executable is missing. Run scripts\bootstrap.ps1 or pass -PythonPath.'
 }
 
 [void](New-Item -ItemType Directory -Path $BuildRoot -Force)
