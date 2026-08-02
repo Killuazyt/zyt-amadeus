@@ -126,6 +126,15 @@ class GatedResponseProvider:
             cancellation.unbind_current_task()
 
 
+class RecordingDataThread:
+    def __init__(self) -> None:
+        self.submissions = []
+
+    def submit(self, operation, **metadata):
+        self.submissions.append((operation, metadata))
+        return f"request-{len(self.submissions)}"
+
+
 def _repositories(database: SQLiteDatabase, clock: MutableClock) -> JobRepositoryBundle:
     return JobRepositoryBundle(
         conversations=ConversationStore(database, clock=clock),
@@ -549,6 +558,28 @@ def test_memory_disabled_leaves_extraction_pending_but_runs_summary(qtbot, tmp_p
         assert provider.call_count == 2
     finally:
         _stop(qtbot, runtime, runner, coordinator)
+
+
+def test_enabling_memory_refreshes_an_in_flight_disabled_claim(qtbot) -> None:
+    data_thread = RecordingDataThread()
+    runner = BackgroundGenerationRunner(SequenceProvider([]))
+    coordinator = MemoryJobCoordinator(
+        data_thread,  # type: ignore[arg-type]
+        runner,
+        repositories=lambda _resource: None,  # type: ignore[arg-type]
+        memory_enabled=False,
+        poll_interval_ms=60_000,
+    )
+    coordinator._started = True
+    coordinator._accepting = True
+    coordinator._claim_in_flight = True
+
+    coordinator.set_memory_enabled(True)
+    assert data_thread.submissions == []
+
+    coordinator._on_claimed(())
+    qtbot.waitUntil(lambda: len(data_thread.submissions) == 1)
+    assert coordinator._claim_in_flight
 
 
 def test_exact_repeated_message_adds_provenance_without_provider_call(qtbot, tmp_path) -> None:

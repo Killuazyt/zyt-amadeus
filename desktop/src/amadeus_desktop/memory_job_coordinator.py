@@ -179,6 +179,7 @@ class MemoryJobCoordinator(QObject):
         self._shutting_down = False
         self._recovering = False
         self._claim_in_flight = False
+        self._claim_refresh_pending = False
         self._paused = False
         self._foreground_active = False
         self._current: _Execution | None = None
@@ -269,6 +270,12 @@ class MemoryJobCoordinator(QObject):
         self._memory_enabled = enabled
         if enabled:
             self._memory_enabled_event.set()
+            if self._claim_in_flight:
+                # A claim that started while memory was disabled cannot see
+                # extraction jobs.  Remember the state change so an empty
+                # stale claim cannot consume the only wake-up until the next
+                # periodic poll.
+                self._claim_refresh_pending = True
         else:
             self._memory_enabled_event.clear()
         current = self._current
@@ -333,8 +340,12 @@ class MemoryJobCoordinator(QObject):
 
     def _on_claimed(self, value: object) -> None:
         self._claim_in_flight = False
+        refresh_pending = self._claim_refresh_pending
+        self._claim_refresh_pending = False
         jobs = tuple(value)  # type: ignore[arg-type]
         if not jobs:
+            if refresh_pending and self._accepting:
+                QTimer.singleShot(0, self.poll)
             return
         job = jobs[0]
         if not isinstance(job, BackgroundJob) or job.kind not in KNOWN_JOB_KINDS:
@@ -369,7 +380,11 @@ class MemoryJobCoordinator(QObject):
 
     def _on_claim_failed(self, category: str) -> None:
         self._claim_in_flight = False
+        refresh_pending = self._claim_refresh_pending
+        self._claim_refresh_pending = False
         self.scheduler_error.emit(_safe_category(category))
+        if refresh_pending and self._accepting:
+            QTimer.singleShot(0, self.poll)
 
     def _on_prepared(self, job_id: str, value: object) -> None:
         execution = self._matching(job_id)
