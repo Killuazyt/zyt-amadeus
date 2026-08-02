@@ -53,6 +53,37 @@ _METHOD_LABELS = {
     "automatic": "自动提炼",
     "manual": "手工编辑",
 }
+_MODEL_STATUS_LABELS = {
+    "ready": "离线向量模型已就绪",
+    "loading": "正在加载离线向量模型",
+    "missing": "本地模型缺失，当前使用 FTS5",
+    "corrupt": "本地模型校验失败，当前使用 FTS5",
+    "version_mismatch": "本地模型版本不符，当前使用 FTS5",
+    "unavailable": "离线向量不可用，当前使用 FTS5",
+    "failed": "离线向量不可用，当前使用 FTS5",
+    "unknown": "尚未验证本地向量模型",
+}
+_GENERATION_STATUS_LABELS = {
+    "building": "构建中",
+    "active": "有效",
+    "retired": "已退役",
+    "failed": "失败",
+    "missing": "未建立",
+    "": "未建立",
+}
+_SAFE_RETRIEVAL_ERRORS = {
+    "model_missing": "模型文件缺失",
+    "model_corrupt": "模型文件校验失败",
+    "model_version_mismatch": "模型版本不符",
+    "model_runtime_unavailable": "CPU 推理后端不可用",
+    "model_inference_failed": "本地向量推理失败",
+    "generation_model_mismatch": "索引模型版本不符",
+    "provider_unavailable": "CPU 推理后端不可用",
+    "inference_failed": "本地向量推理失败",
+    "index_failed": "本地向量索引构建失败",
+    "invalid_vector": "本地向量数据无效",
+    "storage_error": "本地索引存储不可用",
+}
 
 
 class MemoryPage(QWidget):
@@ -69,6 +100,8 @@ class MemoryPage(QWidget):
     source_requested = Signal(str, str)
     retry_task_requested = Signal(str)
     memory_selected = Signal(str)
+    verify_model_requested = Signal()
+    rebuild_index_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -94,6 +127,27 @@ class MemoryPage(QWidget):
         enabled_row = QHBoxLayout()
         enabled_row.addWidget(self.enabled_check)
         enabled_row.addWidget(self.enabled_notice, 1)
+
+        self.retrieval_status_label = QLabel("尚未验证本地向量模型")
+        self.retrieval_status_label.setObjectName("memoryRetrievalStatus")
+        self.retrieval_status_label.setWordWrap(True)
+        self.retrieval_index_label = QLabel("用户记忆索引：未建立　角色资料索引：未建立")
+        self.retrieval_index_label.setObjectName("memoryIndexStatus")
+        self.retrieval_index_label.setWordWrap(True)
+        self.verify_model_button = QPushButton("验证本地模型")
+        self.verify_model_button.setObjectName("verifyMemoryModel")
+        self.rebuild_index_button = QPushButton("重新构建索引")
+        self.rebuild_index_button.setObjectName("rebuildMemoryIndex")
+        self.rebuild_index_button.setEnabled(False)
+
+        retrieval_actions = QHBoxLayout()
+        retrieval_actions.addWidget(self.retrieval_status_label, 1)
+        retrieval_actions.addWidget(self.verify_model_button)
+        retrieval_actions.addWidget(self.rebuild_index_button)
+        retrieval_group = QGroupBox("本地混合检索")
+        retrieval_layout = QVBoxLayout(retrieval_group)
+        retrieval_layout.addLayout(retrieval_actions)
+        retrieval_layout.addWidget(self.retrieval_index_label)
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("memorySearch")
@@ -130,6 +184,7 @@ class MemoryPage(QWidget):
             ("置顶优先", "pinned_first"),
             ("重要性最高", "importance_desc"),
             ("置信度最高", "confidence_desc"),
+            ("最近召回", "recalled_desc"),
         ):
             self.sort_combo.addItem(label, value)
         self.search_button = QPushButton("搜索")
@@ -144,11 +199,11 @@ class MemoryPage(QWidget):
         filters.addWidget(self.search_button)
         filters.addWidget(self.refresh_button)
 
-        self.memory_table = QTableWidget(0, 7)
+        self.memory_table = QTableWidget(0, 8)
         self.memory_table.setObjectName("memoryTable")
         self.memory_table.setAccessibleName("长期记忆列表")
         self.memory_table.setHorizontalHeaderLabels(
-            ["置顶", "类型", "状态", "内容", "重要性", "置信度", "更新时间"]
+            ["置顶", "类型", "状态", "内容", "重要性", "置信度", "最近召回", "更新时间"]
         )
         self.memory_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.memory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -239,6 +294,7 @@ class MemoryPage(QWidget):
         layout.addWidget(heading)
         layout.addWidget(explanation)
         layout.addLayout(enabled_row)
+        layout.addWidget(retrieval_group)
         layout.addLayout(filters)
         layout.addWidget(splitter, 1)
         layout.addWidget(failed_group)
@@ -263,6 +319,8 @@ class MemoryPage(QWidget):
         self.open_source_button.clicked.connect(self._open_current_source)
         self.failed_task_view.itemSelectionChanged.connect(self._sync_task_action)
         self.retry_task_button.clicked.connect(self._request_task_retry)
+        self.verify_model_button.clicked.connect(self.verify_model_requested.emit)
+        self.rebuild_index_button.clicked.connect(self.rebuild_index_requested.emit)
         self._sync_enabled_notice()
         self._sync_memory_detail()
         self._sync_task_action()
@@ -318,6 +376,7 @@ class MemoryPage(QWidget):
                     row["content"],
                     _score_text(row["importance"]),
                     _score_text(row["confidence"]),
+                    row["last_recalled_at"] or "从未",
                     row["updated_at"],
                 )
                 for column, value in enumerate(cells):
@@ -369,6 +428,40 @@ class MemoryPage(QWidget):
         self.status_label.setProperty("error", error)
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
+
+    def set_retrieval_status(self, status: object) -> None:
+        """Render only bounded status metadata; unknown error text is never displayed."""
+
+        row = _retrieval_status_row(status)
+        model_status = row["model_status"]
+        summary = _MODEL_STATUS_LABELS.get(model_status, _MODEL_STATUS_LABELS["unavailable"])
+        safe_error = _SAFE_RETRIEVAL_ERRORS.get(row["safe_error_category"])
+        if safe_error:
+            summary = f"{summary}（{safe_error}）"
+        self.retrieval_status_label.setText(summary)
+        self.retrieval_status_label.setProperty("degraded", model_status != "ready")
+        self.retrieval_status_label.style().unpolish(self.retrieval_status_label)
+        self.retrieval_status_label.style().polish(self.retrieval_status_label)
+
+        user_generation = _generation_text(
+            row["user_generation"],
+            row["user_generation_status"],
+            row["user_index_count"],
+        )
+        persona_generation = _generation_text(
+            row["persona_generation"],
+            row["persona_generation_status"],
+            row["persona_index_count"],
+        )
+        rebuild_status = _GENERATION_STATUS_LABELS.get(
+            row["last_rebuild_status"],
+            "未知",
+        )
+        self.retrieval_index_label.setText(
+            f"用户记忆索引：{user_generation}　角色资料索引：{persona_generation}\n"
+            f"最近重建：{rebuild_status}"
+        )
+        self.rebuild_index_button.setEnabled(model_status == "ready")
 
     @Slot(bool)
     def _on_enabled_toggled(self, enabled: bool) -> None:
@@ -482,7 +575,9 @@ class MemoryPage(QWidget):
         if self.enabled_check.isChecked():
             self.enabled_notice.setText("已启用：新对话可提炼并召回长期记忆。")
         else:
-            self.enabled_notice.setText("已停用：不会提炼或召回；现有数据保持不变。")
+            self.enabled_notice.setText(
+                "已停用：不会提炼或召回用户记忆；角色资料与会话摘要保持可用。"
+            )
 
     def _sync_memory_detail(self) -> None:
         memory_id = self.current_memory_id
@@ -515,7 +610,8 @@ class MemoryPage(QWidget):
             f"重要性：{_score_text(memory['importance'])}　"
             f"置信度：{_score_text(memory['confidence'])}\n"
             f"创建：{memory['created_at'] or '未知'}　"
-            f"更新：{memory['updated_at'] or '未知'}"
+            f"更新：{memory['updated_at'] or '未知'}　"
+            f"最近召回：{memory['last_recalled_at'] or '从未'}"
         )
         self.detail_edit.setPlainText(memory["content"])
         self.pin_button.setText("取消置顶" if memory["pinned"] else "置顶")
@@ -600,7 +696,56 @@ def _memory_row(value: object) -> dict[str, Any]:
         ),
         "created_at": _display_value(_member(record, "created_at", default="")),
         "updated_at": _display_value(_member(record, "updated_at", default="")),
+        "last_recalled_at": _display_value(
+            _member(
+                record,
+                "last_recalled_at",
+                "last_successful_recall_at",
+                "recalled_at",
+                default="",
+            )
+        ),
     }
+
+
+def _retrieval_status_row(value: object) -> dict[str, Any]:
+    return {
+        "model_status": _enum_text(
+            _member(value, "model_status", "status", default="unknown")
+        ).lower(),
+        "safe_error_category": _enum_text(
+            _member(value, "safe_error_category", "error_category", default="")
+        ).lower(),
+        "user_generation": str(
+            _member(value, "user_generation", "user_generation_id", default="") or ""
+        ),
+        "user_generation_status": _enum_text(
+            _member(value, "user_generation_status", default="")
+        ).lower(),
+        "user_index_count": _nonnegative_int(
+            _member(value, "user_index_count", "user_vector_count", default=0)
+        ),
+        "persona_generation": str(
+            _member(value, "persona_generation", "persona_generation_id", default="") or ""
+        ),
+        "persona_generation_status": _enum_text(
+            _member(value, "persona_generation_status", default="")
+        ).lower(),
+        "persona_index_count": _nonnegative_int(
+            _member(value, "persona_index_count", "persona_vector_count", default=0)
+        ),
+        "last_rebuild_status": _enum_text(
+            _member(value, "last_rebuild_status", "rebuild_status", default="")
+        ).lower(),
+    }
+
+
+def _generation_text(generation: str, status: str, count: int) -> str:
+    if not generation:
+        return "未建立"
+    safe_generation = generation if len(generation) <= 12 else f"{generation[:12]}…"
+    status_label = _GENERATION_STATUS_LABELS.get(status, "未知")
+    return f"{safe_generation} · {status_label} · {count} 条"
 
 
 def _source_row(value: object) -> dict[str, Any]:
@@ -675,6 +820,13 @@ def _number(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _display_value(value: object) -> str:

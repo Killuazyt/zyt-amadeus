@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
 from datetime import date
+from inspect import Parameter, signature
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from amadeus_desktop.chat_models import (
     ChatMessage,
     ConversationTurn,
     MessageRole,
     MessageStatus,
+    PreparedPrompt,
     PromptMessage,
     PromptRole,
     TurnTerminalReason,
@@ -27,7 +31,14 @@ from amadeus_desktop.persona import (
     build_capability_safety_boundary,
     build_persona_core_prompt,
 )
+from amadeus_desktop.persona_repository import PersonaRepository
 from amadeus_desktop.prompt_context import DefaultPromptContextService, PromptContextInput
+from amadeus_desktop.retrieval_pipeline import (
+    PromptRetrievalSeed,
+    VectorRetrievalResult,
+    collect_prompt_retrieval_seed,
+    finalize_prepared_prompt,
+)
 from amadeus_desktop.storage_models import (
     DEFAULT_PROFILE_ID,
     BackgroundJob,
@@ -40,11 +51,15 @@ from amadeus_desktop.storage_models import (
     StoredMessageRole,
     StoredMessageStatus,
 )
+from amadeus_desktop.vector_store import VectorStore
 
 SUMMARY_MESSAGE_THRESHOLD = 12
 SUMMARY_CHARACTER_THRESHOLD = 6_000
 MESSAGE_PAGE_SIZE = 40
-PROMPT_RECENT_MESSAGE_LIMIT = 20
+# The current durable user row is part of the SQL result and is removed by the
+# prompt budgeter, so fetch one extra row to retain 20 historical messages.
+PROMPT_RECENT_MESSAGE_LIMIT = 21
+_USER_MEMORY_SECTION_PREFIX = "[用户长期记忆："
 
 
 @dataclass(slots=True)
@@ -52,6 +67,8 @@ class LocalDataStores:
     database: SQLiteDatabase
     conversations: ConversationStore
     memories: MemoryService
+    personas: PersonaRepository
+    vectors: VectorStore
     jobs: BackgroundJobStore
 
     def close(self) -> None:
@@ -83,6 +100,49 @@ class MemoryListSnapshot:
     failed_jobs: tuple[dict[str, object], ...]
 
 
+@dataclass(slots=True)
+class _PendingPromptPreparation:
+    seed: PromptRetrievalSeed
+    turn: object
+    memory_enabled: bool
+    memory_disable_epoch: int
+    on_success: Callable[[PreparedPrompt], None]
+    on_failure: Callable[[str], None]
+    vector_future: Future[VectorRetrievalResult] | None = None
+
+
+def _supports_include_user(vector_query: Callable[..., object] | None) -> bool:
+    """Detect the P5B keyword without breaking legacy injected callbacks."""
+
+    if vector_query is None:
+        return False
+    try:
+        parameters = signature(vector_query).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "include_user" or parameter.kind is Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _without_user_memory(prepared: PreparedPrompt) -> PreparedPrompt:
+    """Remove both injected user-memory text and its recall evidence."""
+
+    return replace(
+        prepared,
+        messages=tuple(
+            message
+            for message in prepared.messages
+            if not (
+                message.role is PromptRole.SYSTEM
+                and message.content.startswith(_USER_MEMORY_SECTION_PREFIX)
+            )
+        ),
+        user_memory_version_ids=(),
+    )
+
+
 def create_local_data_stores(database_path: Path, backup_directory: Path) -> LocalDataStores:
     """Open and construct all synchronous repositories on the caller's thread."""
 
@@ -94,6 +154,8 @@ def create_local_data_stores(database_path: Path, backup_directory: Path) -> Loc
         database=database,
         conversations=ConversationStore(database),
         memories=MemoryStore(database),
+        personas=PersonaRepository(database),
+        vectors=VectorStore(database),
         jobs=BackgroundJobStore(database),
     )
 
@@ -112,6 +174,8 @@ class LocalDataService(QObject):
     operation_failed = Signal(str, str)
     write_availability_changed = Signal(bool)
     jobs_enqueued = Signal()
+    index_rebuild_requested = Signal(str)
+    _vector_query_completed = Signal(str, object)
 
     def __init__(
         self,
@@ -119,12 +183,20 @@ class LocalDataService(QObject):
         *,
         memory_enabled: bool = True,
         prompt_service: DefaultPromptContextService | None = None,
+        vector_query: Callable[..., Future[VectorRetrievalResult]] | None = None,
+        vector_timeout_ms: int = 500,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.runtime = runtime
         self._memory_enabled = bool(memory_enabled)
+        self._memory_disable_epoch = 0
         self._prompt_service = prompt_service or DefaultPromptContextService()
+        self._vector_query = vector_query
+        self._vector_query_supports_include_user = _supports_include_user(vector_query)
+        self._vector_timeout_ms = max(1, int(vector_timeout_ms))
+        self._pending_prompt_preparations: dict[str, _PendingPromptPreparation] = {}
+        self._accept_prompt_preparations = True
         self._current_conversation_id: str | None = None
         self._next_before_sequence: int | None = None
         self._writable = False
@@ -133,6 +205,7 @@ class LocalDataService(QObject):
         self._started = False
         runtime.ready_changed.connect(self._on_runtime_ready)
         runtime.initialization_failed.connect(self.startup_failed.emit)
+        self._vector_query_completed.connect(self._on_vector_query_completed)
 
     @property
     def memory_enabled(self) -> bool:
@@ -153,7 +226,12 @@ class LocalDataService(QObject):
         self.runtime.start()
 
     def set_memory_enabled(self, enabled: bool) -> None:
-        self._memory_enabled = bool(enabled)
+        normalized = bool(enabled)
+        if self._memory_enabled and not normalized:
+            # A disable event invalidates user-memory evidence already being
+            # prepared, even if the setting is enabled again before completion.
+            self._memory_disable_epoch += 1
+        self._memory_enabled = normalized
 
     def set_provider_metadata(self, provider_name: str | None, model_name: str | None) -> None:
         self._provider_name = provider_name
@@ -194,11 +272,12 @@ class LocalDataService(QObject):
     # ConversationPersistence boundary ---------------------------------
     def prepare_new_turn(self, turn, on_success, on_failure) -> bool:
         conversation_id = self._current_conversation_id
-        if not self._writable or conversation_id is None:
+        if not self._accept_prompt_preparations or not self._writable or conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
+        memory_disable_epoch = self._memory_disable_epoch
 
-        def operation(stores: LocalDataStores) -> tuple[PromptMessage, ...]:
+        def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
             stores.conversations.save_turn(
                 conversation_id,
                 turn.turn_id,
@@ -208,33 +287,25 @@ class LocalDataService(QObject):
                 attempt=turn.attempt,
                 participates_in_memory=memory_enabled,
             )
-            try:
-                return _build_prompt(
-                    stores,
-                    conversation_id,
-                    turn.user_message.content,
-                    memory_enabled=memory_enabled,
-                    prompt_service=self._prompt_service,
-                )
-            except Exception:
-                # The user row is already durable. Persist the matching stable
-                # assistant placeholder as failed before surfacing the safe
-                # preparation category; never leave a phantom pending stream.
-                stores.conversations.finalize_assistant(
-                    turn.assistant_message.message_id,
-                    "",
-                    status=StoredMessageStatus.FAILED,
-                    terminal_reason=TurnTerminalReason.LOCAL_PERSISTENCE_ERROR.value,
-                    attempt=turn.attempt,
-                    failure_code="local_persistence",
-                )
-                raise
+            return collect_prompt_retrieval_seed(
+                stores,
+                conversation_id,
+                turn.user_message.content,
+                memory_enabled=memory_enabled,
+            )
 
         return (
             self.runtime.submit(
                 operation,
                 priority=DataPriority.FOREGROUND,
-                on_success=on_success,
+                on_success=lambda seed: self._start_prompt_retrieval(
+                    seed,
+                    turn,
+                    memory_enabled=memory_enabled,
+                    memory_disable_epoch=memory_disable_epoch,
+                    on_success=on_success,
+                    on_failure=on_failure,
+                ),
                 on_failure=on_failure,
             )
             is not None
@@ -242,11 +313,12 @@ class LocalDataService(QObject):
 
     def prepare_retry(self, turn, on_success, on_failure) -> bool:
         conversation_id = self._current_conversation_id
-        if not self._writable or conversation_id is None:
+        if not self._accept_prompt_preparations or not self._writable or conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
+        memory_disable_epoch = self._memory_disable_epoch
 
-        def operation(stores: LocalDataStores) -> tuple[PromptMessage, ...]:
+        def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
             # A previous two-step preparation may have committed only the user
             # message. Recover that exact stable-ID turn without duplicating it.
             try:
@@ -271,34 +343,145 @@ class LocalDataService(QObject):
                     turn.assistant_message.message_id,
                     attempt=turn.attempt,
                 )
-            try:
-                return _build_prompt(
-                    stores,
-                    conversation_id,
-                    turn.user_message.content,
-                    memory_enabled=memory_enabled,
-                    prompt_service=self._prompt_service,
-                )
-            except Exception:
-                stores.conversations.finalize_assistant(
-                    turn.assistant_message.message_id,
-                    "",
-                    status=StoredMessageStatus.FAILED,
-                    terminal_reason=TurnTerminalReason.LOCAL_PERSISTENCE_ERROR.value,
-                    attempt=turn.attempt,
-                    failure_code="local_persistence",
-                )
-                raise
+            return collect_prompt_retrieval_seed(
+                stores,
+                conversation_id,
+                turn.user_message.content,
+                memory_enabled=memory_enabled,
+            )
 
         return (
             self.runtime.submit(
                 operation,
                 priority=DataPriority.FOREGROUND,
-                on_success=on_success,
+                on_success=lambda seed: self._start_prompt_retrieval(
+                    seed,
+                    turn,
+                    memory_enabled=memory_enabled,
+                    memory_disable_epoch=memory_disable_epoch,
+                    on_success=on_success,
+                    on_failure=on_failure,
+                ),
                 on_failure=on_failure,
             )
             is not None
         )
+
+    def _start_prompt_retrieval(
+        self,
+        seed: PromptRetrievalSeed,
+        turn: object,
+        *,
+        memory_enabled: bool,
+        memory_disable_epoch: int,
+        on_success: Callable[[PreparedPrompt], None],
+        on_failure: Callable[[str], None],
+    ) -> None:
+        if not self._accept_prompt_preparations:
+            return
+        token = f"{turn.turn_id}:{turn.attempt}"
+        pending = _PendingPromptPreparation(
+            seed=seed,
+            turn=turn,
+            memory_enabled=memory_enabled,
+            memory_disable_epoch=memory_disable_epoch,
+            on_success=on_success,
+            on_failure=on_failure,
+        )
+        self._pending_prompt_preparations[token] = pending
+        if self._vector_query is None:
+            self._finish_prompt_retrieval(token, None)
+            return
+        try:
+            include_user = self._user_memory_allowed(pending)
+            if self._vector_query_supports_include_user:
+                future = self._vector_query(
+                    seed.retrieval_query,
+                    include_user=include_user,
+                )
+            else:
+                # Compatibility for injected P5A/fake callbacks.  The final
+                # data-thread stage still discards any legacy user-vector hits.
+                future = self._vector_query(seed.retrieval_query)
+        except Exception:
+            self._finish_prompt_retrieval(token, None)
+            return
+        pending.vector_future = future
+
+        def completed(result_future: Future[VectorRetrievalResult]) -> None:
+            try:
+                result: object = result_future.result()
+            except Exception:
+                result = VectorRetrievalResult(degraded_category="vector_query_failed")
+            self._vector_query_completed.emit(token, result)
+
+        future.add_done_callback(completed)
+        QTimer.singleShot(
+            self._vector_timeout_ms,
+            self,
+            lambda: self._finish_prompt_retrieval(token, None),
+        )
+
+    @Slot(str, object)
+    def _on_vector_query_completed(self, token: str, value: object) -> None:
+        result = value if isinstance(value, VectorRetrievalResult) else None
+        self._finish_prompt_retrieval(token, result)
+
+    def _finish_prompt_retrieval(
+        self,
+        token: str,
+        vector_result: VectorRetrievalResult | None,
+    ) -> None:
+        pending = self._pending_prompt_preparations.pop(token, None)
+        if pending is None:
+            return
+        if vector_result is None and pending.vector_future is not None:
+            # This cancels a queued vector task.  A task already executing may
+            # finish later, but its callback sees no pending token and is ignored.
+            pending.vector_future.cancel()
+        memory_enabled = self._user_memory_allowed(pending)
+
+        def operation(stores: LocalDataStores) -> PreparedPrompt:
+            try:
+                return finalize_prepared_prompt(
+                    stores,
+                    pending.seed,
+                    turn_id=pending.turn.turn_id,
+                    attempt=pending.turn.attempt,
+                    memory_enabled=memory_enabled,
+                    vector_result=vector_result,
+                    prompt_service=self._prompt_service,
+                )
+            except Exception:
+                # The user row already committed in stage one.  Keep the stable
+                # assistant placeholder auditable instead of starting a model
+                # request with a prompt that was not safely assembled.
+                stores.conversations.finalize_assistant(
+                    pending.turn.assistant_message.message_id,
+                    "",
+                    status=StoredMessageStatus.FAILED,
+                    terminal_reason=TurnTerminalReason.LOCAL_PERSISTENCE_ERROR.value,
+                    attempt=pending.turn.attempt,
+                    failure_code="local_persistence",
+                )
+                raise
+
+        def completed(prepared: PreparedPrompt) -> None:
+            # Re-check on the Qt thread immediately before the conversation
+            # coordinator can start the provider.  This closes the window where
+            # memory was disabled while final revalidation was queued in SQLite.
+            if not self._user_memory_allowed(pending):
+                prepared = _without_user_memory(prepared)
+            pending.on_success(prepared)
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.FOREGROUND,
+            on_success=completed,
+            on_failure=pending.on_failure,
+        )
+        if request_id is None:
+            pending.on_failure("DataThreadStopped")
 
     def checkpoint_assistant(self, turn) -> None:
         if not self._writable:
@@ -417,6 +600,66 @@ class LocalDataService(QObject):
         self._writable = False
         self.write_availability_changed.emit(False)
         self.operation_failed.emit("finalize", category)
+
+    def record_successful_recall(
+        self,
+        turn: ConversationTurn,
+        prepared: PreparedPrompt,
+    ) -> None:
+        """Persist only the IDs that the budgeter actually injected."""
+
+        if not self._writable or turn.terminal_reason is None:
+            return
+        ticket_id = prepared.retrieval_ticket_id or f"{turn.turn_id}:{turn.attempt}"
+        memory_enabled = self._memory_enabled
+
+        def operation(stores: LocalDataStores) -> tuple[int, int]:
+            user_message = stores.conversations.get_message(turn.user_message.message_id)
+            user_count = stores.memories.record_successful_recall(
+                ticket_id,
+                prepared.user_memory_version_ids if memory_enabled else (),
+                terminal_status=turn.terminal_reason.value,
+                first_chunk_received=True,
+                profile_id=DEFAULT_PROFILE_ID,
+                conversation_id=user_message.conversation_id,
+                assistant_message_id=turn.assistant_message.message_id,
+                attempt=prepared.attempt,
+            )
+            persona_count = stores.personas.record_successful_recall(
+                ticket_id,
+                "kurisu",
+                prepared.persona_knowledge_ids,
+                terminal_status=turn.terminal_reason.value,
+                first_chunk_received=True,
+                conversation_id=user_message.conversation_id,
+                assistant_message_id=turn.assistant_message.message_id,
+                attempt=prepared.attempt,
+            )
+            return user_count, persona_count
+
+        self.runtime.submit(
+            operation,
+            priority=DataPriority.BACKGROUND,
+            on_failure=lambda category: self.operation_failed.emit("recall_event", category),
+        )
+
+    def run_memory_maintenance(self) -> None:
+        """Archive eligible ordinary events without touching disabled memory."""
+
+        if not self._writable or not self._memory_enabled:
+            return
+
+        def completed(memory_ids: tuple[str, ...]) -> None:
+            if memory_ids:
+                self.index_rebuild_requested.emit("user_memory")
+                self.refresh_memories()
+
+        self.runtime.submit(
+            lambda stores: stores.memories.archive_decayed_events(profile_id=DEFAULT_PROFILE_ID),
+            priority=DataPriority.BACKGROUND,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit("memory_maintenance", category),
+        )
 
     # History -----------------------------------------------------------
     def refresh_history(self) -> None:
@@ -632,8 +875,32 @@ class LocalDataService(QObject):
                     and (not status or record.status.value == status)
                     and (pinned is None or record.pinned is pinned)
                 )
-            ordered = _sort_memories(records, sort)
-            rows = tuple(_memory_view_row(record) for record in ordered)
+            stats = {
+                item.target_id: item
+                for item in stores.memories.recall_stats(
+                    profile_id=DEFAULT_PROFILE_ID,
+                    memory_ids=tuple(record.memory_id for record in records),
+                )
+            }
+            if sort == "recalled_desc":
+                ordered = tuple(
+                    sorted(
+                        records,
+                        key=lambda item: (
+                            -1.0
+                            if stats[item.memory_id].last_recalled_at is None
+                            else stats[item.memory_id].last_recalled_at.timestamp(),
+                            item.updated_at.timestamp(),
+                            item.memory_id,
+                        ),
+                        reverse=True,
+                    )
+                )
+            else:
+                ordered = _sort_memories(records, sort)
+            rows = tuple(
+                _memory_view_row(record, recall_stats=stats[record.memory_id]) for record in ordered
+            )
             failed = tuple(_job_view_row(job) for job in stores.jobs.list_failed())
             return MemoryListSnapshot(rows, failed)
 
@@ -674,6 +941,7 @@ class LocalDataService(QObject):
         self._memory_write(
             "edit_memory",
             lambda stores: stores.memories.edit_memory(memory_id, content),
+            index_changed=True,
         )
 
     def set_memory_pinned(self, memory_id: str, pinned: bool) -> None:
@@ -686,18 +954,21 @@ class LocalDataService(QObject):
         self._memory_write(
             "archive_memory",
             lambda stores: stores.memories.archive(memory_id),
+            index_changed=True,
         )
 
     def restore_memory(self, memory_id: str) -> None:
         self._memory_write(
             "restore_memory",
             lambda stores: stores.memories.restore(memory_id),
+            index_changed=True,
         )
 
     def delete_memory(self, memory_id: str) -> None:
         self._memory_write(
             "delete_memory",
             lambda stores: stores.memories.delete_memory(memory_id),
+            index_changed=True,
         )
 
     def retry_failed_job(self, job_id: str) -> None:
@@ -707,7 +978,14 @@ class LocalDataService(QObject):
             jobs_changed=True,
         )
 
-    def _memory_write(self, name: str, operation, *, jobs_changed: bool = False) -> None:
+    def _memory_write(
+        self,
+        name: str,
+        operation,
+        *,
+        jobs_changed: bool = False,
+        index_changed: bool = False,
+    ) -> None:
         if not self._writable:
             self.operation_failed.emit(name, "DatabaseReadOnlyError")
             return
@@ -715,6 +993,8 @@ class LocalDataService(QObject):
         def completed(_value: object) -> None:
             if jobs_changed:
                 self.jobs_enqueued.emit()
+            if index_changed:
+                self.index_rebuild_requested.emit("user_memory")
             self.refresh_memories()
 
         request_id = self.runtime.submit(
@@ -726,7 +1006,25 @@ class LocalDataService(QObject):
         if request_id is None:
             self._on_persistence_submission_failed(name)
 
+    def _user_memory_allowed(self, pending: _PendingPromptPreparation) -> bool:
+        return (
+            pending.memory_enabled
+            and self._memory_enabled
+            and pending.memory_disable_epoch == self._memory_disable_epoch
+        )
+
+    def stop_prompt_preparations(self) -> None:
+        """Reject new prompt work and cancel queued vector queries."""
+
+        self._accept_prompt_preparations = False
+        pending = tuple(self._pending_prompt_preparations.values())
+        self._pending_prompt_preparations.clear()
+        for preparation in pending:
+            if preparation.vector_future is not None:
+                preparation.vector_future.cancel()
+
     def shutdown(self, wait_ms: int = 5_000) -> bool:
+        self.stop_prompt_preparations()
         return self.runtime.shutdown(wait_ms)
 
 
@@ -933,7 +1231,11 @@ def _restored_status_text(
     return None
 
 
-def _memory_view_row(record: MemoryRecord) -> dict[str, object]:
+def _memory_view_row(
+    record: MemoryRecord,
+    *,
+    recall_stats: object | None = None,
+) -> dict[str, object]:
     version = record.current_version
     return {
         "memory_id": record.memory_id,
@@ -947,6 +1249,12 @@ def _memory_view_row(record: MemoryRecord) -> dict[str, object]:
         "version_number": version.version_number,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "last_recalled_at": getattr(recall_stats, "last_recalled_at", None),
+        "successful_recall_count": getattr(
+            recall_stats,
+            "successful_recall_count",
+            0,
+        ),
     }
 
 

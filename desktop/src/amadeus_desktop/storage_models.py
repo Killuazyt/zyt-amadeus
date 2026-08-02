@@ -70,6 +70,23 @@ class MemoryVersionOperation(StrEnum):
     MANUAL_EDIT = "manual_edit"
 
 
+class EmbeddingCorpus(StrEnum):
+    MEMORY = "memory"
+    PERSONA = "persona"
+
+
+class EmbeddingGenerationStatus(StrEnum):
+    BUILDING = "building"
+    ACTIVE = "active"
+    RETIRED = "retired"
+    FAILED = "failed"
+
+
+class RecallTerminalStatus(StrEnum):
+    COMPLETED = "completed"
+    USER_STOPPED = "user_stopped"
+
+
 class BackgroundJobStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -203,6 +220,70 @@ class MemoryUpsertResult:
 @dataclass(frozen=True, slots=True)
 class MemorySearchResult:
     memory: MemoryRecord
+    rank: float
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingGeneration:
+    generation_id: str
+    corpus: EmbeddingCorpus
+    scope_id: str
+    model_name: str
+    model_commit: str
+    dimension: int
+    model_sha256: str
+    calibration_threshold: float
+    status: EmbeddingGenerationStatus
+    item_count: int
+    failure_code: str | None
+    created_at: datetime
+    updated_at: datetime
+    activated_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredVector:
+    generation_id: str
+    target_id: str
+    vector: tuple[float, ...]
+    vector_hash: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RecallStats:
+    target_id: str
+    successful_recall_count: int
+    last_recalled_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class PersonaKnowledge:
+    knowledge_id: str
+    persona_id: str
+    content: str
+    search_text: str
+    tags: tuple[str, ...]
+    source_ref: str
+    source_hash: str
+    content_hash: str
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PersonaKnowledgeDraft:
+    content: str
+    tags: tuple[str, ...]
+    source_ref: str
+    source_hash: str
+    knowledge_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PersonaSearchResult:
+    knowledge: PersonaKnowledge
     rank: float
 
 

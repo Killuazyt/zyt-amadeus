@@ -58,6 +58,20 @@ class AppPaths:
 
         return self.directory(AppDirectory.BACKUPS) / "migrations"
 
+    @property
+    def embedding_model_directory(self) -> Path:
+        """Return the fixed P5B embedding snapshot directory."""
+
+        from amadeus_desktop.embedding_model import MODEL_REVISION
+
+        return self.directory(AppDirectory.MODELS) / "bge-small-zh-v1.5" / MODEL_REVISION
+
+    @property
+    def persona_knowledge_file(self) -> Path:
+        """Return the private local knowledge manifest for the active persona."""
+
+        return self.directory(AppDirectory.PERSONAS) / "kurisu" / "knowledge.jsonl"
+
     def initialize(self) -> None:
         """Create only the directories needed during P1 startup."""
 

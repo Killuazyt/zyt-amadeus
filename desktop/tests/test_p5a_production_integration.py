@@ -757,7 +757,7 @@ def test_newer_database_opens_application_read_only_without_calling_provider(
     stores = create_local_data_stores(paths.database_file, paths.migration_backup_directory)
     try:
         stores.conversations.get_or_create_active_conversation()
-        stores.database.connection.execute("PRAGMA user_version = 2")
+        stores.database.connection.execute("PRAGMA user_version = 3")
     finally:
         stores.close()
 

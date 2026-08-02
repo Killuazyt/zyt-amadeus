@@ -6,11 +6,12 @@ from amadeus_desktop.chat_models import (
     ConversationState,
     ConversationTurn,
     MessageStatus,
+    PreparedPrompt,
     PromptMessage,
     PromptRole,
     TurnTerminalReason,
 )
-from amadeus_desktop.chat_provider import ScriptedChatProvider
+from amadeus_desktop.chat_provider import ScriptedChatProvider, ScriptedScenario
 from amadeus_desktop.conversation import ConversationCoordinator
 
 
@@ -20,6 +21,7 @@ class DeferredPersistence:
         self.retried_turns: list[ConversationTurn] = []
         self.checkpoints: list[ConversationTurn] = []
         self.finalized: list[ConversationTurn] = []
+        self.recalled: list[tuple[ConversationTurn, PreparedPrompt]] = []
         self.success: Callable[[tuple[PromptMessage, ...]], None] | None = None
         self.failure: Callable[[str], None] | None = None
 
@@ -42,6 +44,13 @@ class DeferredPersistence:
         self.finalized.append(turn)
         on_success()
         return True
+
+    def record_successful_recall(
+        self,
+        turn: ConversationTurn,
+        prepared: PreparedPrompt,
+    ) -> None:
+        self.recalled.append((turn, prepared))
 
 
 def _wait_idle(qtbot, coordinator: ConversationCoordinator) -> None:
@@ -143,5 +152,88 @@ def test_stream_checkpoints_are_coalesced_at_500ms_and_terminal_flushes(qtbot) -
         assert persistence.checkpoints[0].assistant_message.content == "一二"
         assert persistence.checkpoints[-1].assistant_message.content == "一二三"
         assert persistence.finalized[-1].assistant_message.content == "一二三"
+    finally:
+        assert coordinator.shutdown(1_000)
+
+
+def test_recall_is_recorded_only_after_first_chunk_and_successful_terminal(qtbot) -> None:
+    persistence = DeferredPersistence()
+    provider = ScriptedChatProvider(chunks=("已使用记忆",), first_delay_ms=0)
+    coordinator = ConversationCoordinator(provider, persistence=persistence)
+    try:
+        coordinator.send_message("记得吗")
+        assert persistence.success is not None
+        prepared = PreparedPrompt(
+            messages=(PromptMessage(PromptRole.USER, "记得吗"),),
+            user_memory_version_ids=("version-1",),
+            persona_knowledge_ids=("persona-1",),
+        )
+        persistence.success(prepared)
+        _wait_idle(qtbot, coordinator)
+
+        assert len(persistence.recalled) == 1
+        recalled_turn, recalled_prompt = persistence.recalled[0]
+        assert recalled_turn.terminal_reason is TurnTerminalReason.COMPLETED
+        assert recalled_prompt == prepared
+    finally:
+        assert coordinator.shutdown(1_000)
+
+
+def test_recall_is_not_recorded_when_user_stops_before_first_chunk(qtbot) -> None:
+    persistence = DeferredPersistence()
+    provider = ScriptedChatProvider(chunks=("不应到达",), first_delay_ms=1_000)
+    coordinator = ConversationCoordinator(
+        provider,
+        persistence=persistence,
+        first_chunk_timeout_ms=2_000,
+    )
+    try:
+        coordinator.send_message("先停下")
+        assert persistence.success is not None
+        persistence.success(
+            PreparedPrompt(
+                messages=(PromptMessage(PromptRole.USER, "先停下"),),
+                user_memory_version_ids=("version-1",),
+            )
+        )
+        qtbot.waitUntil(
+            lambda: coordinator.state is ConversationState.WAITING_FIRST_CHUNK,
+            timeout=1_000,
+        )
+        assert coordinator.stop()
+        _wait_idle(qtbot, coordinator)
+
+        assert persistence.recalled == []
+    finally:
+        assert coordinator.shutdown(1_000)
+
+
+def test_recall_is_recorded_when_user_stops_after_first_chunk(qtbot) -> None:
+    persistence = DeferredPersistence()
+    provider = ScriptedChatProvider(
+        ScriptedScenario.STALL,
+        chunks=("已收到",),
+        first_delay_ms=0,
+        chunk_delay_ms=0,
+    )
+    coordinator = ConversationCoordinator(provider, persistence=persistence)
+    try:
+        coordinator.send_message("收到后停止")
+        assert persistence.success is not None
+        persistence.success(
+            PreparedPrompt(
+                messages=(PromptMessage(PromptRole.USER, "收到后停止"),),
+                user_memory_version_ids=("version-1",),
+            )
+        )
+        qtbot.waitUntil(
+            lambda: coordinator.state is ConversationState.STREAMING,
+            timeout=1_000,
+        )
+        assert coordinator.stop()
+        _wait_idle(qtbot, coordinator)
+
+        assert len(persistence.recalled) == 1
+        assert persistence.recalled[0][0].terminal_reason is TurnTerminalReason.USER_STOPPED
     finally:
         assert coordinator.shutdown(1_000)

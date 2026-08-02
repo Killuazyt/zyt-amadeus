@@ -1,4 +1,4 @@
-"""SQLite schema v1, consistent migration backups, and fail-closed opening."""
+"""SQLite schema v2, consistent migration backups, and fail-closed opening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 
@@ -219,7 +219,172 @@ def _migrate_to_v1(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
-_DEFAULT_MIGRATIONS: Mapping[int, Migration] = {1: _migrate_to_v1}
+_SCHEMA_V2: tuple[str, ...] = (
+    """
+    CREATE TABLE memory_embedding_generations (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        model_name TEXT NOT NULL,
+        model_commit TEXT NOT NULL,
+        dimension INTEGER NOT NULL CHECK (dimension > 0),
+        model_sha256 TEXT NOT NULL,
+        calibration_threshold REAL NOT NULL
+            CHECK (calibration_threshold >= -1.0 AND calibration_threshold <= 1.0),
+        status TEXT NOT NULL
+            CHECK (status IN ('building', 'active', 'retired', 'failed')),
+        item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        activated_at TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX memory_embedding_one_active_idx
+    ON memory_embedding_generations(profile_id)
+    WHERE status = 'active'
+    """,
+    """
+    CREATE INDEX memory_embedding_generation_state_idx
+    ON memory_embedding_generations(profile_id, status, created_at DESC)
+    """,
+    """
+    CREATE TABLE memory_vectors (
+        generation_id TEXT NOT NULL
+            REFERENCES memory_embedding_generations(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES memory_versions(id) ON DELETE CASCADE,
+        vector_blob BLOB NOT NULL CHECK (length(vector_blob) > 0),
+        vector_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (generation_id, version_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_vectors_version_idx ON memory_vectors(version_id)
+    """,
+    """
+    CREATE TABLE memory_recall_events (
+        id TEXT PRIMARY KEY,
+        retrieval_ticket_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES memory_versions(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+        terminal_status TEXT NOT NULL CHECK (terminal_status IN ('completed', 'user_stopped')),
+        recalled_at TEXT NOT NULL,
+        UNIQUE (retrieval_ticket_id, version_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_recall_version_time_idx
+    ON memory_recall_events(version_id, recalled_at DESC)
+    """,
+    """
+    CREATE INDEX memory_recall_profile_time_idx
+    ON memory_recall_events(profile_id, recalled_at DESC)
+    """,
+    """
+    CREATE TABLE persona_knowledge (
+        id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        search_text TEXT NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        source_ref TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (persona_id, content_hash)
+    )
+    """,
+    """
+    CREATE INDEX persona_knowledge_state_idx
+    ON persona_knowledge(persona_id, active, updated_at DESC, id)
+    """,
+    """
+    CREATE VIRTUAL TABLE persona_fts USING fts5(
+        knowledge_id UNINDEXED,
+        persona_id UNINDEXED,
+        search_text,
+        tokenize = 'unicode61 remove_diacritics 2'
+    )
+    """,
+    """
+    CREATE TABLE persona_embedding_generations (
+        id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        model_commit TEXT NOT NULL,
+        dimension INTEGER NOT NULL CHECK (dimension > 0),
+        model_sha256 TEXT NOT NULL,
+        calibration_threshold REAL NOT NULL
+            CHECK (calibration_threshold >= -1.0 AND calibration_threshold <= 1.0),
+        status TEXT NOT NULL
+            CHECK (status IN ('building', 'active', 'retired', 'failed')),
+        item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        activated_at TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX persona_embedding_one_active_idx
+    ON persona_embedding_generations(persona_id)
+    WHERE status = 'active'
+    """,
+    """
+    CREATE INDEX persona_embedding_generation_state_idx
+    ON persona_embedding_generations(persona_id, status, created_at DESC)
+    """,
+    """
+    CREATE TABLE persona_vectors (
+        generation_id TEXT NOT NULL
+            REFERENCES persona_embedding_generations(id) ON DELETE CASCADE,
+        knowledge_id TEXT NOT NULL REFERENCES persona_knowledge(id) ON DELETE CASCADE,
+        vector_blob BLOB NOT NULL CHECK (length(vector_blob) > 0),
+        vector_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (generation_id, knowledge_id)
+    )
+    """,
+    """
+    CREATE INDEX persona_vectors_knowledge_idx ON persona_vectors(knowledge_id)
+    """,
+    """
+    CREATE TABLE persona_recall_events (
+        id TEXT PRIMARY KEY,
+        retrieval_ticket_id TEXT NOT NULL,
+        persona_id TEXT NOT NULL,
+        knowledge_id TEXT NOT NULL REFERENCES persona_knowledge(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+        terminal_status TEXT NOT NULL CHECK (terminal_status IN ('completed', 'user_stopped')),
+        recalled_at TEXT NOT NULL,
+        UNIQUE (retrieval_ticket_id, knowledge_id)
+    )
+    """,
+    """
+    CREATE INDEX persona_recall_knowledge_time_idx
+    ON persona_recall_events(knowledge_id, recalled_at DESC)
+    """,
+    """
+    CREATE INDEX persona_recall_persona_time_idx
+    ON persona_recall_events(persona_id, recalled_at DESC)
+    """,
+)
+
+
+def _migrate_to_v2(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V2:
+        connection.execute(statement)
+
+
+_DEFAULT_MIGRATIONS: Mapping[int, Migration] = {1: _migrate_to_v1, 2: _migrate_to_v2}
 _REQUIRED_TABLES = {
     "profiles",
     "conversations",
@@ -230,7 +395,128 @@ _REQUIRED_TABLES = {
     "memory_sources",
     "background_jobs",
     "memory_fts",
+    "memory_embedding_generations",
+    "memory_vectors",
+    "memory_recall_events",
+    "persona_knowledge",
+    "persona_fts",
+    "persona_embedding_generations",
+    "persona_vectors",
+    "persona_recall_events",
 }
+_REQUIRED_TRIGGER_SQL_MARKERS = {
+    "memory_versions_are_immutable": (
+        "before update on memory_versions",
+        "raise(abort, 'memory versions are immutable')",
+    ),
+    "memory_versions_no_individual_delete": (
+        "before delete on memory_versions",
+        "when exists (select 1 from memory_groups where id = old.memory_id)",
+        "raise(abort, 'memory versions can only be deleted with their group')",
+    ),
+}
+_REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
+    "memory_embedding_one_active_idx": (
+        "create unique index",
+        "on memory_embedding_generations(profile_id)",
+        "where status = 'active'",
+    ),
+    "persona_embedding_one_active_idx": (
+        "create unique index",
+        "on persona_embedding_generations(persona_id)",
+        "where status = 'active'",
+    ),
+}
+_REQUIRED_COLUMNS = {
+    "memory_embedding_generations": {
+        "id",
+        "profile_id",
+        "model_name",
+        "model_commit",
+        "dimension",
+        "model_sha256",
+        "calibration_threshold",
+        "status",
+        "item_count",
+        "failure_code",
+        "created_at",
+        "updated_at",
+        "activated_at",
+    },
+    "memory_vectors": {
+        "generation_id",
+        "version_id",
+        "vector_blob",
+        "vector_hash",
+        "created_at",
+    },
+    "memory_recall_events": {
+        "id",
+        "retrieval_ticket_id",
+        "profile_id",
+        "version_id",
+        "conversation_id",
+        "assistant_message_id",
+        "attempt",
+        "terminal_status",
+        "recalled_at",
+    },
+    "persona_knowledge": {
+        "id",
+        "persona_id",
+        "content",
+        "search_text",
+        "tags_json",
+        "source_ref",
+        "source_hash",
+        "content_hash",
+        "active",
+        "created_at",
+        "updated_at",
+    },
+    "persona_embedding_generations": {
+        "id",
+        "persona_id",
+        "model_name",
+        "model_commit",
+        "dimension",
+        "model_sha256",
+        "calibration_threshold",
+        "status",
+        "item_count",
+        "failure_code",
+        "created_at",
+        "updated_at",
+        "activated_at",
+    },
+    "persona_vectors": {
+        "generation_id",
+        "knowledge_id",
+        "vector_blob",
+        "vector_hash",
+        "created_at",
+    },
+    "persona_recall_events": {
+        "id",
+        "retrieval_ticket_id",
+        "persona_id",
+        "knowledge_id",
+        "conversation_id",
+        "assistant_message_id",
+        "attempt",
+        "terminal_status",
+        "recalled_at",
+    },
+}
+_REQUIRED_FTS_COLUMNS = {
+    "memory_fts": {"version_id", "memory_id", "profile_id", "search_text"},
+    "persona_fts": {"knowledge_id", "persona_id", "search_text"},
+}
+_REQUIRED_FTS_SQL_MARKERS = (
+    "virtual table",
+    "using fts5",
+    "tokenize = 'unicode61 remove_diacritics 2'",
+)
 
 
 class SQLiteDatabase:
@@ -425,6 +711,47 @@ class SQLiteDatabase:
         }
         if not _REQUIRED_TABLES.issubset(existing):
             raise DatabaseMigrationError("database schema is incomplete")
+        trigger_rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+        triggers = {str(row["name"]): str(row["sql"] or "") for row in trigger_rows}
+        if not _REQUIRED_TRIGGER_SQL_MARKERS.keys() <= triggers.keys():
+            raise DatabaseMigrationError("database schema is missing required triggers")
+        for name, markers in _REQUIRED_TRIGGER_SQL_MARKERS.items():
+            normalized_sql = " ".join(triggers[name].lower().split())
+            if any(marker not in normalized_sql for marker in markers):
+                raise DatabaseMigrationError("database immutable-memory trigger is invalid")
+        index_rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+        indexes = {str(row["name"]): str(row["sql"] or "") for row in index_rows}
+        if not _REQUIRED_PARTIAL_INDEX_SQL_MARKERS.keys() <= indexes.keys():
+            raise DatabaseMigrationError("database schema is missing required indexes")
+        for name, markers in _REQUIRED_PARTIAL_INDEX_SQL_MARKERS.items():
+            normalized_sql = " ".join(indexes[name].lower().split())
+            if any(marker not in normalized_sql for marker in markers):
+                raise DatabaseMigrationError("database active-generation index is invalid")
+        for table, required_columns in _REQUIRED_COLUMNS.items():
+            columns = {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if columns != required_columns:
+                raise DatabaseMigrationError("database schema columns are invalid")
+        for table, required_columns in _REQUIRED_FTS_COLUMNS.items():
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            normalized_sql = "" if row is None else " ".join(str(row["sql"] or "").lower().split())
+            if any(marker not in normalized_sql for marker in _REQUIRED_FTS_SQL_MARKERS):
+                raise DatabaseMigrationError("database FTS schema is invalid")
+            columns = {
+                str(column["name"])
+                for column in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if columns != required_columns:
+                raise DatabaseMigrationError("database FTS columns are invalid")
         quick_check = connection.execute("PRAGMA quick_check").fetchone()
         if quick_check is None or quick_check[0] != "ok":
             raise DatabaseMigrationError("database integrity check failed")

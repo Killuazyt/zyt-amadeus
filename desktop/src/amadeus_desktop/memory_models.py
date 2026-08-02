@@ -65,6 +65,17 @@ class PromptMemory:
     importance: float = 0.5
     confidence: float = 1.0
     pinned: bool = False
+    memory_version_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PromptPersonaKnowledge:
+    """Minimal local persona fragment that may be injected into a prompt."""
+
+    knowledge_id: str
+    persona_id: str
+    content: str
+    active: bool = True
 
 
 @runtime_checkable

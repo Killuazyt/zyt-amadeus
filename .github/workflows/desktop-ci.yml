@@ -34,15 +34,56 @@ jobs:
       - name: Install locked dependencies
         run: |
           python -m pip install "pip>=24,<26"
+          if ($LASTEXITCODE -ne 0) { throw 'pip bootstrap failed' }
           python -m pip install -r requirements-dev.lock
+          if ($LASTEXITCODE -ne 0) { throw 'locked dependency install failed' }
           python -m pip install --no-deps .
+          if ($LASTEXITCODE -ne 0) { throw 'project install failed' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'pip check failed' }
       - name: Lint
         run: |
           python -m ruff check .
+          if ($LASTEXITCODE -ne 0) { throw 'ruff check failed' }
           python -m ruff format --check .
+          if ($LASTEXITCODE -ne 0) { throw 'ruff format check failed' }
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest
       - name: Build Python package
         run: python -m build --no-isolation
+      - name: Verify isolated wheel install
+        shell: powershell
+        run: |
+          $isolated = Join-Path $env:RUNNER_TEMP 'amadeus-p5b-wheel-install'
+          python -m venv $isolated
+          if ($LASTEXITCODE -ne 0) { throw 'isolated venv creation failed' }
+          $python = Join-Path $isolated 'Scripts\python.exe'
+          $wheel = (Get-ChildItem -LiteralPath dist -Filter '*.whl' | Select-Object -First 1).FullName
+          & $python -m pip install -r requirements.lock
+          if ($LASTEXITCODE -ne 0) { throw 'isolated locked dependency install failed' }
+          & $python -m pip install --no-deps $wheel
+          if ($LASTEXITCODE -ne 0) { throw 'isolated wheel install failed' }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'isolated pip check failed' }
+          & $python -c "import amadeus_desktop; assert amadeus_desktop.__version__ == '0.5.0.dev5'"
+          if ($LASTEXITCODE -ne 0) { throw 'isolated version import failed' }
+      - name: Build FTS-degraded onedir
+        shell: powershell
+        run: .\scripts\build-onedir.ps1 -Mode Degraded
+      - name: Smoke FTS-degraded onedir
+        shell: powershell
+        run: |
+          $exe = Join-Path $PWD 'build\onedir-dist\Amadeus\Amadeus.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'onedir executable missing' }
+          $model = Join-Path $PWD 'build\onedir-dist\Amadeus\_internal\amadeus_desktop\resources\embedding_model'
+          if (Test-Path -LiteralPath $model) { throw 'CI onedir unexpectedly contains the embedding model' }
+          $process = Start-Process -FilePath $exe -ArgumentList '--auto-exit-ms=500' -PassThru -WindowStyle Hidden
+          if (-not $process.WaitForExit(15000)) {
+            Stop-Process -Id $process.Id -Force
+            throw 'onedir lifecycle smoke timed out'
+          }
+          if ($process.ExitCode -ne 0) { throw "onedir exited with $($process.ExitCode)" }
+      - name: Scan source and build artifacts
+        run: python scripts/scan_artifacts.py --path ..

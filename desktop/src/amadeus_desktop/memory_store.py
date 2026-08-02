@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from uuid import uuid4
 
@@ -28,6 +28,8 @@ from amadeus_desktop.storage_models import (
     MemoryVersion,
     MemoryVersionOperation,
     MemoryVersionOrigin,
+    RecallStats,
+    RecallTerminalStatus,
     StaleMemorySourceError,
     StorageNotFoundError,
     StorageValidationError,
@@ -38,6 +40,7 @@ from amadeus_desktop.storage_models import (
 
 Clock = Callable[[], datetime]
 IdFactory = Callable[[], str]
+MAX_INDEX_DOCUMENTS = 10_000
 
 _MEMORY_SELECT = """
 SELECT g.id AS memory_id, g.profile_id, g.kind, g.topic_key, g.status, g.pinned,
@@ -456,6 +459,199 @@ class MemoryStore:
             for row in rows
         )
 
+    def list_active_documents(
+        self,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        limit: int = MAX_INDEX_DOCUMENTS,
+    ) -> tuple[MemoryRecord, ...]:
+        """Return current active versions for a generation rebuild."""
+
+        _validate_limit(limit, MAX_INDEX_DOCUMENTS)
+        rows = self._database.connection.execute(
+            _MEMORY_SELECT
+            + """
+            WHERE g.profile_id = ? AND g.status = 'active'
+            ORDER BY g.updated_at DESC, g.id
+            LIMIT ?
+            """,
+            (_identifier(profile_id, "profile_id"), limit),
+        ).fetchall()
+        return tuple(_memory_from_row(row) for row in rows)
+
+    def get_active_by_version_ids(
+        self,
+        version_ids: Iterable[str],
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> tuple[MemoryRecord, ...]:
+        """Revalidate vector hits against current active immutable versions."""
+
+        ids = tuple(dict.fromkeys(_identifier(value, "version_id") for value in version_ids))
+        if not ids:
+            return ()
+        placeholders = ",".join("?" for _value in ids)
+        rows = self._database.connection.execute(
+            _MEMORY_SELECT
+            + f"""
+            WHERE g.profile_id = ? AND g.status = 'active'
+              AND g.current_version_id IN ({placeholders})
+            """,
+            (_identifier(profile_id, "profile_id"), *ids),
+        ).fetchall()
+        by_id = {str(row["version_id"]): _memory_from_row(row) for row in rows}
+        return tuple(by_id[value] for value in ids if value in by_id)
+
+    def record_successful_recall(
+        self,
+        retrieval_ticket_id: str,
+        version_ids: Sequence[str],
+        *,
+        terminal_status: RecallTerminalStatus | str,
+        first_chunk_received: bool,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        conversation_id: str | None = None,
+        assistant_message_id: str | None = None,
+        attempt: int = 1,
+        recalled_at: datetime | None = None,
+    ) -> int:
+        """Record only prompt entries that produced a visible successful response."""
+
+        status = _successful_terminal(terminal_status, first_chunk_received)
+        if status is None:
+            return 0
+        ticket_id = _identifier(retrieval_ticket_id, "retrieval_ticket_id")
+        profile_id = _identifier(profile_id, "profile_id")
+        ids = tuple(dict.fromkeys(_identifier(value, "version_id") for value in version_ids))
+        if not ids:
+            return 0
+        _validate_attempt(attempt)
+        now = encode_utc(recalled_at or self._clock())
+        placeholders = ",".join("?" for _value in ids)
+        with self._database.transaction() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT v.id
+                FROM memory_versions AS v
+                JOIN memory_groups AS g ON g.id = v.memory_id
+                WHERE g.profile_id = ? AND v.id IN ({placeholders})
+                """,
+                (profile_id, *ids),
+            ).fetchall()
+            if {str(row["id"]) for row in rows} != set(ids):
+                raise StorageValidationError("recall contains unknown memory versions")
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO memory_recall_events(
+                    id, retrieval_ticket_id, profile_id, version_id,
+                    conversation_id, assistant_message_id, attempt,
+                    terminal_status, recalled_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        self._id_factory(),
+                        ticket_id,
+                        profile_id,
+                        version_id,
+                        conversation_id,
+                        assistant_message_id,
+                        attempt,
+                        status.value,
+                        now,
+                    )
+                    for version_id in ids
+                ),
+            )
+            return connection.total_changes - before
+
+    def recall_stats(
+        self,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        memory_ids: Sequence[str] | None = None,
+    ) -> tuple[RecallStats, ...]:
+        """Aggregate success history across every immutable version in a group."""
+
+        parameters: list[object] = [_identifier(profile_id, "profile_id")]
+        id_clause = ""
+        if memory_ids is not None:
+            ids = tuple(dict.fromkeys(_identifier(value, "memory_id") for value in memory_ids))
+            if not ids:
+                return ()
+            placeholders = ",".join("?" for _value in ids)
+            id_clause = f"AND g.id IN ({placeholders})"
+            parameters.extend(ids)
+        rows = self._database.connection.execute(
+            """
+            SELECT g.id AS target_id, COUNT(e.id) AS recall_count,
+                   MAX(e.recalled_at) AS last_recalled_at
+            FROM memory_groups AS g
+            LEFT JOIN memory_versions AS v ON v.memory_id = g.id
+            LEFT JOIN memory_recall_events AS e ON e.version_id = v.id
+            WHERE g.profile_id = ?
+            """
+            + id_clause
+            + " GROUP BY g.id ORDER BY g.id",
+            parameters,
+        ).fetchall()
+        return tuple(
+            RecallStats(
+                target_id=str(row["target_id"]),
+                successful_recall_count=int(row["recall_count"]),
+                last_recalled_at=decode_utc(row["last_recalled_at"]),
+            )
+            for row in rows
+        )
+
+    def archive_decayed_events(
+        self,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        """Archive inactive low-value event memories; never delete user data."""
+
+        now_value = now or self._clock()
+        now_text = encode_utc(now_value)
+        profile_id = _identifier(profile_id, "profile_id")
+        with self._database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT g.id, v.created_at AS current_version_created_at, v.importance,
+                       MAX(e.recalled_at) AS last_recalled_at
+                FROM memory_groups AS g
+                JOIN memory_versions AS v ON v.id = g.current_version_id
+                LEFT JOIN memory_versions AS all_versions ON all_versions.memory_id = g.id
+                LEFT JOIN memory_recall_events AS e ON e.version_id = all_versions.id
+                WHERE g.profile_id = ? AND g.status = 'active'
+                  AND g.kind = 'event' AND g.pinned = 0 AND v.importance < 0.85
+                GROUP BY g.id, v.created_at, v.importance
+                """,
+                (profile_id,),
+            ).fetchall()
+            archived: list[str] = []
+            for row in rows:
+                created_at = _required_datetime(row["current_version_created_at"])
+                recalled_at = decode_utc(row["last_recalled_at"])
+                anchor = recalled_at or created_at
+                inactive_days = max(0.0, (now_value - anchor).total_seconds() / 86_400.0)
+                effective_score = float(row["importance"]) * 0.5 ** (inactive_days / 30.0)
+                if inactive_days >= 90.0 and effective_score < 0.15:
+                    archived.append(str(row["id"]))
+            if archived:
+                placeholders = ",".join("?" for _value in archived)
+                connection.execute(
+                    f"""
+                    UPDATE memory_groups SET status = 'archived', updated_at = ?
+                    WHERE profile_id = ? AND status = 'active'
+                      AND id IN ({placeholders})
+                    """,
+                    (now_text, profile_id, *archived),
+                )
+        return tuple(archived)
+
     def archive(self, memory_id: str) -> MemoryRecord:
         return self._set_status(memory_id, MemoryStatus.ARCHIVED)
 
@@ -838,6 +1034,24 @@ def _unit_interval(value: float, field: str) -> float:
 def _validate_limit(limit: int, maximum: int) -> None:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
         raise StorageValidationError(f"limit must be between 1 and {maximum}")
+
+
+def _validate_attempt(attempt: int) -> None:
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise StorageValidationError("attempt must be a positive integer")
+
+
+def _successful_terminal(
+    value: RecallTerminalStatus | str, first_chunk_received: bool
+) -> RecallTerminalStatus | None:
+    if not first_chunk_received:
+        return None
+    try:
+        return (
+            value if isinstance(value, RecallTerminalStatus) else RecallTerminalStatus(str(value))
+        )
+    except ValueError:
+        return None
 
 
 def _required_datetime(value: str) -> datetime:

@@ -4,6 +4,8 @@
 #
 #    pip-compile --allow-unsafe --extra=dev --output-file=requirements-dev.lock --strip-extras pyproject.toml
 #
+altgraph==0.17.5
+    # via pyinstaller
 anyio==4.14.2
     # via httpx
 build==1.5.0
@@ -14,38 +16,95 @@ certifi==2026.7.22
     # via
     #   httpcore
     #   httpx
+    #   requests
+charset-normalizer==3.4.9
+    # via requests
 click==8.4.2
-    # via pip-tools
+    # via
+    #   huggingface-hub
+    #   pip-tools
 colorama==0.4.6
     # via
     #   build
     #   click
+    #   loguru
     #   pytest
+    #   tqdm
+fastembed==0.8.0
+    # via amadeus-desktop (pyproject.toml)
+filelock==3.32.2
+    # via huggingface-hub
+flatbuffers==25.12.19
+    # via onnxruntime
+fsspec==2026.7.0
+    # via huggingface-hub
 h11==0.16.0
     # via httpcore
+hf-xet==1.5.2
+    # via huggingface-hub
 httpcore==1.0.9
     # via httpx
 httpx==0.28.1
-    # via amadeus-desktop (pyproject.toml)
+    # via
+    #   amadeus-desktop (pyproject.toml)
+    #   huggingface-hub
+huggingface-hub==1.26.0
+    # via
+    #   fastembed
+    #   tokenizers
 idna==3.18
     # via
     #   anyio
     #   httpx
+    #   requests
 iniconfig==2.3.0
     # via pytest
+loguru==0.7.3
+    # via fastembed
+mmh3==5.2.1
+    # via fastembed
+mpmath==1.3.0
+    # via sympy
+numpy==2.4.2
+    # via
+    #   amadeus-desktop (pyproject.toml)
+    #   fastembed
+    #   onnxruntime
+onnxruntime==1.24.4
+    # via
+    #   amadeus-desktop (pyproject.toml)
+    #   fastembed
 packaging==26.2
     # via
     #   build
+    #   huggingface-hub
+    #   onnxruntime
+    #   pyinstaller
+    #   pyinstaller-hooks-contrib
     #   pytest
     #   wheel
+pefile==2024.8.26
+    # via pyinstaller
+pillow==12.3.0
+    # via fastembed
 pip-tools==7.6.0
     # via amadeus-desktop (pyproject.toml)
 pluggy==1.6.0
     # via
     #   pytest
     #   pytest-qt
+protobuf==7.35.1
+    # via onnxruntime
+py-rust-stemmers==0.1.8
+    # via fastembed
 pygments==2.20.0
     # via pytest
+pyinstaller==6.21.0
+    # via amadeus-desktop (pyproject.toml)
+pyinstaller-hooks-contrib==2026.6
+    # via
+    #   amadeus-desktop (pyproject.toml)
+    #   pyinstaller
 pyproject-hooks==1.2.0
     # via
     #   build
@@ -66,6 +125,12 @@ pytest-qt==4.5.0
     # via amadeus-desktop (pyproject.toml)
 pywin32==312
     # via amadeus-desktop (pyproject.toml)
+pywin32-ctypes==0.2.3
+    # via pyinstaller
+pyyaml==6.0.3
+    # via huggingface-hub
+requests==2.34.2
+    # via fastembed
 ruff==0.16.1
     # via amadeus-desktop (pyproject.toml)
 shiboken6==6.11.1
@@ -73,14 +138,27 @@ shiboken6==6.11.1
     #   pyside6
     #   pyside6-addons
     #   pyside6-essentials
+sympy==1.14.0
+    # via onnxruntime
+tokenizers==0.23.1
+    # via fastembed
+tqdm==4.70.0
+    # via
+    #   fastembed
+    #   huggingface-hub
 typing-extensions==4.16.0
     # via
     #   anyio
+    #   huggingface-hub
     #   pytest-qt
+urllib3==2.7.0
+    # via requests
 wheel==0.47.0
     # via
     #   amadeus-desktop (pyproject.toml)
     #   pip-tools
+win32-setctime==1.2.0
+    # via loguru
 
 # The following packages are considered to be unsafe in a requirements file:
 pip==25.3
@@ -91,3 +169,4 @@ setuptools==81.0.0
     # via
     #   amadeus-desktop (pyproject.toml)
     #   pip-tools
+    #   pyinstaller

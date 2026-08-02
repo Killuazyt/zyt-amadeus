@@ -21,6 +21,7 @@ class MemoryView:
     version: int
     created_at: str
     updated_at: str
+    last_recalled_at: str = ""
 
 
 def make_page(qtbot) -> MemoryPage:
@@ -52,7 +53,7 @@ def test_enabled_and_search_signals_only_reflect_user_actions(qtbot) -> None:
     page.enabled_changed.connect(enabled.append)
     page.search_requested.connect(lambda *values: searches.append(values))
     assert page.status_combo.findData("superseded") == -1
-    assert page.sort_combo.findData("recalled_desc") == -1
+    assert page.sort_combo.findData("recalled_desc") >= 0
 
     page.set_memory_enabled(False)
     assert enabled == []
@@ -84,7 +85,7 @@ def test_memory_detail_edit_pin_archive_and_restore_emit_ids(qtbot) -> None:
     assert page.current_memory_id == "memory-1"
     assert page.detail_edit.toPlainText() == "用户不喜欢太甜的咖啡"
     assert "偏好" in page.detail_title_label.text()
-    assert "最近召回" not in page.detail_meta_label.text()
+    assert "最近召回：从未" in page.detail_meta_label.text()
     assert page.restore_button.isHidden()
 
     page.detail_edit.setPlainText("  用户现在喜欢微甜咖啡  ")
@@ -101,6 +102,72 @@ def test_memory_detail_edit_pin_archive_and_restore_emit_ids(qtbot) -> None:
     assert not page.restore_button.isHidden()
     page.restore_button.click()
     assert restored == ["memory-1"]
+
+
+def test_recent_recall_is_visible_and_sortable(qtbot) -> None:
+    page = make_page(qtbot)
+    searches: list[tuple[str, str, str, str]] = []
+    page.search_requested.connect(lambda *values: searches.append(values))
+    recalled = MemoryView(
+        **{
+            **sample_memory().__dict__,
+            "last_recalled_at": "2026-08-02 10:30:00",
+        }
+    )
+
+    page.set_memories([recalled])
+    assert page.memory_table.item(0, 6).text() == "2026-08-02 10:30:00"
+    assert "最近召回：2026-08-02 10:30:00" in page.detail_meta_label.text()
+
+    page.sort_combo.setCurrentIndex(page.sort_combo.findData("recalled_desc"))
+    assert searches[-1][-1] == "recalled_desc"
+
+
+def test_retrieval_status_and_actions_use_only_safe_metadata(qtbot) -> None:
+    page = make_page(qtbot)
+    verified: list[bool] = []
+    rebuilt: list[bool] = []
+    page.verify_model_requested.connect(lambda: verified.append(True))
+    page.rebuild_index_requested.connect(lambda: rebuilt.append(True))
+
+    page.set_retrieval_status(
+        {
+            "model_status": "missing",
+            "safe_error_category": "raw secret must never be rendered",
+            "user_generation_id": "user-generation-private-long-id",
+            "user_generation_status": "active",
+            "user_vector_count": 12,
+            "persona_generation_id": "persona-generation-private-long-id",
+            "persona_generation_status": "failed",
+            "persona_vector_count": 7,
+            "last_rebuild_status": "failed",
+        }
+    )
+
+    assert "模型缺失" in page.retrieval_status_label.text()
+    assert "raw secret" not in page.retrieval_status_label.text()
+    assert "user-generat…" in page.retrieval_index_label.text()
+    assert "12 条" in page.retrieval_index_label.text()
+    assert not page.rebuild_index_button.isEnabled()
+    qtbot.mouseClick(page.verify_model_button, Qt.MouseButton.LeftButton)
+    assert verified == [True]
+
+    page.set_retrieval_status(
+        {
+            "model_status": "ready",
+            "user_generation": "generation-1",
+            "user_generation_status": "active",
+            "user_index_count": 12,
+            "persona_generation": "generation-2",
+            "persona_generation_status": "active",
+            "persona_index_count": 7,
+            "last_rebuild_status": "active",
+        }
+    )
+    assert "已就绪" in page.retrieval_status_label.text()
+    assert page.rebuild_index_button.isEnabled()
+    qtbot.mouseClick(page.rebuild_index_button, Qt.MouseButton.LeftButton)
+    assert rebuilt == [True]
 
 
 def test_sources_show_body_or_tombstone_and_only_live_source_can_jump(qtbot) -> None:

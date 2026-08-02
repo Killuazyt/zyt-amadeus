@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from copy import deepcopy
 from typing import Any
 
@@ -28,6 +29,9 @@ from amadeus_desktop.credential_store import (
     WinCredentialStore,
 )
 from amadeus_desktop.data_runtime import SerialDataThread
+from amadeus_desktop.embedding_backend import FastEmbedEmbeddingBackend
+from amadeus_desktop.embedding_calibration import calibrate_backend
+from amadeus_desktop.embedding_model import resolve_runtime_model_directory
 from amadeus_desktop.local_data_service import (
     ConversationSnapshot,
     LocalDataService,
@@ -59,6 +63,8 @@ from amadeus_desktop.ui.model_settings import ModelSettingsWindow
 from amadeus_desktop.ui.pet_window import PetWindow
 from amadeus_desktop.ui.settings_window import SettingsWindow
 from amadeus_desktop.ui.tray import TrayController
+from amadeus_desktop.vector_index import VectorIndexCoordinator, VectorIndexRepositories
+from amadeus_desktop.vector_runtime import PriorityVectorRuntime
 
 
 class ApplicationController:
@@ -91,6 +97,7 @@ class ApplicationController:
         self.settings_repository = settings_repository
         self.settings = settings
         self._exiting = False
+        self._shutdown_clean: bool | None = None
         self._restore_scheduled = False
         self._chat_reposition_scheduled = False
         self._turn_started_at: dict[str, float] = {}
@@ -102,6 +109,8 @@ class ApplicationController:
         self._pending_provider_configuration: ProviderConfig | None = None
         self._pending_provider_secret: str | None = None
         self._provider_switch_generation = 0
+        self._initial_index_refresh_requested = False
+        self._vector_index_available = False
         self._mock_chat = mock_chat
         self._settings_trusted = allow_saved_provider
         self.credential_store = credential_store or WinCredentialStore()
@@ -178,11 +187,31 @@ class ApplicationController:
             resource_close=lambda stores: stores.close(),
             parent=application,
         )
+        self.vector_runtime = PriorityVectorRuntime()
+        prepared_model_directory = resolve_runtime_model_directory(
+            self.paths.embedding_model_directory
+        )
+        self.vector_index = VectorIndexCoordinator(
+            self.data_runtime,
+            self.vector_runtime,
+            lambda: FastEmbedEmbeddingBackend(prepared_model_directory),
+            lambda resource: VectorIndexRepositories(
+                resource.memories,
+                resource.personas,
+                resource.vectors,
+            ),
+            backend_calibrator=lambda backend: calibrate_backend(backend).calibration.threshold,
+            parent=application,
+        )
         self.data_service = LocalDataService(
             self.data_runtime,
             memory_enabled=bool(settings["memory"]["enabled"]),
+            vector_query=self.vector_index.query,
             parent=application,
         )
+        self.memory_maintenance_timer = QTimer(application)
+        self.memory_maintenance_timer.setInterval(24 * 60 * 60 * 1_000)
+        self.memory_maintenance_timer.timeout.connect(self.data_service.run_memory_maintenance)
         self.background_generation = BackgroundGenerationRunner(
             selected_provider,
             parent=application,
@@ -203,6 +232,7 @@ class ApplicationController:
         self.memory_jobs.job_failed.connect(
             lambda _job_id, _kind, _category: self.data_service.refresh_memories()
         )
+        self.memory_jobs.job_status_changed.connect(self._on_background_job_status_changed)
         self.memory_jobs.scheduler_error.connect(
             lambda category: self.logger.warning(
                 "Background memory scheduler error_type=%s", category
@@ -290,6 +320,10 @@ class ApplicationController:
         self.application.aboutToQuit.connect(self._cleanup)
         self.data_service.start()
 
+    @property
+    def shutdown_clean(self) -> bool | None:
+        return self._shutdown_clean
+
     def show_control_window(self) -> None:
         self.window.show_and_activate()
 
@@ -319,6 +353,9 @@ class ApplicationController:
         self.data_service.memory_sources_loaded.connect(self.memory_page.set_sources)
         self.data_service.source_context_loaded.connect(self._on_source_context_loaded)
         self.data_service.operation_failed.connect(self._on_data_operation_failed)
+        self.data_service.index_rebuild_requested.connect(self._request_incremental_index_refresh)
+        self.vector_index.status_changed.connect(self.memory_page.set_retrieval_status)
+        self.vector_index.status_changed.connect(self._queue_vector_index_status)
 
         self.chat_panel.load_older_requested.connect(self.data_service.load_older_messages)
         self.history_page.refresh_requested.connect(self.data_service.refresh_history)
@@ -344,6 +381,8 @@ class ApplicationController:
         self.memory_page.delete_requested.connect(self.data_service.delete_memory)
         self.memory_page.source_requested.connect(self.data_service.load_source_context)
         self.memory_page.retry_task_requested.connect(self.data_service.retry_failed_job)
+        self.memory_page.verify_model_requested.connect(self._verify_local_embedding_model)
+        self.memory_page.rebuild_index_requested.connect(self._request_index_rebuild)
 
     def _on_data_startup_loaded(self, snapshot_object: object) -> None:
         if not isinstance(snapshot_object, ConversationSnapshot):
@@ -360,6 +399,10 @@ class ApplicationController:
         self.data_service.refresh_memories()
         if self._background_jobs_enabled and self._data_writable:
             self.memory_jobs.start()
+        if self._data_writable:
+            self.vector_index.start()
+            self.data_service.run_memory_maintenance()
+            self.memory_maintenance_timer.start()
         if snapshot_object.read_only:
             self.logger.warning(
                 "Local database opened read-only migration_error=%s",
@@ -492,6 +535,61 @@ class ApplicationController:
         self.memory_page.set_memories(snapshot_object.rows, selected)
         self.memory_page.set_failed_tasks(snapshot_object.failed_jobs)
         self.memory_page.set_status(f"已加载 {len(snapshot_object.rows)} 条本地记忆。")
+
+    def _on_vector_index_status_changed(self, status: object) -> None:
+        available = bool(getattr(status, "available", False))
+        category = str(getattr(status, "category", ""))
+        if not available:
+            self._vector_index_available = False
+            return
+        # retry_backend() publishes a transient loading state after creating
+        # the backend but before persisted caches are installed.  Reindex only
+        # once that recovery reaches the stable ready state.
+        if category != "ready":
+            return
+        recovered = available and not self._vector_index_available
+        self._vector_index_available = available
+        if available and (not self._initial_index_refresh_requested or recovered):
+            self._initial_index_refresh_requested = True
+            self.vector_index.refresh_incremental()
+
+    def _queue_vector_index_status(self, status: object) -> None:
+        QTimer.singleShot(
+            0,
+            self.application,
+            lambda: self._on_vector_index_status_changed(status),
+        )
+
+    def _verify_local_embedding_model(self) -> None:
+        self.memory_page.set_status("正在后台验证本地模型。")
+        self.vector_index.retry_backend()
+
+    def _request_index_rebuild(self, _corpus: object | None = None) -> None:
+        if self.vector_index.rebuild():
+            self.memory_page.set_status("索引正在后台重新构建。")
+        else:
+            self.memory_page.set_status(
+                "索引当前无法重建；聊天会继续使用 FTS5。",
+                error=True,
+            )
+
+    def _request_incremental_index_refresh(self, _corpus: object | None = None) -> None:
+        if not self.vector_index.refresh_incremental():
+            category = getattr(self.vector_index.status, "category", "")
+            if category not in {"rebuilding", "incremental"}:
+                self.memory_page.set_status(
+                    "增量索引当前不可用；聊天会继续使用 FTS5。",
+                    error=True,
+                )
+
+    def _on_background_job_status_changed(
+        self,
+        _job_id: str,
+        kind: str,
+        status: str,
+    ) -> None:
+        if kind == "memory_extraction" and status == "completed":
+            self._request_incremental_index_refresh("user_memory")
 
     def _set_memory_enabled(self, enabled: bool) -> None:
         previous = bool(self.settings["memory"]["enabled"])
@@ -704,6 +802,8 @@ class ApplicationController:
         self._pending_provider_secret = None
         self._provider_switch_pending = False
         self._provider_switch_generation += 1
+        if self._data_writable and not self.memory_maintenance_timer.isActive():
+            self.memory_maintenance_timer.start()
         self.memory_jobs.resume()
         self.model_settings_window.apply_save_result(
             success=False,
@@ -1147,7 +1247,7 @@ class ApplicationController:
             return
         self._exiting = True
         self.logger.info("Application exit requested")
-        self._shutdown_background_tasks()
+        self._shutdown_clean = self._shutdown_background_tasks()
         self.window.prepare_to_exit()
         self.window.hide()
         self.chat_panel.hide()
@@ -1163,7 +1263,7 @@ class ApplicationController:
             self._exiting = True
             if self.tray is not None:
                 self.tray.close()
-            self._shutdown_background_tasks()
+            self._shutdown_clean = self._shutdown_background_tasks()
             self.chat_panel.hide()
             self.settings_window.hide()
             self.pet_window.hide()
@@ -1176,16 +1276,37 @@ class ApplicationController:
         self._pending_provider_secret = None
         self._provider_switch_pending = False
         self._provider_switch_generation += 1
-        deadline = time.monotonic() + max(0, timeout_ms) / 1_000
-        background_clean = self.memory_jobs.shutdown(
-            wait_ms=max(0, round((deadline - time.monotonic()) * 1000))
-        )
+        self.memory_maintenance_timer.stop()
+        self.data_service.stop_prompt_preparations()
+        total_ms = max(0, timeout_ms)
+        deadline = time.monotonic() + total_ms / 1_000
+
+        def slice_ms(fraction: float) -> int:
+            remaining = max(0, round((deadline - time.monotonic()) * 1_000))
+            return min(remaining, round(total_ms * fraction))
+
+        background_clean = self.memory_jobs.shutdown(wait_ms=slice_ms(0.15))
         # Start cancellation for the connection test before waiting on conversation cleanup.
         self.model_settings_window.cancel_test()
-        remaining_ms = max(0, round((deadline - time.monotonic()) * 1_000))
-        conversation_clean = self.conversation.shutdown(wait_ms=remaining_ms)
-        remaining_ms = max(0, round((deadline - time.monotonic()) * 1_000))
-        settings_clean = self.settings_window.shutdown(wait_ms=remaining_ms)
+        conversation_clean = self.conversation.shutdown(wait_ms=slice_ms(0.25))
+        vector_clean = True
+        remaining_seconds = min(
+            max(0.0, deadline - time.monotonic()),
+            total_ms * 0.15 / 1_000,
+        )
+        try:
+            self.vector_index.close().result(timeout=remaining_seconds)
+        except (FutureTimeoutError, RuntimeError):
+            vector_clean = False
+        remaining_seconds = min(
+            max(0.0, deadline - time.monotonic()),
+            total_ms * 0.15 / 1_000,
+        )
+        try:
+            self.vector_runtime.close(timeout=remaining_seconds, cancel_pending=True)
+        except TimeoutError:
+            vector_clean = False
+        settings_clean = self.settings_window.shutdown(wait_ms=slice_ms(0.10))
         remaining_ms = max(0, round((deadline - time.monotonic()) * 1000))
         data_clean = self.data_service.shutdown(wait_ms=remaining_ms)
         if not conversation_clean:
@@ -1200,6 +1321,14 @@ class ApplicationController:
             self.logger.error(
                 "Provider connection test did not stop within the shared shutdown deadline"
             )
+        if not vector_clean:
+            self.logger.error("Local vector runtime did not stop within the shutdown deadline")
         if not data_clean:
             self.logger.error("Local data thread did not stop within the shutdown deadline")
-        return background_clean and conversation_clean and settings_clean and data_clean
+        return (
+            background_clean
+            and conversation_clean
+            and vector_clean
+            and settings_clean
+            and data_clean
+        )

@@ -9,8 +9,11 @@ description = "Windows desktop pet with secure chat and auditable local memory"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "fastembed==0.8.0",
     "PySide6>=6.8,<7",
     "httpx>=0.28,<1",
+    "numpy==2.4.2",
+    "onnxruntime==1.24.4",
     "pywin32==312",
 ]
 
@@ -19,6 +22,8 @@ dev = [
     "build>=1.2,<2",
     "pip>=24,<26",
     "pip-tools>=7.4,<8",
+    "PyInstaller==6.21.0",
+    "pyinstaller-hooks-contrib==2026.6",
     "pytest>=8.3,<10",
     "pytest-qt>=4.4,<5",
     "ruff>=0.9,<1",
@@ -33,6 +38,10 @@ amadeus-pet-preview = "amadeus_desktop.tools.pet_preview:main"
 amadeus-pet-acceptance = "amadeus_desktop.tools.pet_acceptance:main"
 amadeus-pet-snapshot = "amadeus_desktop.tools.pet_snapshot:main"
 amadeus-pet-runtime-probe = "amadeus_desktop.tools.pet_runtime_probe:main"
+amadeus-model = "amadeus_desktop.tools.model:main"
+amadeus-persona = "amadeus_desktop.tools.persona:main"
+amadeus-embedding-acceptance = "amadeus_desktop.tools.embedding_acceptance:main"
+amadeus-index-acceptance = "amadeus_desktop.tools.index_acceptance:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -42,6 +51,7 @@ amadeus_desktop = [
     "resources/builtin_pet/*.json",
     "resources/builtin_pet/*.png",
     "resources/builtin_pet/*.txt",
+    "resources/licenses/*.txt",
 ]
 
 [tool.pytest.ini_options]

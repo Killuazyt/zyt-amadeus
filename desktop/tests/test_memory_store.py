@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -378,3 +378,169 @@ def test_conversation_and_current_memory_survive_database_reopen(tmp_path) -> No
         assert restored_memory.search("无糖咖啡")[0].memory.memory_id == record.memory_id
     finally:
         second_database.close()
+
+
+def test_active_document_revalidation_and_successful_recall_are_auditable(
+    memory_fixture,
+) -> None:
+    database, _conversations, memory, _conversation = memory_fixture
+    active = memory.create_memory(
+        "preference",
+        "饮料",
+        "用户喜欢咖啡",
+        source_message_ids=("user-0",),
+    )
+    archived = memory.create_memory(
+        "fact",
+        "旧资料",
+        "这是一条归档资料",
+        source_message_ids=("user-1",),
+    )
+    memory.archive(archived.memory_id)
+
+    assert [item.current_version.version_id for item in memory.list_active_documents()] == [
+        active.current_version.version_id
+    ]
+    assert memory.get_active_by_version_ids(
+        (active.current_version.version_id, archived.current_version.version_id, "missing")
+    ) == (active,)
+
+    assert (
+        memory.record_successful_recall(
+            "ticket-no-first",
+            (active.current_version.version_id,),
+            terminal_status="completed",
+            first_chunk_received=False,
+        )
+        == 0
+    )
+    assert (
+        memory.record_successful_recall(
+            "ticket-failed",
+            (active.current_version.version_id,),
+            terminal_status="failed",
+            first_chunk_received=True,
+        )
+        == 0
+    )
+    assert (
+        memory.record_successful_recall(
+            "ticket-success",
+            (active.current_version.version_id,),
+            terminal_status="completed",
+            first_chunk_received=True,
+        )
+        == 1
+    )
+    assert (
+        memory.record_successful_recall(
+            "ticket-success",
+            (active.current_version.version_id,),
+            terminal_status="completed",
+            first_chunk_received=True,
+        )
+        == 0
+    )
+    assert (
+        memory.record_successful_recall(
+            "ticket-stopped",
+            (active.current_version.version_id,),
+            terminal_status="user_stopped",
+            first_chunk_received=True,
+            attempt=2,
+        )
+        == 1
+    )
+    stats = memory.recall_stats(memory_ids=(active.memory_id,))[0]
+    assert stats.successful_recall_count == 2
+    assert stats.last_recalled_at is not None
+    assert (
+        database.connection.execute("SELECT COUNT(*) FROM memory_recall_events").fetchone()[0] == 2
+    )
+
+
+def test_event_decay_uses_latest_success_and_respects_exemptions(tmp_path) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    database = SQLiteDatabase(tmp_path / "amadeus.sqlite3").open()
+    memory = MemoryStore(database, clock=lambda: start)
+    try:
+        stale = memory.create_memory(
+            "event",
+            "旧事件",
+            "用户一百天前去过展览",
+            importance=0.5,
+            origin=MemoryVersionOrigin.MANUAL,
+        )
+        recalled = memory.create_memory(
+            "event",
+            "有召回事件",
+            "用户一百天前参加过读书会",
+            importance=0.5,
+            origin=MemoryVersionOrigin.MANUAL,
+        )
+        pinned = memory.create_memory(
+            "event",
+            "置顶事件",
+            "用户一百天前得到一份礼物",
+            importance=0.2,
+            origin=MemoryVersionOrigin.MANUAL,
+        )
+        important = memory.create_memory(
+            "event",
+            "重要事件",
+            "用户一百天前完成毕业答辩",
+            importance=0.85,
+            origin=MemoryVersionOrigin.MANUAL,
+        )
+        fact = memory.create_memory(
+            "fact",
+            "事实",
+            "用户的生日是五月一日",
+            importance=0.2,
+            origin=MemoryVersionOrigin.MANUAL,
+        )
+        memory.set_pinned(pinned.memory_id, True)
+        memory.record_successful_recall(
+            "ticket-recent",
+            (recalled.current_version.version_id,),
+            terminal_status="completed",
+            first_chunk_received=True,
+            recalled_at=start + timedelta(days=50),
+        )
+
+        assert memory.archive_decayed_events(now=start + timedelta(days=100)) == (stale.memory_id,)
+        assert memory.get(recalled.memory_id).status is MemoryStatus.ACTIVE
+        assert memory.get(pinned.memory_id).status is MemoryStatus.ACTIVE
+        assert memory.get(important.memory_id).status is MemoryStatus.ACTIVE
+        assert memory.get(fact.memory_id).status is MemoryStatus.ACTIVE
+
+        assert memory.archive_decayed_events(now=start + timedelta(days=151)) == (
+            recalled.memory_id,
+        )
+    finally:
+        database.close()
+
+
+def test_event_decay_anchor_ignores_group_metadata_updates(tmp_path) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    database = SQLiteDatabase(tmp_path / "amadeus.sqlite3").open()
+    memory = MemoryStore(database, clock=lambda: start)
+    try:
+        record = memory.create_memory(
+            "event",
+            "旧事件",
+            "用户一百天前参加过一次合成活动",
+            importance=0.5,
+            origin=MemoryVersionOrigin.MANUAL,
+        )
+        metadata_editor = MemoryStore(
+            database,
+            clock=lambda: start + timedelta(days=89),
+        )
+        metadata_editor.set_pinned(record.memory_id, True)
+        metadata_editor.set_pinned(record.memory_id, False)
+
+        assert memory.archive_decayed_events(now=start + timedelta(days=100)) == (record.memory_id,)
+        assert memory.get(record.memory_id).status is MemoryStatus.ARCHIVED
+    finally:
+        database.close()

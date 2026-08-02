@@ -136,3 +136,14 @@ class ChatRequest:
     attempt: int
     messages: tuple[PromptMessage, ...]
     options: GenerationOptions = field(default_factory=GenerationOptions)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPrompt:
+    """Provider messages plus the local retrieval evidence for one attempt."""
+
+    messages: tuple[PromptMessage, ...]
+    user_memory_version_ids: tuple[str, ...] = ()
+    persona_knowledge_ids: tuple[str, ...] = ()
+    retrieval_ticket_id: str = ""
+    attempt: int = 1

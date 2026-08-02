@@ -18,6 +18,7 @@ from amadeus_desktop.chat_models import (
     ConversationTurn,
     MessageRole,
     MessageStatus,
+    PreparedPrompt,
     PromptMessage,
     PromptRole,
     TurnTerminalReason,
@@ -41,6 +42,14 @@ PERSISTENCE_ERROR_TEXT = "本地数据无法安全保存，本轮未发送。"
 MAX_VISIBLE_RESPONSE_CHARS = 1024 * 1024
 
 
+def _prepared_prompt(
+    value: PreparedPrompt | tuple[PromptMessage, ...],
+) -> PreparedPrompt:
+    if isinstance(value, PreparedPrompt):
+        return value
+    return PreparedPrompt(messages=tuple(value))
+
+
 @runtime_checkable
 class ConversationPersistence(Protocol):
     """Asynchronous persistence boundary implemented by the P5A data session."""
@@ -48,14 +57,14 @@ class ConversationPersistence(Protocol):
     def prepare_new_turn(
         self,
         turn: ConversationTurn,
-        on_success: Callable[[tuple[PromptMessage, ...]], None],
+        on_success: Callable[[PreparedPrompt | tuple[PromptMessage, ...]], None],
         on_failure: Callable[[str], None],
     ) -> bool: ...
 
     def prepare_retry(
         self,
         turn: ConversationTurn,
-        on_success: Callable[[tuple[PromptMessage, ...]], None],
+        on_success: Callable[[PreparedPrompt | tuple[PromptMessage, ...]], None],
         on_failure: Callable[[str], None],
     ) -> bool: ...
 
@@ -132,7 +141,9 @@ class _RequestContext:
     cancellation: CancellationToken
     thread: QThread
     worker: _ProviderWorker
+    prepared_prompt: PreparedPrompt
     terminal_state: ConversationState | None = None
+    received_first_chunk: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +151,8 @@ class _PendingFinalization:
     request_id: str
     turn_id: str
     state: ConversationState
+    prepared_prompt: PreparedPrompt | None = None
+    received_first_chunk: bool = False
 
 
 class ConversationCoordinator(QObject):
@@ -440,7 +453,7 @@ class ConversationCoordinator(QObject):
         self._pending_preparation_request_id = request_id
         self._active_request_id = request_id
 
-        def prepared(messages: tuple[PromptMessage, ...]) -> None:
+        def prepared(value: PreparedPrompt | tuple[PromptMessage, ...]) -> None:
             if (
                 self._shutting_down
                 or generation != self._preparation_generation
@@ -451,7 +464,11 @@ class ConversationCoordinator(QObject):
             self._pending_preparation_request_id = None
             current = self._turn(turn.turn_id)
             if current is not None:
-                self._start_attempt(current, messages, request_id=request_id)
+                self._start_attempt(
+                    current,
+                    _prepared_prompt(value),
+                    request_id=request_id,
+                )
 
         def failed(_category: str) -> None:
             if (
@@ -485,8 +502,8 @@ class ConversationCoordinator(QObject):
             self.request_finished.emit(request_id, updated, ConversationState.FAILED)
             QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
 
-        def queue_prepared(messages: tuple[PromptMessage, ...]) -> None:
-            QTimer.singleShot(0, self, lambda: prepared(messages))
+        def queue_prepared(value: PreparedPrompt | tuple[PromptMessage, ...]) -> None:
+            QTimer.singleShot(0, self, lambda: prepared(value))
 
         def queue_failed(category: str) -> None:
             QTimer.singleShot(0, self, lambda: failed(category))
@@ -505,16 +522,17 @@ class ConversationCoordinator(QObject):
     def _start_attempt(
         self,
         turn: ConversationTurn,
-        messages: tuple[PromptMessage, ...],
+        prepared_prompt: PreparedPrompt | tuple[PromptMessage, ...],
         *,
         request_id: str | None = None,
     ) -> None:
         request_id = request_id or uuid4().hex
+        prepared_prompt = _prepared_prompt(prepared_prompt)
         request = ChatRequest(
             request_id=request_id,
             turn_id=turn.turn_id,
             attempt=turn.attempt,
-            messages=messages,
+            messages=prepared_prompt.messages,
         )
         cancellation = CancellationToken()
         thread = QThread(self)
@@ -522,7 +540,14 @@ class ConversationCoordinator(QObject):
         thread.setProperty("conversation_request_id", request_id)
         worker = _ProviderWorker(self._provider, request, cancellation)
         worker.moveToThread(thread)
-        context = _RequestContext(request_id, turn.turn_id, cancellation, thread, worker)
+        context = _RequestContext(
+            request_id,
+            turn.turn_id,
+            cancellation,
+            thread,
+            worker,
+            prepared_prompt,
+        )
         self._contexts[request_id] = context
         self._active_request_id = request_id
 
@@ -577,6 +602,7 @@ class ConversationCoordinator(QObject):
         if self._state is ConversationState.WAITING_FIRST_CHUNK:
             self._first_chunk_timer.stop()
             self._set_state(ConversationState.STREAMING)
+        context.received_first_chunk = True
         assistant = replace(
             turn.assistant_message,
             content=turn.assistant_message.content + chunk,
@@ -759,19 +785,34 @@ class ConversationCoordinator(QObject):
         self._flush_checkpoint()
         self.turn_updated.emit(updated)
         self._set_state(state)
-        self._persist_terminal_result(context.request_id, updated, state)
+        self._persist_terminal_result(
+            context.request_id,
+            updated,
+            state,
+            prepared_prompt=context.prepared_prompt,
+            received_first_chunk=context.received_first_chunk,
+        )
 
     def _persist_terminal_result(
         self,
         request_id: str,
         turn: ConversationTurn,
         state: ConversationState,
+        *,
+        prepared_prompt: PreparedPrompt | None = None,
+        received_first_chunk: bool = False,
     ) -> None:
         if self._persistence is None:
             self.request_finished.emit(request_id, turn, state)
             QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
             return
-        pending = _PendingFinalization(request_id, turn.turn_id, state)
+        pending = _PendingFinalization(
+            request_id,
+            turn.turn_id,
+            state,
+            prepared_prompt,
+            received_first_chunk,
+        )
         self._pending_finalization = pending
 
         def succeeded() -> None:
@@ -804,8 +845,32 @@ class ConversationCoordinator(QObject):
             return
         turn = self._turn(pending.turn_id)
         if turn is not None:
+            self._record_successful_recall(turn, pending)
             self.request_finished.emit(request_id, turn, pending.state)
         QTimer.singleShot(0, self, self._return_to_idle_if_inactive)
+
+    def _record_successful_recall(
+        self,
+        turn: ConversationTurn,
+        pending: _PendingFinalization,
+    ) -> None:
+        prepared = pending.prepared_prompt
+        if (
+            prepared is None
+            or not pending.received_first_chunk
+            or turn.terminal_reason
+            not in {TurnTerminalReason.COMPLETED, TurnTerminalReason.USER_STOPPED}
+            or not (prepared.user_memory_version_ids or prepared.persona_knowledge_ids)
+        ):
+            return
+        recorder = getattr(self._persistence, "record_successful_recall", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(turn, prepared)
+        except Exception:
+            # Recall evidence is auxiliary and must never roll back a durable reply.
+            return
 
     def _on_finalization_failed(self, request_id: str, _category: str) -> None:
         pending = self._pending_finalization

@@ -5,10 +5,11 @@ from datetime import date
 import pytest
 
 from amadeus_desktop.chat_models import PromptMessage, PromptRole
-from amadeus_desktop.memory_models import MemoryKind, PromptMemory
+from amadeus_desktop.memory_models import MemoryKind, PromptMemory, PromptPersonaKnowledge
 from amadeus_desktop.prompt_context import (
     DEFAULT_CHARACTER_BUDGET,
     MAX_PROMPT_MEMORIES,
+    MAX_PROMPT_PERSONA_KNOWLEDGE,
     MAX_RECENT_MESSAGES,
     DefaultPromptContextService,
     PromptContextInput,
@@ -22,6 +23,15 @@ def memory(index: int, content: str | None = None) -> PromptMemory:
         kind=MemoryKind.PREFERENCE,
         content=content or f"用户偏好第 {index} 项",
         topic_key=f"topic:{index}",
+        memory_version_id=f"version-{index}",
+    )
+
+
+def knowledge(index: int, content: str | None = None) -> PromptPersonaKnowledge:
+    return PromptPersonaKnowledge(
+        knowledge_id=f"knowledge-{index}",
+        persona_id="kurisu",
+        content=content or f"角色资料第 {index} 项",
     )
 
 
@@ -43,6 +53,7 @@ def test_default_service_satisfies_protocol_and_builds_fixed_order() -> None:
     result = service.build(
         build_input(
             memories=(memory(1),),
+            persona_knowledge=(knowledge(1),),
             summary="之前谈到了饮料。",
             recent_messages=(
                 PromptMessage(PromptRole.USER, "我有点渴。"),
@@ -57,6 +68,7 @@ def test_default_service_satisfies_protocol_and_builds_fixed_order() -> None:
         PromptRole.SYSTEM,
         PromptRole.SYSTEM,
         PromptRole.SYSTEM,
+        PromptRole.SYSTEM,
         PromptRole.USER,
         PromptRole.ASSISTANT,
         PromptRole.USER,
@@ -64,9 +76,13 @@ def test_default_service_satisfies_protocol_and_builds_fixed_order() -> None:
     assert result.messages[0].content.startswith("[应用与安全边界]")
     assert result.messages[1].content.startswith("[角色核心设定]")
     assert result.messages[2].content.endswith("2026-08-01")
-    assert result.messages[3].content.startswith("[用户长期记忆")
-    assert result.messages[4].content.startswith("[当前会话摘要")
+    assert result.messages[3].content.startswith("[角色本地知识")
+    assert result.messages[4].content.startswith("[用户长期记忆")
+    assert result.messages[5].content.startswith("[当前会话摘要")
     assert result.messages[-1].content == "今天喝什么？"
+    assert result.selected_memory_ids == ("memory-1",)
+    assert result.selected_memory_version_ids == ("version-1",)
+    assert result.selected_persona_knowledge_ids == ("knowledge-1",)
 
 
 def test_memory_selection_is_max_eight_and_at_most_twenty_percent() -> None:
@@ -76,8 +92,47 @@ def test_memory_selection_is_max_eight_and_at_most_twenty_percent() -> None:
 
     assert len(result.selected_memory_ids) == MAX_PROMPT_MEMORIES
     assert result.selected_memory_ids == tuple(f"memory-{index}" for index in range(8))
+    assert result.selected_memory_version_ids == tuple(f"version-{index}" for index in range(8))
     assert result.memory_character_count <= int(DEFAULT_CHARACTER_BUDGET * 0.20)
     assert result.omitted_memory_count == 4
+
+
+def test_persona_knowledge_is_separate_limited_and_never_counted_as_user_memory() -> None:
+    result = DefaultPromptContextService().build(
+        build_input(
+            memories=(memory(1),),
+            persona_knowledge=tuple(knowledge(index) for index in range(6)),
+        )
+    )
+
+    assert len(result.selected_persona_knowledge_ids) == MAX_PROMPT_PERSONA_KNOWLEDGE
+    assert result.selected_persona_knowledge_ids == tuple(
+        f"knowledge-{index}" for index in range(4)
+    )
+    assert result.selected_memory_ids == ("memory-1",)
+    assert result.omitted_persona_knowledge_count == 2
+    assert result.persona_knowledge_character_count > 0
+    assert result.memory_character_count <= int(DEFAULT_CHARACTER_BUDGET * 0.20)
+
+
+def test_inactive_duplicate_and_oversized_persona_fragments_are_skipped() -> None:
+    result = DefaultPromptContextService().build(
+        build_input(
+            character_budget=500,
+            persona_knowledge=(
+                PromptPersonaKnowledge("inactive", "kurisu", "不应出现", active=False),
+                knowledge(1, "过长" * 1_000),
+                knowledge(2, "理性地核对实验结果"),
+                knowledge(2, "重复标识也不应再次注入"),
+            ),
+        )
+    )
+
+    visible = "\n".join(message.content for message in result.messages)
+    assert result.selected_persona_knowledge_ids == ("knowledge-2",)
+    assert "理性地核对实验结果" in visible
+    assert "不应出现" not in visible
+    assert "重复标识" not in visible
 
 
 def test_oversized_memory_is_skipped_without_blocking_later_ranked_memory() -> None:
