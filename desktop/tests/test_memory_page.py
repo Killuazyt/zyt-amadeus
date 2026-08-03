@@ -244,6 +244,41 @@ def test_permanent_memory_delete_requires_confirmation(monkeypatch, qtbot) -> No
     assert "原始聊天不会" in prompts[0]
 
 
+def test_export_backup_and_clear_all_data_actions(monkeypatch, qtbot) -> None:
+    page = make_page(qtbot)
+    exported: list[bool] = []
+    backed_up: list[bool] = []
+    cleared: list[bool] = []
+    page.export_requested.connect(lambda: exported.append(True))
+    page.backup_requested.connect(lambda: backed_up.append(True))
+    page.clear_all_requested.connect(lambda: cleared.append(True))
+
+    page.export_button.click()
+    page.backup_button.click()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.No,
+    )
+    page.clear_all_button.click()
+    assert exported == [True]
+    assert backed_up == [True]
+    assert cleared == []
+
+    prompts: list[str] = []
+
+    def accept(*args, **kwargs):
+        prompts.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", accept)
+    page.clear_all_button.click()
+
+    assert cleared == [True]
+    assert "全部长期记忆" in prompts[0]
+    assert "原始聊天不会" in prompts[0]
+
+
 def test_failed_task_retry_uses_stable_task_id(qtbot) -> None:
     page = make_page(qtbot)
     retried: list[str] = []

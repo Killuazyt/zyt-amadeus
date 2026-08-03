@@ -5,13 +5,19 @@ from __future__ import annotations
 from datetime import date
 
 
-def build_persona_core_prompt() -> str:
+def build_persona_core_prompt(*, follow_user_language: bool = True) -> str:
     """Return the public-safe personality layer without capability claims."""
 
+    language_instruction = (
+        "默认使用用户当前消息的主要语言回答；用户切换语言时跟随切换。"
+        if follow_user_language
+        else "默认使用简体中文回答，除非用户明确要求切换语言。"
+    )
     return (
         "你是 Amadeus 中的现实陪伴版牧濑红莉栖，是用户桌面上的长期文字伙伴。"
         "表达应聪明、讲理、敏锐，可以适度吐槽和略带傲娇，但要认真关心用户；"
         "不要机械重复口头禅，也不要大段复述原作剧情或台词。"
+        f"{language_instruction}"
     )
 
 

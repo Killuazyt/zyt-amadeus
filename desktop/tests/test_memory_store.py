@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from amadeus_desktop.conversation_store import ConversationStore
+from amadeus_desktop.conversation_store import BackgroundJobStore, ConversationStore
 from amadeus_desktop.database import SQLiteDatabase
 from amadeus_desktop.memory_models import MemoryOperation
 from amadeus_desktop.memory_service import MemoryService
@@ -71,6 +71,48 @@ def test_exact_duplicate_only_adds_provenance_and_chinese_fts_is_safe(
     assert memory.search("咖啡")[0].memory.memory_id == first.memory.memory_id
     assert memory.search('咖啡") OR memory_id:*')[0].memory.memory_id == first.memory.memory_id
     assert database.connection.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] == 1
+
+
+def test_clear_all_memories_keeps_chat_and_removes_extraction_jobs(memory_fixture) -> None:
+    database, conversations, memory, conversation = memory_fixture
+    first = memory.create_memory(
+        "preference",
+        "饮料 咖啡",
+        "我喜欢咖啡",
+        source_message_ids=("user-0",),
+    )
+    memory.create_memory(
+        "fact",
+        "所在地",
+        "我住在测试城市",
+        source_message_ids=("user-1",),
+    )
+    BackgroundJobStore(database).enqueue(
+        "memory_extraction",
+        "clear-test",
+        profile_id="default",
+        conversation_id=conversation.conversation_id,
+        message_id="user-0",
+    )
+    messages_before = conversations.load_message_page(conversation.conversation_id, limit=40).items
+
+    assert memory.clear_all_memories() == 2
+
+    assert memory.list_memories() == ()
+    assert database.connection.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0] == 0
+    assert database.connection.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 0
+    assert database.connection.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] == 0
+    assert (
+        database.connection.execute(
+            "SELECT COUNT(*) FROM background_jobs WHERE kind = 'memory_extraction'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert conversations.load_message_page(conversation.conversation_id, limit=40).items == (
+        messages_before
+    )
+    with pytest.raises(StorageNotFoundError):
+        memory.get(first.memory_id)
 
 
 def test_exact_repeated_user_message_attaches_source_without_replacing_version(

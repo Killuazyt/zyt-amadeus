@@ -48,3 +48,22 @@ def test_acceptance_result_rejects_timeout_or_bad_corner() -> None:
         {"panel_fully_visible": True},
     ]
     assert not _acceptance_passed(result)
+
+
+def test_p6_double_click_requires_both_pet_and_chat_with_focused_input() -> None:
+    for failed_check in (
+        "pet_visible_after_double_click",
+        "chat_visible_after_double_click",
+        "chat_input_focused_after_double_click",
+    ):
+        result = passing_result()
+        result[failed_check] = False
+
+        assert not _acceptance_passed(result)
+
+    legacy = passing_result()
+    legacy.pop("chat_visible_after_double_click")
+    legacy.pop("chat_input_focused_after_double_click")
+    legacy["chat_remains_hidden_after_double_click"] = True
+
+    assert not _acceptance_passed(legacy)

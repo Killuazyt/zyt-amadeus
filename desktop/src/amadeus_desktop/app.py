@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 
 from amadeus_desktop import __version__
 from amadeus_desktop.controller import ApplicationController
+from amadeus_desktop.data_management import DataManagementError, recover_interrupted_restore
 from amadeus_desktop.logging_config import close_logger, configure_logging
 from amadeus_desktop.paths import AppPaths
 from amadeus_desktop.settings import DEFAULT_SETTINGS, SettingsError, SettingsRepository
@@ -54,6 +55,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths.initialize()
     logger = configure_logging(paths.log_file)
     logger.info("Application starting version=%s", __version__)
+
+    try:
+        restore_recovered = recover_interrupted_restore(paths)
+    except DataManagementError as exc:
+        logger.critical(
+            "Interrupted restore recovery failed closed error_type=%s",
+            type(exc).__name__,
+        )
+        instance_guard.close()
+        close_logger(logger)
+        return 4
+    if restore_recovered:
+        logger.warning("Interrupted restore transaction recovered before startup")
 
     status_message: str | None = None
     settings_trusted = True

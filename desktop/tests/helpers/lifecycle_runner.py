@@ -16,6 +16,20 @@ from amadeus_desktop.settings import SettingsRepository
 from amadeus_desktop.single_instance import SingleInstance
 
 
+class _IsolatedAutostart:
+    """Prevent lifecycle probes from observing or changing the real HKCU Run value."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+
+    def is_enabled(self) -> bool:
+        return self.enabled
+
+    def set_enabled(self, enabled: bool) -> bool:
+        self.enabled = bool(enabled)
+        return self.enabled
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instance-name", required=True)
@@ -50,6 +64,7 @@ def main() -> int:
         settings=settings,
         tray_available=False,
         credential_store=InMemoryCredentialStore(),
+        autostart_manager=_IsolatedAutostart(),  # type: ignore[arg-type]
     )
 
     def on_activation() -> None:

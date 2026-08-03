@@ -45,6 +45,7 @@ class GenerationPurpose(StrEnum):
     CONVERSATION_SUMMARY = "conversation_summary"
     MEMORY_EXTRACTION = "memory_extraction"
     STRUCTURE_REPAIR = "structure_repair"
+    PROACTIVE_GREETING = "proactive_greeting"
 
 
 @dataclass(frozen=True, slots=True)

@@ -48,11 +48,14 @@ def wait_for_file(path: Path, process: subprocess.Popen[str], timeout: float = 1
 
 def test_twenty_clean_start_exit_cycles(tmp_path: Path) -> None:
     environment = subprocess_environment()
+    # Reuse one endpoint name so every cycle proves the previous process released
+    # its QLocalServer endpoint rather than hiding residue behind a fresh UUID.
+    instance_name = f"amadeus-cycle-{uuid4().hex}"
 
     for index in range(20):
         result = subprocess.run(
             helper_command(
-                f"amadeus-cycle-{uuid4().hex}",
+                instance_name,
                 tmp_path / f"cycle-{index}",
                 "--auto-exit-ms",
                 "40",

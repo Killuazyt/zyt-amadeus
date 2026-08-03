@@ -7,14 +7,16 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from amadeus_desktop.provider_config import ProviderConfig, ProviderConfigError
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -23,9 +25,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ui": {
         "language": "zh-CN",
     },
+    "general": {
+        "always_on_top": True,
+        "launch_at_login": False,
+    },
     "pet": {
         "active_pet_id": "builtin-amadeus",
         "scale_percent": 100,
+        "animation_speed_percent": 100,
         "position": None,
     },
     "provider_enabled": False,
@@ -33,7 +40,27 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "memory": {
         "enabled": True,
     },
+    "persona": {
+        "follow_user_language": True,
+    },
+    "proactive": {
+        "mode": "restrained",
+        "quiet_start_minute": 23 * 60,
+        "quiet_end_minute": 8 * 60,
+        "daily_limit": 2,
+        "paused_local_date": None,
+        "ai_greetings_enabled": False,
+    },
 }
+
+_TOP_LEVEL_FIELDS = frozenset(DEFAULT_SETTINGS)
+_UI_FIELDS = frozenset(DEFAULT_SETTINGS["ui"])
+_GENERAL_FIELDS = frozenset(DEFAULT_SETTINGS["general"])
+_PET_FIELDS = frozenset(DEFAULT_SETTINGS["pet"])
+_MEMORY_FIELDS = frozenset(DEFAULT_SETTINGS["memory"])
+_PERSONA_FIELDS = frozenset(DEFAULT_SETTINGS["persona"])
+_PROACTIVE_FIELDS = frozenset(DEFAULT_SETTINGS["proactive"])
+_PROACTIVE_MODES = frozenset({"restrained", "startup_only", "off"})
 
 _FORBIDDEN_SETTING_KEYS = {
     "api-key",
@@ -107,11 +134,34 @@ def _migrate_v3_to_v4(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v4_to_v5(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 5
+
+    pet = migrated.get("pet")
+    if not isinstance(pet, dict):
+        raise InvalidSettingsError("The pet settings section must be an object.")
+    pet.setdefault(
+        "animation_speed_percent",
+        DEFAULT_SETTINGS["pet"]["animation_speed_percent"],
+    )
+
+    for section in ("general", "persona", "proactive"):
+        defaults = DEFAULT_SETTINGS[section]
+        existing = migrated.setdefault(section, deepcopy(defaults))
+        if not isinstance(existing, dict):
+            raise InvalidSettingsError(f"The {section} settings section must be an object.")
+        for key, value in defaults.items():
+            existing.setdefault(key, deepcopy(value))
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
+    4: _migrate_v4_to_v5,
 }
 
 
@@ -165,10 +215,10 @@ class SettingsRepository:
     def save(self, settings: Mapping[str, Any]) -> None:
         document = deepcopy(dict(settings))
         self._validate(document)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
 
         temporary_path: Path | None = None
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 "w",
                 encoding="utf-8",
@@ -185,7 +235,8 @@ class SettingsRepository:
             os.replace(temporary_path, self.path)
         except OSError as exc:
             if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
             raise SettingsError("Settings could not be saved atomically.") from exc
 
     def capture_snapshot(self) -> SettingsFileSnapshot:
@@ -212,9 +263,9 @@ class SettingsRepository:
         if snapshot.content is None:
             raise SettingsError("Settings snapshot is incomplete.")
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 "wb",
                 dir=self.path.parent,
@@ -229,7 +280,8 @@ class SettingsRepository:
             os.replace(temporary_path, self.path)
         except OSError as exc:
             if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
             raise SettingsError("Settings snapshot could not be restored.") from exc
 
     def load_provider_config(self) -> ProviderConfig:
@@ -253,23 +305,41 @@ class SettingsRepository:
                 f"Settings must use schema version {CURRENT_SCHEMA_VERSION}."
             )
         cls._reject_sensitive_keys(settings)
+        cls._require_exact_fields(settings, _TOP_LEVEL_FIELDS, "The settings document")
 
         ui = settings.get("ui")
         if not isinstance(ui, Mapping):
             raise InvalidSettingsError("The ui settings section must be an object.")
+        cls._require_exact_fields(ui, _UI_FIELDS, "The ui settings section")
         language = ui.get("language")
         if not isinstance(language, str) or not language.strip():
             raise InvalidSettingsError("ui.language must be a non-empty string.")
 
+        general = settings.get("general")
+        if not isinstance(general, Mapping):
+            raise InvalidSettingsError("The general settings section must be an object.")
+        cls._require_exact_fields(general, _GENERAL_FIELDS, "The general settings section")
+        for key in _GENERAL_FIELDS:
+            if not isinstance(general.get(key), bool):
+                raise InvalidSettingsError(f"general.{key} must be a boolean.")
+
         pet = settings.get("pet")
         if not isinstance(pet, Mapping):
             raise InvalidSettingsError("The pet settings section must be an object.")
+        cls._require_exact_fields(pet, _PET_FIELDS, "The pet settings section")
         pet_id = pet.get("active_pet_id")
         if not isinstance(pet_id, str) or _SAFE_PET_ID.fullmatch(pet_id) is None:
             raise InvalidSettingsError("pet.active_pet_id is invalid.")
         scale = pet.get("scale_percent")
         if isinstance(scale, bool) or not isinstance(scale, int) or not 50 <= scale <= 200:
             raise InvalidSettingsError("pet.scale_percent must be between 50 and 200.")
+        animation_speed = pet.get("animation_speed_percent")
+        if (
+            isinstance(animation_speed, bool)
+            or not isinstance(animation_speed, int)
+            or not 50 <= animation_speed <= 200
+        ):
+            raise InvalidSettingsError("pet.animation_speed_percent must be between 50 and 200.")
         position = pet.get("position")
         if position is not None:
             cls._validate_pet_position(position)
@@ -284,10 +354,60 @@ class SettingsRepository:
         memory = settings.get("memory")
         if not isinstance(memory, Mapping):
             raise InvalidSettingsError("The memory settings section must be an object.")
-        if set(memory) != {"enabled"}:
-            raise InvalidSettingsError("The memory settings section contains unsupported fields.")
+        cls._require_exact_fields(memory, _MEMORY_FIELDS, "The memory settings section")
         if not isinstance(memory.get("enabled"), bool):
             raise InvalidSettingsError("memory.enabled must be a boolean.")
+
+        persona = settings.get("persona")
+        if not isinstance(persona, Mapping):
+            raise InvalidSettingsError("The persona settings section must be an object.")
+        cls._require_exact_fields(persona, _PERSONA_FIELDS, "The persona settings section")
+        if not isinstance(persona.get("follow_user_language"), bool):
+            raise InvalidSettingsError("persona.follow_user_language must be a boolean.")
+
+        proactive = settings.get("proactive")
+        if not isinstance(proactive, Mapping):
+            raise InvalidSettingsError("The proactive settings section must be an object.")
+        cls._require_exact_fields(proactive, _PROACTIVE_FIELDS, "The proactive settings section")
+        mode = proactive.get("mode")
+        if not isinstance(mode, str) or mode not in _PROACTIVE_MODES:
+            raise InvalidSettingsError("proactive.mode is invalid.")
+        for key in ("quiet_start_minute", "quiet_end_minute"):
+            value = proactive.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1439:
+                raise InvalidSettingsError(f"proactive.{key} must be between 0 and 1439.")
+        daily_limit = proactive.get("daily_limit")
+        if (
+            isinstance(daily_limit, bool)
+            or not isinstance(daily_limit, int)
+            or not 1 <= daily_limit <= 2
+        ):
+            raise InvalidSettingsError("proactive.daily_limit must be between 1 and 2.")
+        paused_local_date = proactive.get("paused_local_date")
+        if paused_local_date is not None:
+            cls._validate_local_date(paused_local_date)
+        if not isinstance(proactive.get("ai_greetings_enabled"), bool):
+            raise InvalidSettingsError("proactive.ai_greetings_enabled must be a boolean.")
+
+    @staticmethod
+    def _require_exact_fields(
+        section: Mapping[str, Any],
+        expected: frozenset[str],
+        description: str,
+    ) -> None:
+        if set(section) != expected:
+            raise InvalidSettingsError(f"{description} contains unsupported or missing fields.")
+
+    @staticmethod
+    def _validate_local_date(value: Any) -> None:
+        if not isinstance(value, str) or len(value) != 10:
+            raise InvalidSettingsError("proactive.paused_local_date must use YYYY-MM-DD.")
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as exc:
+            raise InvalidSettingsError("proactive.paused_local_date must use YYYY-MM-DD.") from exc
+        if parsed.isoformat() != value:
+            raise InvalidSettingsError("proactive.paused_local_date must use YYYY-MM-DD.")
 
     @staticmethod
     def _validate_pet_position(position: Any) -> None:
@@ -319,3 +439,11 @@ class SettingsRepository:
         elif isinstance(value, list):
             for nested in value:
                 cls._reject_sensitive_keys(nested)
+
+
+def validate_settings_document(settings: Mapping[str, Any]) -> None:
+    """Validate one current settings document without migrating or writing it."""
+
+    if not isinstance(settings, Mapping):
+        raise InvalidSettingsError("Settings must be a JSON object.")
+    SettingsRepository._validate(settings)

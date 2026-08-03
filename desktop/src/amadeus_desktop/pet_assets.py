@@ -405,6 +405,48 @@ class PetAssetService:
         except (OSError, PetAssetError):
             return self.load_builtin(fallback=True)
 
+    def list_installed(self) -> tuple[LoadedPetAsset, ...]:
+        """Return the bundled pet plus every valid imported package."""
+
+        assets = [self.load_builtin()]
+        if not self.pets_root.exists():
+            return tuple(assets)
+        for candidate in sorted(self.pets_root.iterdir(), key=lambda path: path.name.lower()):
+            if (
+                not candidate.is_dir()
+                or candidate.name.startswith(".")
+                or SAFE_ID.fullmatch(candidate.name) is None
+            ):
+                continue
+            try:
+                asset = validate_package(candidate)
+            except (OSError, PetAssetError):
+                continue
+            if asset.manifest.pet_id == candidate.name and asset.manifest.pet_id != BUILTIN_PET_ID:
+                assets.append(asset)
+        return tuple(assets)
+
+    def remove(self, pet_id: str) -> bool:
+        """Remove one validated imported package without accepting a broad path."""
+
+        if pet_id == BUILTIN_PET_ID:
+            raise InvalidPetAssetError("The bundled pet cannot be removed.")
+        if SAFE_ID.fullmatch(str(pet_id)) is None:
+            raise InvalidPetAssetError("Pet id is invalid.")
+        root = self.pets_root.resolve()
+        target = (self.pets_root / pet_id).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise InvalidPetAssetError("Pet path escaped the import directory.") from exc
+        if not target.exists():
+            return False
+        if not target.is_dir() or target.is_symlink():
+            raise InvalidPetAssetError("Installed pet path is unsafe.")
+        validate_package(target)
+        shutil.rmtree(target)
+        return True
+
     def import_package(self, source: Path, *, replace: bool = False) -> LoadedPetAsset:
         source = source.resolve()
         _validate_source_name(source)

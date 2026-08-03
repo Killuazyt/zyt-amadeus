@@ -192,6 +192,7 @@ def finalize_prepared_prompt(
     vector_result: VectorRetrievalResult | None,
     prompt_service: DefaultPromptContextService,
     persona_id: str = DEFAULT_PERSONA_ID,
+    follow_user_language: bool = True,
 ) -> PreparedPrompt:
     """Revalidate candidates, fuse the two corpora, and build one immutable prompt."""
 
@@ -256,7 +257,7 @@ def finalize_prepared_prompt(
     context = prompt_service.build(
         PromptContextInput(
             safety_boundary=build_capability_safety_boundary(),
-            persona=build_persona_core_prompt(),
+            persona=build_persona_core_prompt(follow_user_language=follow_user_language),
             current_date=date.today(),
             current_user_message=seed.current_user_message,
             memories=memories,

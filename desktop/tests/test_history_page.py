@@ -73,21 +73,25 @@ def test_user_selection_and_non_destructive_toolbar_actions_emit_stable_ids(qtbo
     refreshed: list[bool] = []
     created: list[bool] = []
     older: list[str] = []
+    exports: list[bool] = []
     page.conversation_selected.connect(selected.append)
     page.refresh_requested.connect(lambda: refreshed.append(True))
     page.new_conversation_requested.connect(lambda: created.append(True))
     page.load_older_messages_requested.connect(older.append)
+    page.export_requested.connect(lambda: exports.append(True))
 
     page.conversation_list.setCurrentRow(1)
     page.refresh_button.click()
     page.new_button.click()
     page.set_messages("c2", [], has_older=True)
     page.load_older_button.click()
+    page.export_button.click()
 
     assert selected == ["c2"]
     assert refreshed == [True]
     assert created == [True]
     assert older == ["c2"]
+    assert exports == [True]
 
 
 def test_shutdown_recovery_is_not_labeled_as_user_stop(qtbot) -> None:

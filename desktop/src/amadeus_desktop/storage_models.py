@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 
 from amadeus_desktop.memory_models import MemoryKind
@@ -51,6 +51,22 @@ class StoredMessageStatus(StrEnum):
     COMPLETED = "completed"
     STOPPED = "stopped"
     FAILED = "failed"
+
+
+class StoredMessageOrigin(StrEnum):
+    CONVERSATION = "conversation"
+    PROACTIVE = "proactive"
+
+
+class ProactiveTrigger(StrEnum):
+    STARTUP = "startup"
+    IDLE = "idle"
+
+
+class ProactiveDisposition(StrEnum):
+    DISPLAYED = "displayed"
+    CLICKED = "clicked"
+    DISMISSED = "dismissed"
 
 
 class MemoryStatus(StrEnum):
@@ -121,6 +137,7 @@ class StoredMessage:
     conversation_id: str
     turn_id: str
     role: StoredMessageRole
+    origin: StoredMessageOrigin
     content: str
     status: StoredMessageStatus
     attempt: int
@@ -132,6 +149,17 @@ class StoredMessage:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProactiveInteractionEvent:
+    event_id: str
+    profile_id: str
+    local_date: date
+    trigger: ProactiveTrigger
+    displayed_at: datetime
+    disposition: ProactiveDisposition
+    message_id: str | None
 
 
 @dataclass(frozen=True, slots=True)

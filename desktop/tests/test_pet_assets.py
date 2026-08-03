@@ -129,6 +129,21 @@ def test_missing_active_pet_falls_back_without_overwriting(qapp, tmp_path: Path)
     assert asset.is_fallback is True
 
 
+def test_list_switch_and_safe_remove_keep_bundled_pet(qapp, tmp_path: Path) -> None:
+    service = PetAssetService(tmp_path / "pets")
+    imported = service.import_package(write_legacy_package(tmp_path / "source"))
+
+    assert [asset.manifest.pet_id for asset in service.list_installed()] == [
+        BUILTIN_PET_ID,
+        "legacy-test",
+    ]
+    assert service.load_active("legacy-test").manifest.pet_id == "legacy-test"
+    assert service.remove(imported.manifest.pet_id) is True
+    assert [asset.manifest.pet_id for asset in service.list_installed()] == [BUILTIN_PET_ID]
+    with pytest.raises(InvalidPetAssetError, match="bundled"):
+        service.remove(BUILTIN_PET_ID)
+
+
 @pytest.mark.parametrize("entry", ["../escape.json", "/absolute.json", "C:/drive.json"])
 def test_archive_path_escape_is_rejected(qapp, tmp_path: Path, entry: str) -> None:
     archive = tmp_path / "unsafe.codex-pet.zip"

@@ -31,7 +31,7 @@ PRIVATE_MEDIA_SUFFIXES = frozenset(
 PUBLIC_BUILTIN_SHEET = "amadeus_desktop/resources/builtin_pet/spritesheet.png"
 PUBLIC_BUILTIN_SHEET_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
 SECRET_PATTERNS = (
-    re.compile(rb"sk-[A-Za-z0-9_-]{24,}"),
+    re.compile(rb"(?:sk|tp)-[A-Za-z0-9_-]{24,}"),
     re.compile(rb"(?i)authorization\s*:\s*bearer\s+[A-Za-z0-9._-]{20,}"),
     re.compile(rb"(?i)['\"]?api[-_ ]?key['\"]?\s*[=:]\s*['\"]?[A-Za-z0-9._-]{24,}"),
 )
@@ -42,7 +42,7 @@ CLEARLY_INVALID_TEST_CREDENTIAL = re.compile(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scan P5B artifacts without printing paths.")
+    parser = argparse.ArgumentParser(description="Scan Amadeus artifacts without printing paths.")
     parser.add_argument("--path", action="append", required=True, type=Path)
     parser.add_argument("--allow-model", action="store_true")
     return parser
@@ -96,11 +96,12 @@ def _iter_payloads(root: Path) -> Iterable[tuple[str, bytes]]:
                 yield relative, path.read_bytes()
         return
     suffixes = root.suffixes
-    if root.suffix == ".whl" or root.suffix == ".zip":
+    if root.suffix in {".whl", ".zip", ".amadeus-backup", ".codex-pet"}:
+        archive_prefix = f"{root.name}!" if root.suffix in {".amadeus-backup", ".codex-pet"} else ""
         with zipfile.ZipFile(root) as archive:
             for name in sorted(archive.namelist()):
                 if not name.endswith("/"):
-                    yield f"archive:{name}", archive.read(name)
+                    yield f"archive:{archive_prefix}{name}", archive.read(name)
         return
     if suffixes[-2:] == [".tar", ".gz"]:
         with tarfile.open(root, "r:gz") as archive:
@@ -114,7 +115,9 @@ def _iter_payloads(root: Path) -> Iterable[tuple[str, bytes]]:
 
 
 def _is_archive(path: Path) -> bool:
-    return path.suffix in {".whl", ".zip"} or path.suffixes[-2:] == [".tar", ".gz"]
+    return path.suffix in {".whl", ".zip", ".amadeus-backup", ".codex-pet"} or path.suffixes[
+        -2:
+    ] == [".tar", ".gz"]
 
 
 def _inspect(
@@ -128,6 +131,13 @@ def _inspect(
     path = PurePosixPath(normalized)
     basename = path.name
     suffix = path.suffix
+    if ".amadeus-backup" in normalized:
+        violations["local_backup_file"] += 1
+    if basename in {
+        "amadeus-chat-export.json",
+        "amadeus-memory-export.json",
+    } or (suffix == ".json" and _is_local_data_export(payload)):
+        violations["local_data_export"] += 1
     if basename == ".env" or basename.startswith(".env."):
         violations["dotenv_file"] += 1
     if suffix in {".sqlite", ".sqlite3", ".db", ".log", ".jsonl"} or basename.endswith(
@@ -140,6 +150,8 @@ def _inspect(
         violations[category] += 1
     if "reference/amadeus" in normalized or "克里斯提拉" in normalized:
         violations["private_reference"] += 1
+    if "/personas/" in f"/{normalized}":
+        violations["private_persona_data"] += 1
     if suffix in PRIVATE_MEDIA_SUFFIXES:
         public_sheet = PUBLIC_BUILTIN_SHEET in normalized
         if not public_sheet or hashlib.sha256(payload).hexdigest() != PUBLIC_BUILTIN_SHEET_SHA256:
@@ -195,6 +207,17 @@ def _valid_model_manifest(payload: bytes) -> bool:
         and files[name]["size"] > 0
         for name, expected_hash in PINNED_MODEL_FILE_SHA256.items()
     )
+
+
+def _is_local_data_export(payload: bytes) -> bool:
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(document, dict) and document.get("format") in {
+        "amadeus-chat-export/v1",
+        "amadeus-memory-export/v1",
+    }
 
 
 if __name__ == "__main__":

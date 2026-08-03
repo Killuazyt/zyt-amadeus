@@ -45,6 +45,7 @@ class HistoryPage(QWidget):
     delete_conversation_requested = Signal(str)
     clear_history_requested = Signal()
     load_older_messages_requested = Signal(str)
+    export_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -65,6 +66,8 @@ class HistoryPage(QWidget):
         self.rename_button = QPushButton("重命名")
         self.delete_button = QPushButton("删除会话")
         self.clear_button = QPushButton("清空全部聊天")
+        self.export_button = QPushButton("导出聊天 JSON…")
+        self.export_button.setObjectName("exportChatHistory")
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(self.refresh_button)
@@ -72,6 +75,7 @@ class HistoryPage(QWidget):
         toolbar.addWidget(self.rename_button)
         toolbar.addWidget(self.delete_button)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.export_button)
         toolbar.addWidget(self.clear_button)
 
         self.conversation_list = QListWidget()
@@ -142,6 +146,7 @@ class HistoryPage(QWidget):
         self.rename_button.clicked.connect(self._request_rename)
         self.delete_button.clicked.connect(self._request_delete)
         self.clear_button.clicked.connect(self._request_clear)
+        self.export_button.clicked.connect(self.export_requested.emit)
         self.load_older_button.clicked.connect(self._request_older_messages)
         self.conversation_list.currentItemChanged.connect(self._on_conversation_changed)
         self._sync_actions()

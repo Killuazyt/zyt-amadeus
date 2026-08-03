@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Protocol, TypeVar
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
 from amadeus_desktop.embedding_backend import (
@@ -166,6 +166,20 @@ class _RebuildContext:
 
 
 @dataclass(frozen=True, slots=True)
+class _PersonaRebuildSeed:
+    persona_generation_id: str
+    documents: tuple[_Document, ...]
+
+
+@dataclass(slots=True)
+class _PersonaRebuildContext:
+    seed: _PersonaRebuildSeed
+    offset: int = 0
+    persona_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    persona_snapshot: VectorCacheSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _IncrementalSeed:
     requires_rebuild: bool
     user_generation_id: str | None = None
@@ -221,6 +235,10 @@ class VectorIndexCoordinator(QObject):
         self._rebuild_in_progress = False
         self._incremental_in_progress = False
         self._incremental_pending = False
+        self._persona_rebuild_pending = False
+        self._load_in_progress = False
+        self._retry_in_progress = False
+        self._operation_epoch = 0
         self._thresholds = {
             VectorCorpus.USER_MEMORY: self._calibration_threshold,
             VectorCorpus.PERSONA_KNOWLEDGE: self._calibration_threshold,
@@ -241,16 +259,27 @@ class VectorIndexCoordinator(QObject):
         """Load persisted active generations without touching SQLite on Qt."""
 
         with self._state_lock:
-            if self._closed:
+            if (
+                self._closed
+                or self._load_in_progress
+                or self._retry_in_progress
+                or self._rebuild_in_progress
+                or self._incremental_in_progress
+            ):
                 return False
+            self._load_in_progress = True
+            self._operation_epoch += 1
+            epoch = self._operation_epoch
         request_id = self._data_thread.submit(
             self._load_persisted,
             priority=DataPriority.BACKGROUND,
-            on_success=self._on_persisted_loaded,
-            on_failure=lambda _category: self._publish_status("storage_error"),
+            on_success=lambda value: self._on_persisted_loaded(value, epoch),
+            on_failure=lambda _category: self._finish_persisted_load_failure(
+                epoch, "storage_error"
+            ),
         )
         if request_id is None:
-            self._publish_status("storage_unavailable")
+            self._finish_persisted_load_failure(epoch, "storage_unavailable")
             return False
         self._publish_status("loading")
         return True
@@ -261,6 +290,8 @@ class VectorIndexCoordinator(QObject):
         with self._state_lock:
             if (
                 self._closed
+                or self._load_in_progress
+                or self._retry_in_progress
                 or self._rebuild_in_progress
                 or self._incremental_in_progress
                 or self._backend_unavailable
@@ -279,11 +310,41 @@ class VectorIndexCoordinator(QObject):
         self._publish_status("rebuilding")
         return True
 
+    def rebuild_persona(self) -> bool:
+        """Rebuild only the fixed persona corpus without switching user memory."""
+
+        with self._state_lock:
+            if self._closed or self._backend_unavailable:
+                return False
+            if (
+                self._load_in_progress
+                or self._retry_in_progress
+                or self._rebuild_in_progress
+                or self._incremental_in_progress
+            ):
+                self._persona_rebuild_pending = True
+                return True
+            self._rebuild_in_progress = True
+        request_id = self._data_thread.submit(
+            self._begin_persona_rebuild,
+            priority=DataPriority.BACKGROUND,
+            on_success=self._on_persona_rebuild_seeded,
+            on_failure=lambda _category: self._finish_rebuild_failure("storage_error"),
+        )
+        if request_id is None:
+            self._finish_rebuild_failure("storage_unavailable")
+            return False
+        self._publish_status("rebuilding")
+        return True
+
     def refresh_incremental(self) -> bool:
         """Embed only new/current rows, falling back to a generation rebuild on deletions."""
 
         with self._state_lock:
             if self._closed or self._backend_unavailable:
+                return False
+            if self._load_in_progress or self._retry_in_progress:
+                self._incremental_pending = True
                 return False
             if self._rebuild_in_progress or self._incremental_in_progress:
                 self._incremental_pending = True
@@ -367,8 +428,15 @@ class VectorIndexCoordinator(QObject):
         """Explicitly retry model construction after a user-requested verification."""
 
         with self._state_lock:
-            if self._closed:
+            if (
+                self._closed
+                or self._load_in_progress
+                or self._retry_in_progress
+                or self._rebuild_in_progress
+                or self._incremental_in_progress
+            ):
                 return _failed_future(EmbeddingUnavailableError("embedding_unavailable"))
+            self._retry_in_progress = True
 
         def operation() -> bool:
             previous, self._backend = self._backend, None
@@ -389,6 +457,8 @@ class VectorIndexCoordinator(QObject):
         try:
             future = self._vector_runtime.submit(operation, priority=VectorTaskPriority.QUERY)
         except VectorRuntimeClosedError as error:
+            with self._state_lock:
+                self._retry_in_progress = False
             self._publish_status("runtime_unavailable")
             return _failed_future(EmbeddingUnavailableError("embedding_unavailable"), error)
 
@@ -396,13 +466,19 @@ class VectorIndexCoordinator(QObject):
             try:
                 result.result()
             except Exception as error:
+                with self._state_lock:
+                    self._retry_in_progress = False
                 self._publish_status(_safe_embedding_category(error))
             else:
+                with self._state_lock:
+                    self._retry_in_progress = False
+                    closed = self._closed
                 # A retry can follow a startup failure, before any persisted
                 # generation was materialized into the immutable caches.
                 # Re-run the normal load path rather than reporting a false
                 # ready state with empty caches.
-                self.start()
+                if not closed:
+                    self.start()
 
         future.add_done_callback(completed)
         return future
@@ -412,6 +488,9 @@ class VectorIndexCoordinator(QObject):
 
         with self._state_lock:
             self._closed = True
+            self._operation_epoch += 1
+            self._load_in_progress = False
+            self._retry_in_progress = False
 
         def operation() -> None:
             backend, self._backend = self._backend, None
@@ -448,7 +527,10 @@ class VectorIndexCoordinator(QObject):
             ),
         )
 
-    def _on_persisted_loaded(self, value: object) -> None:
+    def _on_persisted_loaded(self, value: object, epoch: int) -> None:
+        with self._state_lock:
+            if self._closed or not self._load_in_progress or epoch != self._operation_epoch:
+                return
         loaded = value
         assert isinstance(loaded, _LoadedState)
 
@@ -462,7 +544,7 @@ class VectorIndexCoordinator(QObject):
         try:
             future = self._vector_runtime.submit(operation, priority=VectorTaskPriority.REBUILD)
         except VectorRuntimeClosedError:
-            self._publish_status("runtime_unavailable")
+            self._finish_persisted_load_failure(epoch, "runtime_unavailable")
             return
 
         def completed(
@@ -471,10 +553,27 @@ class VectorIndexCoordinator(QObject):
             try:
                 user_snapshot, persona_snapshot = result.result()
             except Exception as error:
+                if _safe_embedding_category(error) == "generation_model_mismatch":
+                    if self._finish_persisted_load_failure(
+                        epoch,
+                        "generation_model_mismatch",
+                        run_pending=False,
+                    ):
+                        QTimer.singleShot(0, self, self.rebuild)
+                    return
+                if not self._finish_persisted_load_failure(
+                    epoch,
+                    _safe_embedding_category(error),
+                    publish=False,
+                    run_pending=False,
+                ):
+                    return
                 self._disable_backend(error)
                 return
-            self._replace_caches(user_snapshot, persona_snapshot)
             with self._state_lock:
+                if self._closed or not self._load_in_progress or epoch != self._operation_epoch:
+                    return
+                self._replace_caches(user_snapshot, persona_snapshot)
                 if loaded.user is not None:
                     self._thresholds[VectorCorpus.USER_MEMORY] = (
                         loaded.user.generation.calibration_threshold
@@ -483,9 +582,49 @@ class VectorIndexCoordinator(QObject):
                     self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE] = (
                         loaded.persona.generation.calibration_threshold
                     )
+                self._load_in_progress = False
+                persona_pending = self._persona_rebuild_pending
+                self._persona_rebuild_pending = False
+                incremental_pending = False if persona_pending else self._incremental_pending
+                if not persona_pending:
+                    self._incremental_pending = False
             self._publish_status("ready")
+            self._run_pending_index_work(persona_pending, incremental_pending)
 
         future.add_done_callback(completed)
+
+    def _finish_persisted_load_failure(
+        self,
+        epoch: int,
+        category: str,
+        *,
+        publish: bool = True,
+        run_pending: bool = True,
+    ) -> bool:
+        with self._state_lock:
+            if self._closed or not self._load_in_progress or epoch != self._operation_epoch:
+                return False
+            self._load_in_progress = False
+            persona_pending = self._persona_rebuild_pending
+            self._persona_rebuild_pending = False
+            incremental_pending = False if persona_pending else self._incremental_pending
+            if not persona_pending:
+                self._incremental_pending = False
+        if publish:
+            self._publish_status(category)
+        if run_pending:
+            self._run_pending_index_work(persona_pending, incremental_pending)
+        return True
+
+    def _run_pending_index_work(
+        self,
+        persona_pending: bool,
+        incremental_pending: bool,
+    ) -> None:
+        if persona_pending and not self._backend_unavailable and self.rebuild_persona():
+            return
+        if incremental_pending and not self._backend_unavailable:
+            self.refresh_incremental()
 
     def _begin_incremental(self, resource: object) -> _IncrementalSeed:
         repositories = self._repository_resolver(resource)
@@ -665,20 +804,175 @@ class VectorIndexCoordinator(QObject):
     def _finish_incremental_success(self) -> None:
         with self._state_lock:
             self._incremental_in_progress = False
-            pending = self._incremental_pending
-            self._incremental_pending = False
+            persona_pending = self._persona_rebuild_pending
+            self._persona_rebuild_pending = False
+            pending = False if persona_pending else self._incremental_pending
+            if not persona_pending:
+                self._incremental_pending = False
         self._publish_status("ready")
+        if persona_pending and self.rebuild_persona():
+            return
         if pending:
             self.refresh_incremental()
 
     def _finish_incremental_failure(self, category: str) -> None:
         with self._state_lock:
             self._incremental_in_progress = False
-            pending = self._incremental_pending
-            self._incremental_pending = False
+            persona_pending = self._persona_rebuild_pending
+            self._persona_rebuild_pending = False
+            pending = False if persona_pending else self._incremental_pending
+            if not persona_pending:
+                self._incremental_pending = False
         self._publish_status(category)
+        if persona_pending and not self._backend_unavailable and self.rebuild_persona():
+            return
         if pending and not self._backend_unavailable:
             self.refresh_incremental()
+
+    def _begin_persona_rebuild(self, resource: object) -> _PersonaRebuildSeed:
+        repositories = self._repository_resolver(resource)
+        persona_documents = repositories.personas.list_active_documents(
+            self._persona_id,
+            limit=MAX_INDEX_DOCUMENTS,
+        )
+        generation = repositories.vectors.begin_persona_generation(
+            persona_id=self._persona_id,
+            model_name=PINNED_MODEL.api_name,
+            model_commit=PINNED_MODEL.revision,
+            model_sha256=PINNED_MODEL.onnx_sha256,
+            calibration_threshold=self._calibration_threshold,
+            dimension=PINNED_MODEL.dimension,
+        )
+        return _PersonaRebuildSeed(
+            persona_generation_id=generation.generation_id,
+            documents=tuple(
+                _Document(
+                    VectorCorpus.PERSONA_KNOWLEDGE,
+                    document.knowledge_id,
+                    document.content,
+                )
+                for document in persona_documents
+            ),
+        )
+
+    def _on_persona_rebuild_seeded(self, value: object) -> None:
+        seed = value
+        assert isinstance(seed, _PersonaRebuildSeed)
+        self._submit_persona_rebuild_batch(_PersonaRebuildContext(seed))
+
+    def _submit_persona_rebuild_batch(self, context: _PersonaRebuildContext) -> None:
+        if context.offset >= len(context.seed.documents):
+            self._prepare_persona_rebuild_snapshot(context)
+            return
+        batch = context.seed.documents[context.offset : context.offset + self._batch_size]
+
+        def operation() -> tuple[tuple[float, ...], ...]:
+            backend = self._require_backend()
+            vectors = backend.embed_documents(tuple(document.content for document in batch))
+            if len(vectors) != len(batch):
+                raise ValueError("embedding_count_mismatch")
+            return vectors
+
+        try:
+            future = self._vector_runtime.submit(operation, priority=VectorTaskPriority.REBUILD)
+        except VectorRuntimeClosedError:
+            self._mark_persona_rebuild_failed(context.seed, "runtime_unavailable")
+            return
+
+        def completed(result: Future[tuple[tuple[float, ...], ...]]) -> None:
+            try:
+                vectors = result.result()
+                for document, vector in zip(batch, vectors, strict=True):
+                    context.persona_vectors[document.target_id] = vector
+                context.offset += len(batch)
+                self._submit_persona_rebuild_batch(context)
+            except Exception as error:
+                self._disable_backend(error, publish=False)
+                self._mark_persona_rebuild_failed(context.seed, "embedding_unavailable")
+
+        future.add_done_callback(completed)
+
+    def _prepare_persona_rebuild_snapshot(self, context: _PersonaRebuildContext) -> None:
+        try:
+            context.persona_snapshot = VectorCacheSnapshot.build(
+                context.seed.persona_generation_id,
+                (
+                    VectorRecord(target_id, vector)
+                    for target_id, vector in context.persona_vectors.items()
+                ),
+            )
+        except Exception as error:
+            self._disable_backend(error, publish=False)
+            self._mark_persona_rebuild_failed(context.seed, "embedding_unavailable")
+            return
+
+        def activate(resource: object) -> str:
+            repositories = self._repository_resolver(resource)
+            current_persona = {
+                document.knowledge_id
+                for document in repositories.personas.list_active_documents(
+                    self._persona_id,
+                    limit=MAX_INDEX_DOCUMENTS,
+                )
+            }
+            if current_persona != set(context.persona_vectors):
+                raise ValueError("rebuild_documents_changed")
+            generation = repositories.vectors.activate_persona_generation(
+                context.seed.persona_generation_id,
+                context.persona_vectors,
+            )
+            return generation.generation_id
+
+        request_id = self._data_thread.submit(
+            activate,
+            priority=DataPriority.BACKGROUND,
+            on_success=lambda _value: self._finish_persona_rebuild_success(context),
+            on_failure=lambda _category: self._mark_persona_rebuild_failed(
+                context.seed,
+                "storage_error",
+            ),
+        )
+        if request_id is None:
+            self._mark_persona_rebuild_failed(context.seed, "storage_unavailable")
+
+    def _finish_persona_rebuild_success(self, context: _PersonaRebuildContext) -> None:
+        assert context.persona_snapshot is not None
+        self._caches.swap(VectorCorpus.PERSONA_KNOWLEDGE, context.persona_snapshot)
+        with self._state_lock:
+            self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE] = self._calibration_threshold
+            self._rebuild_in_progress = False
+            persona_pending = self._persona_rebuild_pending
+            self._persona_rebuild_pending = False
+            pending = False if persona_pending else self._incremental_pending
+            if not persona_pending:
+                self._incremental_pending = False
+        self._publish_status("ready")
+        if persona_pending and self.rebuild_persona():
+            return
+        if pending:
+            self.refresh_incremental()
+
+    def _mark_persona_rebuild_failed(
+        self,
+        seed: _PersonaRebuildSeed,
+        category: str,
+    ) -> None:
+        def operation(resource: object) -> None:
+            repositories = self._repository_resolver(resource)
+            with suppress(Exception):
+                repositories.vectors.fail_persona_generation(
+                    seed.persona_generation_id,
+                    "rebuild_failed",
+                )
+
+        request_id = self._data_thread.submit(
+            operation,
+            priority=DataPriority.BACKGROUND,
+            on_success=lambda _value: self._finish_rebuild_failure(category),
+            on_failure=lambda _failure: self._finish_rebuild_failure(category),
+        )
+        if request_id is None:
+            self._finish_rebuild_failure(category)
 
     def _begin_rebuild(self, resource: object) -> _RebuildSeed:
         repositories = self._repository_resolver(resource)
@@ -841,9 +1135,14 @@ class VectorIndexCoordinator(QObject):
             self._thresholds[VectorCorpus.USER_MEMORY] = self._calibration_threshold
             self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE] = self._calibration_threshold
             self._rebuild_in_progress = False
-            pending = self._incremental_pending
-            self._incremental_pending = False
+            persona_pending = self._persona_rebuild_pending
+            self._persona_rebuild_pending = False
+            pending = False if persona_pending else self._incremental_pending
+            if not persona_pending:
+                self._incremental_pending = False
         self._publish_status("ready")
+        if persona_pending and self.rebuild_persona():
+            return
         if pending:
             self.refresh_incremental()
 
@@ -871,9 +1170,14 @@ class VectorIndexCoordinator(QObject):
     def _finish_rebuild_failure(self, category: str) -> None:
         with self._state_lock:
             self._rebuild_in_progress = False
-            pending = self._incremental_pending
-            self._incremental_pending = False
+            persona_pending = self._persona_rebuild_pending
+            self._persona_rebuild_pending = False
+            pending = False if persona_pending else self._incremental_pending
+            if not persona_pending:
+                self._incremental_pending = False
         self._publish_status(category)
+        if persona_pending and not self._backend_unavailable and self.rebuild_persona():
+            return
         if pending and not self._backend_unavailable:
             self.refresh_incremental()
 

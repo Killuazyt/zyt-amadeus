@@ -194,13 +194,9 @@ class ChatPanel(QWidget):
     load_older_requested = Signal()
     visibility_changed = Signal(bool)
 
-    def __init__(self) -> None:
-        super().__init__(
-            None,
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint,
-        )
+    def __init__(self, *, always_on_top: bool = True) -> None:
+        self._always_on_top = bool(always_on_top)
+        super().__init__(None, self._window_flags())
         self._conversation_active = False
         self._turn_locked = False
         self._stop_pending = False
@@ -316,6 +312,31 @@ class ChatPanel(QWidget):
         return self._conversation_active
 
     @property
+    def always_on_top(self) -> bool:
+        return self._always_on_top
+
+    def set_always_on_top(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._always_on_top:
+            return
+        visible = self.isVisible()
+        position = self.pos()
+        self._always_on_top = enabled
+        self.setWindowFlags(self._window_flags())
+        self.move(position)
+        if visible:
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            self.show()
+            self.raise_()
+            self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+
+    def _window_flags(self) -> Qt.WindowType:
+        flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+        if self._always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        return flags
+
+    @property
     def message_ids(self) -> tuple[str, ...]:
         return tuple(self._message_order)
 
@@ -397,6 +418,18 @@ class ChatPanel(QWidget):
         self.action_button.setProperty("active", self._conversation_active)
         self.action_button.style().unpolish(self.action_button)
         self.action_button.style().polish(self.action_button)
+        self._sync_retry_enabled()
+        self._sync_action_enabled()
+
+    def set_foreground_preparing(self, preparing: bool) -> None:
+        """Lock duplicate send/retry actions while the provider lane is preempted."""
+
+        if preparing:
+            self._turn_locked = True
+        elif not self._conversation_active:
+            self._turn_locked = False
+            self._send_pending = False
+            self._pending_send_text = None
         self._sync_retry_enabled()
         self._sync_action_enabled()
 

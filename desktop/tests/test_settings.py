@@ -11,8 +11,10 @@ from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
     DEFAULT_SETTINGS,
     InvalidSettingsError,
+    SettingsError,
     SettingsRepository,
     UnsupportedSettingsVersionError,
+    validate_settings_document,
 )
 
 
@@ -34,6 +36,39 @@ def test_save_is_atomic_and_leaves_no_temporary_file(tmp_path: Path) -> None:
 
     assert repository.load() == DEFAULT_SETTINGS
     assert list(tmp_path.glob(".settings.json.*.tmp")) == []
+
+
+def test_save_wraps_parent_directory_failure_as_settings_error(tmp_path: Path) -> None:
+    blocked_parent = tmp_path / "config"
+    blocked_parent.write_text("not-a-directory", encoding="utf-8")
+
+    with pytest.raises(SettingsError, match="saved atomically"):
+        SettingsRepository(blocked_parent / "settings.json").save(DEFAULT_SETTINGS)
+
+
+def test_save_cleanup_failure_does_not_mask_settings_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = SettingsRepository(tmp_path / "settings.json")
+    original_unlink = Path.unlink
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("synthetic replace failure")
+
+    def fail_temporary_cleanup(path: Path, *args, **kwargs) -> None:
+        if path.name.startswith(".settings.json.") and path.name.endswith(".tmp"):
+            raise OSError("synthetic cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("amadeus_desktop.settings.os.replace", fail_replace)
+        patch.setattr(Path, "unlink", fail_temporary_cleanup)
+        with pytest.raises(SettingsError, match="saved atomically"):
+            repository.save(DEFAULT_SETTINGS)
+
+    for temporary in tmp_path.glob(".settings.json.*.tmp"):
+        temporary.unlink()
 
 
 def test_unversioned_settings_migrate_and_persist(tmp_path: Path) -> None:
@@ -81,6 +116,71 @@ def test_schema_v2_migrates_to_deepseek_provider_default(tmp_path: Path) -> None
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
 
+def test_schema_v4_migrates_to_p6_defaults_without_losing_existing_data(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    provider = ProviderConfig.for_preset(ProviderPreset.MIMO_PAYG, model="mimo-v2.5-pro")
+    legacy = {
+        "schema_version": 4,
+        "ui": {"language": "en-US"},
+        "pet": {
+            "active_pet_id": "local-pet",
+            "scale_percent": 125,
+            "position": {
+                "screen_id": "serial:test",
+                "x_ratio": 0.25,
+                "y_ratio": 0.75,
+            },
+        },
+        "provider_enabled": True,
+        "provider": provider.to_mapping(),
+        "memory": {"enabled": False},
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["schema_version"] == 5
+    assert loaded["ui"] == legacy["ui"]
+    assert loaded["pet"] == {
+        **legacy["pet"],
+        "animation_speed_percent": 100,
+    }
+    assert loaded["provider_enabled"] is True
+    assert loaded["provider"] == legacy["provider"]
+    assert loaded["memory"] == {"enabled": False}
+    assert loaded["general"] == DEFAULT_SETTINGS["general"]
+    assert loaded["persona"] == DEFAULT_SETTINGS["persona"]
+    assert loaded["proactive"] == DEFAULT_SETTINGS["proactive"]
+    assert json.loads(path.read_text(encoding="utf-8")) == loaded
+
+
+def test_schema_v4_preserves_already_present_p6_values(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy["schema_version"] = 4
+    legacy["general"] = {"always_on_top": False, "launch_at_login": True}
+    legacy["pet"]["animation_speed_percent"] = 175
+    legacy["persona"]["follow_user_language"] = False
+    legacy["proactive"] = {
+        "mode": "startup_only",
+        "quiet_start_minute": 60,
+        "quiet_end_minute": 120,
+        "daily_limit": 1,
+        "paused_local_date": "2026-08-03",
+        "ai_greetings_enabled": True,
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["general"] == legacy["general"]
+    assert loaded["pet"] == legacy["pet"]
+    assert loaded["persona"] == legacy["persona"]
+    assert loaded["proactive"] == legacy["proactive"]
+
+
 @pytest.mark.parametrize("scale", [49, 201, True, "100"])
 def test_invalid_pet_scale_is_rejected(tmp_path: Path, scale: object) -> None:
     document = deepcopy(DEFAULT_SETTINGS)
@@ -88,6 +188,104 @@ def test_invalid_pet_scale_is_rejected(tmp_path: Path, scale: object) -> None:
 
     with pytest.raises(InvalidSettingsError):
         SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+@pytest.mark.parametrize("speed", [49, 201, True, 100.0, "100"])
+def test_invalid_pet_animation_speed_is_rejected(tmp_path: Path, speed: object) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document["pet"]["animation_speed_percent"] = speed
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("general", "always_on_top", 1),
+        ("general", "launch_at_login", "false"),
+        ("persona", "follow_user_language", 1),
+        ("proactive", "mode", "frequent"),
+        ("proactive", "mode", 1),
+        ("proactive", "quiet_start_minute", -1),
+        ("proactive", "quiet_start_minute", 1440),
+        ("proactive", "quiet_end_minute", True),
+        ("proactive", "quiet_end_minute", 480.0),
+        ("proactive", "daily_limit", 0),
+        ("proactive", "daily_limit", 3),
+        ("proactive", "daily_limit", True),
+        ("proactive", "ai_greetings_enabled", 0),
+    ],
+)
+def test_invalid_p6_setting_values_are_rejected(
+    tmp_path: Path,
+    section: str,
+    key: str,
+    value: object,
+) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document[section][key] = value
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "2026-8-03", "2026-02-30", "2026/08/03", 20260803, False],
+)
+def test_invalid_paused_local_date_is_rejected(tmp_path: Path, value: object) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document["proactive"]["paused_local_date"] = value
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+@pytest.mark.parametrize("mode", ["restrained", "startup_only", "off"])
+def test_each_proactive_mode_round_trips(tmp_path: Path, mode: str) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document["proactive"]["mode"] = mode
+    document["proactive"]["paused_local_date"] = "2026-08-03"
+    repository = SettingsRepository(tmp_path / "settings.json")
+
+    repository.save(document)
+
+    assert repository.load() == document
+
+
+@pytest.mark.parametrize(
+    "section", [None, "ui", "general", "pet", "memory", "persona", "proactive"]
+)
+def test_unknown_fields_are_rejected(tmp_path: Path, section: str | None) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    target = document if section is None else document[section]
+    target["unsupported"] = True
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+@pytest.mark.parametrize("section", ["ui", "general", "pet", "memory", "persona", "proactive"])
+def test_missing_fields_are_rejected(tmp_path: Path, section: str) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document[section].pop(next(iter(document[section])))
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)
+
+
+def test_public_document_validation_is_pure_and_requires_current_schema(tmp_path: Path) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    path = tmp_path / "settings.json"
+
+    validate_settings_document(document)
+
+    assert not path.exists()
+    legacy = deepcopy(document)
+    legacy["schema_version"] = 4
+    with pytest.raises(InvalidSettingsError):
+        validate_settings_document(legacy)
 
 
 def test_valid_pet_position_round_trips(tmp_path: Path) -> None:
@@ -137,6 +335,19 @@ def test_snapshot_restores_exact_unparsed_bytes(tmp_path: Path) -> None:
     repository.restore_snapshot(snapshot)
 
     assert path.read_bytes() == original
+
+
+def test_snapshot_restore_wraps_parent_directory_failure_as_settings_error(
+    tmp_path: Path,
+) -> None:
+    source = SettingsRepository(tmp_path / "source" / "settings.json")
+    source.save(DEFAULT_SETTINGS)
+    snapshot = source.capture_snapshot()
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("not-a-directory", encoding="utf-8")
+
+    with pytest.raises(SettingsError, match="snapshot could not be restored"):
+        SettingsRepository(blocked_parent / "settings.json").restore_snapshot(snapshot)
 
 
 @pytest.mark.parametrize(

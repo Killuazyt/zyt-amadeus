@@ -47,6 +47,7 @@ function Invoke-PackagedProbe {
         throw 'probe directory escaped the system temporary directory'
     }
     [void](New-Item -ItemType Directory -Path $resolvedProbeRoot)
+    $process = $null
     $savedEnvironment = @{
         LOCALAPPDATA = $env:LOCALAPPDATA
         HF_HOME = $env:HF_HOME
@@ -92,6 +93,21 @@ function Invoke-PackagedProbe {
         }
     }
     finally {
+        $processCleanupFailed = $false
+        if ($null -ne $process) {
+            try {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                    if (-not $process.WaitForExit(5000)) {
+                        $processCleanupFailed = $true
+                    }
+                }
+            }
+            catch {
+                $processCleanupFailed = $true
+            }
+        }
         foreach ($name in $savedEnvironment.Keys) {
             $value = $savedEnvironment[$name]
             if ($null -eq $value) {
@@ -103,6 +119,9 @@ function Invoke-PackagedProbe {
         }
         if (Test-Path -LiteralPath $resolvedProbeRoot) {
             Remove-Item -LiteralPath $resolvedProbeRoot -Recurse -Force
+        }
+        if ($processCleanupFailed) {
+            throw "$ProbeName could not clean up its process"
         }
     }
 }
@@ -160,8 +179,10 @@ try {
                 throw 'bundled onedir embedding model missing'
             }
             Invoke-PackagedProbe -ExecutablePath $ExecutablePath -Arguments @('--embedding-model-probe') -ProbeName 'packaged embedding inference probe'
+            # Reuse one endpoint across cycles so a leaked QLocalServer endpoint fails
+            # the next launch instead of being hidden by a fresh acceptance name.
+            $instanceName = 'amadeus-acceptance-' + [Guid]::NewGuid().ToString('N')
             for ($cycle = 1; $cycle -le $LifecycleCycles; $cycle++) {
-                $instanceName = 'amadeus-acceptance-' + [Guid]::NewGuid().ToString('N')
                 Invoke-PackagedProbe -ExecutablePath $ExecutablePath -Arguments @('--embedding-lifecycle-probe=ready', "--acceptance-instance-name=$instanceName") -ProbeName "packaged model lifecycle probe $cycle/$LifecycleCycles"
             }
             Write-Output "Bundled lifecycle probes passed: $LifecycleCycles/$LifecycleCycles"

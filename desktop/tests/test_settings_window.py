@@ -19,16 +19,33 @@ def make_window(qtbot) -> SettingsWindow:
     return window
 
 
-def test_settings_shell_embeds_existing_model_dialog_and_only_exposes_p5_pages(qtbot) -> None:
+def test_settings_shell_has_exact_p6_left_navigation_and_embeds_model_dialog(qtbot) -> None:
     window = make_window(qtbot)
 
-    assert window.tabs.count() == 3
-    assert [window.tabs.tabText(index) for index in range(3)] == [
+    assert window.page_names == (
+        "general",
+        "pet",
+        "model",
+        "persona",
+        "history",
+        "memory",
+        "proactive",
+        "diagnostics",
+    )
+    assert [window.navigation.item(index).text() for index in range(8)] == [
+        "常规",
+        "桌宠",
         "对话模型",
+        "角色",
         "聊天历史",
         "长期记忆",
+        "主动互动",
+        "诊断",
     ]
-    assert window.tabs.widget(0) is window.model_page
+    assert window.stack.count() == 8
+    assert window.stack.widget(2) is window.model_page
+    assert window.stack.widget(4) is window.history_page
+    assert window.stack.widget(5) is window.memory_page
     assert window.model_page.windowType() == Qt.WindowType.Widget
     assert window.model_page.close_button.isHidden()
     assert not window.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -83,3 +100,17 @@ def test_shutdown_delegates_to_optional_page_hook(qtbot) -> None:
 
     assert window.shutdown(321)
     assert model_page.wait_values == [321]
+
+
+def test_invalid_deep_link_is_rejected_without_changing_page(qtbot) -> None:
+    window = make_window(qtbot)
+    window.show_page("persona")
+
+    try:
+        window.show_page("voice")
+    except ValueError as exc:
+        assert "voice" in str(exc)
+    else:
+        raise AssertionError("unsupported P6 settings page must fail closed")
+
+    assert window.current_page == "persona"

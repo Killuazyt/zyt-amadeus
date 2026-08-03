@@ -11,12 +11,12 @@ from amadeus_desktop.embedding_backend import CPU_PROVIDER, EmbeddingUnavailable
 from amadeus_desktop.embedding_model import PINNED_MODEL
 from amadeus_desktop.memory_store import MemoryStore
 from amadeus_desktop.persona_repository import PersonaRepository
-from amadeus_desktop.storage_models import MemoryVersionOrigin
+from amadeus_desktop.storage_models import MemoryVersionOrigin, PersonaKnowledgeDraft
 from amadeus_desktop.vector_index import (
     VectorIndexCoordinator,
     VectorIndexRepositories,
 )
-from amadeus_desktop.vector_runtime import PriorityVectorRuntime
+from amadeus_desktop.vector_runtime import PriorityVectorRuntime, VectorCorpus
 from amadeus_desktop.vector_store import VectorStore
 
 
@@ -45,6 +45,7 @@ class _FakeBackend:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.document_batches: list[tuple[str, ...]] = []
         self.thread_ids: list[int] = []
         self.first_batch_started = threading.Event()
         self.release_first_batch = threading.Event()
@@ -58,8 +59,10 @@ class _FakeBackend:
         return _unit_vector()
 
     def embed_documents(self, documents) -> tuple[tuple[float, ...], ...]:
+        documents = tuple(documents)
         call_number = sum(call.startswith("batch") for call in self.calls) + 1
         self.calls.append(f"batch{call_number}")
+        self.document_batches.append(documents)
         self.thread_ids.append(threading.get_ident())
         if self.block_first_batch and call_number == 1:
             self.first_batch_started.set()
@@ -200,6 +203,86 @@ def test_start_loads_persisted_generations_then_queries_both_caches(qtbot, tmp_p
         _shutdown(data, runtime, coordinator)
 
 
+def test_persisted_model_mismatch_automatically_rebuilds_both_corpora(
+    qtbot,
+    tmp_path,
+) -> None:
+    data, runtime, _backend, coordinator, _resources = _start_runtime(
+        qtbot,
+        tmp_path,
+        seed_active=True,
+    )
+    corrupted: list[bool] = []
+    inspections: list[tuple[object, object, int, int]] = []
+    categories: list[str] = []
+    coordinator.status_changed.connect(lambda status: categories.append(status.category))
+    try:
+
+        def corrupt_persisted_model_identity(resource: _Resource) -> None:
+            resource.database.connection.execute(
+                "UPDATE memory_embedding_generations SET model_commit = ?",
+                ("outdated-memory-commit",),
+            )
+            resource.database.connection.execute(
+                "UPDATE persona_embedding_generations SET model_commit = ?",
+                ("outdated-persona-commit",),
+            )
+
+        assert data.submit(
+            corrupt_persisted_model_identity,
+            on_success=lambda _value: corrupted.append(True),
+        )
+        qtbot.waitUntil(lambda: corrupted == [True], timeout=2_000)
+
+        assert coordinator.start()
+        qtbot.waitUntil(
+            lambda: (
+                coordinator.status.category == "ready"
+                and coordinator.status.user_generation_id not in {None, "user-old"}
+                and coordinator.status.user_count == 2
+                and coordinator.status.persona_generation_id not in {None, "persona-old"}
+                and coordinator.status.persona_count == 1
+            ),
+            timeout=4_000,
+        )
+
+        assert "generation_model_mismatch" in categories
+        assert "rebuilding" in categories
+        assert categories.index("generation_model_mismatch") < categories.index("rebuilding")
+        result = coordinator.query("自动重建后召回").result(timeout=2)
+        assert len(result.user_hits) == 2
+        assert len(result.persona_hits) == 1
+
+        def inspect(resource: _Resource) -> tuple[object, object, int, int]:
+            user = resource.vectors.get_active_memory_generation()
+            persona = resource.vectors.get_active_persona_generation("kurisu")
+            memory_active = int(
+                resource.database.connection.execute(
+                    "SELECT COUNT(*) FROM memory_embedding_generations WHERE status = 'active'"
+                ).fetchone()[0]
+            )
+            persona_active = int(
+                resource.database.connection.execute(
+                    "SELECT COUNT(*) FROM persona_embedding_generations WHERE status = 'active'"
+                ).fetchone()[0]
+            )
+            return user, persona, memory_active, persona_active
+
+        assert data.submit(inspect, on_success=inspections.append)
+        qtbot.waitUntil(lambda: bool(inspections), timeout=2_000)
+        user, persona, memory_active, persona_active = inspections[0]
+        assert user is not None
+        assert persona is not None
+        assert user.model_commit == PINNED_MODEL.revision
+        assert user.model_sha256 == PINNED_MODEL.onnx_sha256
+        assert persona.model_commit == PINNED_MODEL.revision
+        assert persona.model_sha256 == PINNED_MODEL.onnx_sha256
+        assert memory_active == 1
+        assert persona_active == 1
+    finally:
+        _shutdown(data, runtime, coordinator)
+
+
 def test_rebuild_batches_yield_to_query_and_atomically_refresh_caches(qtbot, tmp_path) -> None:
     data, runtime, backend, coordinator, _resources = _start_runtime(
         qtbot, tmp_path, seed_active=False, memory_count=2
@@ -281,6 +364,270 @@ def test_rebuild_failure_marks_new_generations_failed_and_preserves_old_cache(
         assert ("failed", "memory", 1) in generation_states
         assert resources[0].owner_thread_id not in backend.thread_ids
     finally:
+        _shutdown(data, runtime, coordinator)
+
+
+def test_persona_rebuild_switches_only_persona_generation_and_cache(qtbot, tmp_path) -> None:
+    data, runtime, backend, coordinator, _resources = _start_runtime(
+        qtbot,
+        tmp_path,
+        seed_active=True,
+    )
+    changed: list[bool] = []
+    inspection: list[tuple[str, str, int]] = []
+    try:
+        assert coordinator.start()
+        qtbot.waitUntil(lambda: coordinator.status.category == "ready")
+        old_user_generation = coordinator.status.user_generation_id
+        old_persona_generation = coordinator.status.persona_generation_id
+        old_user_cache = coordinator._caches.snapshot(VectorCorpus.USER_MEMORY)
+        old_persona_cache = coordinator._caches.snapshot(VectorCorpus.PERSONA_KNOWLEDGE)
+
+        def add_persona_document(resource: _Resource) -> None:
+            resource.personas.upsert_knowledge(
+                "kurisu",
+                "角色会在实验结束后整理研究笔记。",
+                tags=("习惯",),
+                source_ref="synthetic:test:updated",
+                source_hash="b" * 64,
+                knowledge_id="persona-2",
+            )
+
+        assert data.submit(
+            add_persona_document,
+            on_success=lambda _value: changed.append(True),
+        )
+        qtbot.waitUntil(lambda: bool(changed), timeout=2_000)
+
+        assert coordinator.rebuild_persona()
+        qtbot.waitUntil(
+            lambda: (
+                coordinator.status.category == "ready"
+                and coordinator.status.persona_count == 2
+                and coordinator.status.persona_generation_id != old_persona_generation
+            ),
+            timeout=3_000,
+        )
+
+        assert coordinator.status.user_generation_id == old_user_generation
+        assert coordinator.status.user_count == 2
+        assert coordinator._caches.snapshot(VectorCorpus.USER_MEMORY) is old_user_cache
+        assert coordinator._caches.snapshot(VectorCorpus.PERSONA_KNOWLEDGE) is not old_persona_cache
+        assert {document for batch in backend.document_batches for document in batch} == {
+            "角色在研究所进行实验。",
+            "角色会在实验结束后整理研究笔记。",
+        }
+
+        def inspect(resource: _Resource) -> tuple[str, str, int]:
+            user = resource.vectors.get_active_memory_generation()
+            persona = resource.vectors.get_active_persona_generation("kurisu")
+            memory_generation_count = int(
+                resource.database.connection.execute(
+                    "SELECT COUNT(*) FROM memory_embedding_generations"
+                ).fetchone()[0]
+            )
+            assert user is not None
+            assert persona is not None
+            return user.generation_id, persona.generation_id, memory_generation_count
+
+        assert data.submit(inspect, on_success=inspection.append)
+        qtbot.waitUntil(lambda: bool(inspection), timeout=2_000)
+        assert inspection == [
+            (
+                old_user_generation,
+                coordinator.status.persona_generation_id,
+                1,
+            )
+        ]
+    finally:
+        _shutdown(data, runtime, coordinator)
+
+
+def test_persona_rebuild_failure_preserves_old_dual_caches_and_marks_only_persona_failed(
+    qtbot,
+    tmp_path,
+) -> None:
+    data, runtime, backend, coordinator, _resources = _start_runtime(
+        qtbot,
+        tmp_path,
+        seed_active=True,
+    )
+    generation_states: list[tuple[tuple[tuple[str, int], ...], tuple[tuple[str, int], ...]]] = []
+    try:
+        assert coordinator.start()
+        qtbot.waitUntil(lambda: coordinator.status.category == "ready")
+        old_user_cache = coordinator._caches.snapshot(VectorCorpus.USER_MEMORY)
+        old_persona_cache = coordinator._caches.snapshot(VectorCorpus.PERSONA_KNOWLEDGE)
+        backend.fail_documents = True
+
+        assert coordinator.rebuild_persona()
+        qtbot.waitUntil(lambda: coordinator.status.category == "embedding_unavailable")
+
+        assert coordinator.status.user_generation_id == "user-old"
+        assert coordinator.status.persona_generation_id == "persona-old"
+        assert coordinator._caches.snapshot(VectorCorpus.USER_MEMORY) is old_user_cache
+        assert coordinator._caches.snapshot(VectorCorpus.PERSONA_KNOWLEDGE) is old_persona_cache
+
+        def inspect(
+            resource: _Resource,
+        ) -> tuple[tuple[tuple[str, int], ...], tuple[tuple[str, int], ...]]:
+            memory = tuple(
+                (str(row[0]), int(row[1]))
+                for row in resource.database.connection.execute(
+                    """
+                    SELECT status, COUNT(*) FROM memory_embedding_generations
+                    GROUP BY status ORDER BY status
+                    """
+                ).fetchall()
+            )
+            persona = tuple(
+                (str(row[0]), int(row[1]))
+                for row in resource.database.connection.execute(
+                    """
+                    SELECT status, COUNT(*) FROM persona_embedding_generations
+                    GROUP BY status ORDER BY status
+                    """
+                ).fetchall()
+            )
+            return memory, persona
+
+        assert data.submit(inspect, on_success=generation_states.append)
+        qtbot.waitUntil(lambda: bool(generation_states), timeout=2_000)
+        assert generation_states == [
+            (
+                (("active", 1),),
+                (("active", 1), ("failed", 1)),
+            )
+        ]
+
+        backend.fail_documents = False
+        assert coordinator.retry_backend().result(timeout=2)
+        qtbot.waitUntil(lambda: coordinator.status.category == "ready")
+        result = coordinator.query("旧双库仍可用").result(timeout=2)
+        assert len(result.user_hits) == 2
+        assert len(result.persona_hits) == 1
+    finally:
+        _shutdown(data, runtime, coordinator)
+
+
+def test_persona_rebuild_shares_gate_and_runs_pending_incremental_refresh(
+    qtbot,
+    tmp_path,
+) -> None:
+    data, runtime, backend, coordinator, _resources = _start_runtime(
+        qtbot,
+        tmp_path,
+        seed_active=True,
+    )
+    backend.block_first_batch = True
+    categories: list[str] = []
+    coordinator.status_changed.connect(lambda status: categories.append(status.category))
+    try:
+        assert coordinator.start()
+        qtbot.waitUntil(lambda: coordinator.status.category == "ready")
+        assert coordinator.rebuild_persona()
+        qtbot.waitUntil(backend.first_batch_started.is_set, timeout=2_000)
+
+        assert coordinator.rebuild_persona()
+        assert not coordinator.rebuild()
+        assert not coordinator.refresh_incremental()
+
+        backend.release_first_batch.set()
+        qtbot.waitUntil(
+            lambda: "incremental" in categories and coordinator.status.category == "ready",
+            timeout=3_000,
+        )
+        rebuilding_index = categories.index("rebuilding")
+        incremental_index = categories.index("incremental", rebuilding_index + 1)
+        assert categories.count("rebuilding") >= 2
+        assert "ready" in categories[incremental_index + 1 :]
+    finally:
+        _shutdown(data, runtime, coordinator)
+
+
+def test_queued_persona_rebuild_activates_latest_corpus_after_first_snapshot_changes(
+    qtbot,
+    tmp_path,
+) -> None:
+    data, runtime, backend, coordinator, _resources = _start_runtime(
+        qtbot,
+        tmp_path,
+        seed_active=True,
+    )
+    backend.block_first_batch = True
+    replaced: list[tuple[str, ...]] = []
+    inspections: list[tuple[tuple[str, ...], tuple[tuple[str, int], ...]]] = []
+    categories: list[str] = []
+    coordinator.status_changed.connect(lambda status: categories.append(status.category))
+    try:
+        assert coordinator.start()
+        qtbot.waitUntil(lambda: coordinator.status.category == "ready")
+        old_user_generation = coordinator.status.user_generation_id
+        old_user_cache = coordinator._caches.snapshot(VectorCorpus.USER_MEMORY)
+
+        assert coordinator.rebuild_persona()
+        qtbot.waitUntil(backend.first_batch_started.is_set, timeout=2_000)
+
+        def replace_persona(resource: _Resource) -> tuple[str, ...]:
+            records = resource.personas.replace_persona(
+                "kurisu",
+                (
+                    PersonaKnowledgeDraft(
+                        content="这是并发替换后的最新角色知识。",
+                        tags=("最新",),
+                        source_ref="synthetic:test:latest",
+                        source_hash="c" * 64,
+                        knowledge_id="persona-latest",
+                    ),
+                ),
+            )
+            return tuple(record.knowledge_id for record in records)
+
+        assert data.submit(replace_persona, on_success=replaced.append)
+        qtbot.waitUntil(lambda: replaced == [("persona-latest",)], timeout=2_000)
+        assert coordinator.rebuild_persona()
+
+        backend.release_first_batch.set()
+        qtbot.waitUntil(
+            lambda: (
+                coordinator.status.category == "ready"
+                and coordinator.status.persona_count == 1
+                and backend.document_batches[-1:] == [("这是并发替换后的最新角色知识。",)]
+            ),
+            timeout=4_000,
+        )
+
+        assert categories.count("rebuilding") >= 2
+        assert coordinator.status.user_generation_id == old_user_generation
+        assert coordinator._caches.snapshot(VectorCorpus.USER_MEMORY) is old_user_cache
+        result = coordinator.query("最新角色知识", include_user=False).result(timeout=2)
+        assert tuple(hit.target_id for hit in result.persona_hits) == ("persona-latest",)
+
+        def inspect(
+            resource: _Resource,
+        ) -> tuple[tuple[str, ...], tuple[tuple[str, int], ...]]:
+            active_ids = tuple(
+                document.knowledge_id
+                for document in resource.personas.list_active_documents("kurisu")
+            )
+            states = tuple(
+                (str(row[0]), int(row[1]))
+                for row in resource.database.connection.execute(
+                    """
+                    SELECT status, COUNT(*) FROM persona_embedding_generations
+                    GROUP BY status ORDER BY status
+                    """
+                ).fetchall()
+            )
+            return active_ids, states
+
+        assert data.submit(inspect, on_success=inspections.append)
+        qtbot.waitUntil(lambda: bool(inspections), timeout=2_000)
+        assert inspections[0][0] == ("persona-latest",)
+        assert ("active", 1) in inspections[0][1]
+        assert ("failed", 1) in inspections[0][1]
+    finally:
+        backend.release_first_batch.set()
         _shutdown(data, runtime, coordinator)
 
 

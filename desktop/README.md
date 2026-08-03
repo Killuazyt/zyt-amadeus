@@ -1,17 +1,20 @@
 # Amadeus Desktop
 
-P5 adds persistent local conversations and auditable hybrid memory on top of the tested P1
-application foundation, P2 desktop-pet engine, P3 attached chat flow, and P4 secure text-model
-integration. The application includes safe local pet import, fixed-clock animation, transparent
-hit testing, manual drag placement, multi-screen recovery, a bundled CC0 placeholder pet,
-cancellable chat states, and the system tray lifecycle.
+P6 adds the complete settings, tray, proactive-interaction, and local-data-management closure on top
+of the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
+text-model integration, and P5 auditable hybrid memory. The application includes safe local pet
+import/switch/removal, fixed-clock animation, transparent hit testing, manual drag placement,
+multi-screen recovery, a bundled CC0 placeholder pet, cancellable chat states, and an exact
+eight-item system tray.
 
 P4 provides DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom HTTPS provider. API
-credentials are stored only in Windows Credential Manager. P5A stores conversations, summaries,
-immutable memory versions, provenance, jobs, and keyword indexes in SQLite; it also exposes model,
-history, and memory management pages. P5B adds SQLite schema v2, independent user/persona
-generations, Chinese FTS5 plus CPU-only local vector recall, recall events, event decay, and safe
-FTS fallback. Speech, screen observation, tool execution, and automation remain outside the MVP.
+credentials are stored only in Windows Credential Manager. P5 stores conversations, summaries,
+immutable memory versions, provenance, jobs, independent user/persona vector generations, recall
+events, decay, and safe FTS fallback. P6 upgrades to SQLite schema v3 and settings schema v5, adds
+proactive message origin and a body-free interaction ledger, and exposes an eight-page single
+settings window, verified HKCU startup control, restrained greetings, diagnostics, versioned JSON
+exports, consistent backup/restore, and fail-closed factory reset. Speech, screen observation, tool
+execution, and automation remain outside the MVP.
 
 ## Development commands
 
@@ -62,9 +65,9 @@ The deterministic local provider is development-only and must be requested expli
 ```
 
 Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. Imported pets are copied into its `pets`
-directory; the source package is never modified. P5A stores its SQLite database at
-`data\amadeus.sqlite3`. Provider settings contain only a fixed credential reference; API credentials
-are stored by Windows Credential Manager and are never written to JSON or SQLite.
+directory; the source package is never modified. SQLite is stored at `data\amadeus.sqlite3`.
+Provider settings contain only a fixed credential reference; API credentials are stored by Windows
+Credential Manager and are never written to JSON, SQLite, exports, or backups.
 
 The application never downloads an embedding model during startup or chat. Prepare and verify the
 pinned model only through an explicit command:

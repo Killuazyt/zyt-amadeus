@@ -37,11 +37,26 @@ _REQUIRED_BOOLEAN_CHECKS = (
     "pet_hidden_after_tray_toggle",
     "chat_hidden_with_pet",
     "pet_visible_after_double_click",
-    "chat_remains_hidden_after_double_click",
+    "chat_visible_after_double_click",
+    "chat_input_focused_after_double_click",
     "conversation_worker_clean",
     "conversation_timers_clean",
     "graceful_exit",
 )
+
+
+class _IsolatedAutostart:
+    """Keep interactive UI acceptance independent from the user's real HKCU Run value."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+
+    def is_enabled(self) -> bool:
+        return self.enabled
+
+    def set_enabled(self, enabled: bool) -> bool:
+        self.enabled = bool(enabled)
+        return self.enabled
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +71,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     application = QApplication([])
-    application.setApplicationName("Amadeus P3 acceptance")
+    application.setApplicationName("Amadeus P6 acceptance")
     application.setQuitOnLastWindowClosed(False)
 
     instance = SingleInstance(f"amadeus-tray-acceptance-{uuid4().hex}")
@@ -80,7 +95,8 @@ def main() -> int:
         settings=settings,
         tray_available=tray_available,
         chat_provider=provider,
-        status_message="P3 Windows 托盘、桌宠与本地模拟聊天验收正在运行。",
+        autostart_manager=_IsolatedAutostart(),  # type: ignore[arg-type]
+        status_message="P6 Windows 托盘、桌宠与本地模拟聊天验收正在运行。",
     )
 
     result: dict[str, object] = {
@@ -101,7 +117,8 @@ def main() -> int:
         "pet_hidden_after_tray_toggle": False,
         "chat_hidden_with_pet": False,
         "pet_visible_after_double_click": False,
-        "chat_remains_hidden_after_double_click": False,
+        "chat_visible_after_double_click": False,
+        "chat_input_focused_after_double_click": False,
         "conversation_worker_clean": False,
         "conversation_timers_clean": False,
         "acceptance_timed_out": False,
@@ -121,7 +138,7 @@ def main() -> int:
         result["chat_open_latency_ms"] = (time.perf_counter() - opened_at) * 1_000
         args.ready_file.parent.mkdir(parents=True, exist_ok=True)
         args.ready_file.write_text(str(os.getpid()), encoding="utf-8")
-        controller.chat_panel.send_requested.emit("P3 本地模拟验收消息")
+        controller.chat_panel.send_requested.emit("P6 本地模拟验收消息")
         QTimer.singleShot(25, controller.chat_panel, wait_for_turn)
 
     def wait_for_turn() -> None:
@@ -137,7 +154,7 @@ def main() -> int:
             str(normal_snapshot), "PNG"
         )
         provider.scenario = ScriptedScenario.NEVER
-        controller.chat_panel.send_requested.emit("P3 可见停止验收消息")
+        controller.chat_panel.send_requested.emit("P6 可见停止验收消息")
         QTimer.singleShot(25, controller.chat_panel, wait_to_stop)
 
     def wait_to_stop() -> None:
@@ -158,7 +175,7 @@ def main() -> int:
             and not controller.conversation.has_active_timers
         )
         provider.scenario = ScriptedScenario.PARTIAL_ERROR
-        controller.chat_panel.send_requested.emit("P3 可见失败重试验收消息")
+        controller.chat_panel.send_requested.emit("P6 可见失败重试验收消息")
         QTimer.singleShot(25, controller.chat_panel, wait_for_failure)
 
     def wait_for_failure() -> None:
@@ -273,9 +290,13 @@ def main() -> int:
         if controller.tray is not None:
             controller.tray._on_activated(QSystemTrayIcon.ActivationReason.DoubleClick)
         else:
-            controller.show_pet()
+            controller.show_chat()
+        QTimer.singleShot(50, controller.chat_panel, record_double_click)
+
+    def record_double_click() -> None:
         result["pet_visible_after_double_click"] = controller.pet_window.isVisible()
-        result["chat_remains_hidden_after_double_click"] = not controller.chat_panel.isVisible()
+        result["chat_visible_after_double_click"] = controller.chat_panel.isVisible()
+        result["chat_input_focused_after_double_click"] = controller.chat_panel.input.hasFocus()
         QTimer.singleShot(150, controller.chat_panel, controller.request_exit)
 
     def acceptance_timeout() -> None:

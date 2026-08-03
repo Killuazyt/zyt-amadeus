@@ -35,6 +35,14 @@ class _FakeMemoryJobs:
         self.resume_count += 1
 
 
+class _FakeBackgroundGeneration:
+    def __init__(self) -> None:
+        self.resume_count = 0
+
+    def resume(self) -> None:
+        self.resume_count += 1
+
+
 class _FakeModelSettings:
     def __init__(self) -> None:
         self.results: list[tuple[bool, str]] = []
@@ -78,12 +86,14 @@ def test_provider_switch_timeout_restores_stopped_maintenance_timer() -> None:
     controller._data_writable = True
     controller.memory_maintenance_timer = _FakeTimer()
     controller.memory_jobs = _FakeMemoryJobs()
+    controller.background_generation = _FakeBackgroundGeneration()
     controller.model_settings_window = _FakeModelSettings()
 
     controller._on_provider_switch_timeout(7)
 
     assert controller.memory_maintenance_timer.start_count == 1
     assert controller.memory_jobs.resume_count == 1
+    assert controller.background_generation.resume_count == 1
     assert controller._pending_provider_configuration is None
     assert controller._pending_provider_secret is None
     assert controller._provider_switch_pending is False

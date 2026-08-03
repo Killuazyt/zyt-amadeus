@@ -28,9 +28,10 @@ class AnimationController(QObject):
     frame_changed = Signal(object)
     state_changed = Signal(str)
 
-    def __init__(self, manifest: PetManifest) -> None:
+    def __init__(self, manifest: PetManifest, *, speed_percent: int = 100) -> None:
         super().__init__()
         self.manifest = manifest
+        self._speed_percent = _validated_speed_percent(speed_percent)
         self._active_states: set[str] = set()
         self._transient_state: str | None = None
         self._state = "idle"
@@ -58,6 +59,20 @@ class AnimationController(QObject):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def speed_percent(self) -> int:
+        return self._speed_percent
+
+    def set_speed_percent(self, value: int) -> None:
+        """Apply a bounded playback multiplier without resetting the active action."""
+
+        normalized = _validated_speed_percent(value)
+        if normalized == self._speed_percent:
+            return
+        self._speed_percent = normalized
+        if self._running:
+            self._reset_deadline()
 
     def start(self) -> None:
         if self._running:
@@ -117,7 +132,10 @@ class AnimationController(QObject):
             self._reset_deadline()
 
     def _period_ns(self) -> int:
-        return max(1, round(1_000_000_000 / self._animation.fps))
+        return max(
+            1,
+            round(1_000_000_000 * 100 / (self._animation.fps * self._speed_percent)),
+        )
 
     def _reset_deadline(self) -> None:
         self._timer.stop()
@@ -155,3 +173,9 @@ class AnimationController(QObject):
                 return
         self.frame_changed.emit(self.current_frame)
         self._schedule_timer()
+
+
+def _validated_speed_percent(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 50 <= value <= 200:
+        raise ValueError("animation speed percent must be between 50 and 200")
+    return value

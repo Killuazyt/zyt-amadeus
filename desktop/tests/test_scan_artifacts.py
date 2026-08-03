@@ -46,6 +46,16 @@ def test_scanner_allows_explicitly_invalid_test_credentials(tmp_path) -> None:
     assert result["violations_by_category"] == {}
 
 
+def test_scanner_rejects_bare_token_plan_credentials(tmp_path) -> None:
+    source = tmp_path / "accidental_secret.txt"
+    source.write_text("tp-" + "a" * 32, encoding="utf-8")
+
+    exit_code, result = _scan(source)
+
+    assert exit_code == 1
+    assert result["violations_by_category"] == {"credential_pattern": 1}
+
+
 def test_scanner_rejects_quoted_json_credentials_and_generic_private_media(tmp_path) -> None:
     (tmp_path / "settings.json").write_text(
         json.dumps({"api_key": "a" * 32}),
@@ -87,3 +97,46 @@ def test_scanner_reports_missing_input_without_path_or_traceback(tmp_path) -> No
     assert completed.stderr == ""
     assert str(missing) not in completed.stdout
     assert result["violations_by_category"] == {"artifact_missing": 1}
+
+
+def test_scanner_opens_p6_backup_and_extension_only_pet_archives(tmp_path) -> None:
+    backup = tmp_path / "private.amadeus-backup"
+    with zipfile.ZipFile(backup, "w") as archive:
+        archive.writestr("manifest.json", "{}")
+
+    pet = tmp_path / "private.codex-pet"
+    with zipfile.ZipFile(pet, "w") as archive:
+        archive.writestr("spritesheet.png", b"private-character-image")
+
+    exit_code, result = _scan(tmp_path)
+
+    assert exit_code == 1
+    assert result["archive_members_scanned"] == 2
+    assert result["violations_by_category"] == {
+        "local_backup_file": 1,
+        "unauthorized_character_asset": 1,
+    }
+
+    backup_exit_code, backup_result = _scan(backup)
+    assert backup_exit_code == 1
+    assert backup_result["violations_by_category"] == {"local_backup_file": 1}
+
+
+def test_scanner_rejects_default_exports_and_local_persona_greetings(tmp_path) -> None:
+    (tmp_path / "amadeus-chat-export.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "amadeus-memory-export.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "renamed.json").write_text(
+        json.dumps({"format": "amadeus-chat-export/v1", "conversations": []}),
+        encoding="utf-8",
+    )
+    greetings = tmp_path / "personas" / "kurisu" / "greetings.json"
+    greetings.parent.mkdir(parents=True)
+    greetings.write_text("{}", encoding="utf-8")
+
+    exit_code, result = _scan(tmp_path)
+
+    assert exit_code == 1
+    assert result["violations_by_category"] == {
+        "local_data_export": 3,
+        "private_persona_data": 1,
+    }

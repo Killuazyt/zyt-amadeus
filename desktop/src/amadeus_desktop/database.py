@@ -1,4 +1,4 @@
-"""SQLite schema v2, consistent migration backups, and fail-closed opening."""
+"""SQLite schema v3, consistent migration backups, and fail-closed opening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+AMADEUS_APPLICATION_ID = int.from_bytes(b"AMDS", "big")
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 
@@ -384,7 +385,42 @@ def _migrate_to_v2(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
-_DEFAULT_MIGRATIONS: Mapping[int, Migration] = {1: _migrate_to_v1, 2: _migrate_to_v2}
+_SCHEMA_V3: tuple[str, ...] = (
+    """
+    ALTER TABLE messages
+    ADD COLUMN origin TEXT NOT NULL DEFAULT 'conversation'
+        CHECK (origin IN ('conversation', 'proactive'))
+    """,
+    """
+    CREATE TABLE proactive_events (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        local_date TEXT NOT NULL,
+        trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('startup', 'idle')),
+        displayed_at TEXT NOT NULL,
+        disposition TEXT NOT NULL DEFAULT 'displayed'
+            CHECK (disposition IN ('displayed', 'clicked', 'dismissed')),
+        message_id TEXT REFERENCES messages(id) ON DELETE SET NULL
+    )
+    """,
+    """
+    CREATE INDEX proactive_events_profile_date_idx
+    ON proactive_events(profile_id, local_date, displayed_at)
+    """,
+)
+
+
+def _migrate_to_v3(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V3:
+        connection.execute(statement)
+    connection.execute(f"PRAGMA application_id = {AMADEUS_APPLICATION_ID}")
+
+
+_DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
+    1: _migrate_to_v1,
+    2: _migrate_to_v2,
+    3: _migrate_to_v3,
+}
 _REQUIRED_TABLES = {
     "profiles",
     "conversations",
@@ -403,6 +439,7 @@ _REQUIRED_TABLES = {
     "persona_embedding_generations",
     "persona_vectors",
     "persona_recall_events",
+    "proactive_events",
 }
 _REQUIRED_TRIGGER_SQL_MARKERS = {
     "memory_versions_are_immutable": (
@@ -427,7 +464,32 @@ _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
         "where status = 'active'",
     ),
 }
+_REQUIRED_INDEX_SQL_MARKERS = {
+    "proactive_events_profile_date_idx": (
+        "create index",
+        "on proactive_events(profile_id, local_date, displayed_at)",
+    ),
+}
 _REQUIRED_COLUMNS = {
+    "messages": {
+        "sequence",
+        "id",
+        "conversation_id",
+        "turn_id",
+        "role",
+        "content",
+        "status",
+        "attempt",
+        "terminal_reason",
+        "provider_name",
+        "model_name",
+        "failure_code",
+        "participates_in_memory",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "origin",
+    },
     "memory_embedding_generations": {
         "id",
         "profile_id",
@@ -506,6 +568,15 @@ _REQUIRED_COLUMNS = {
         "attempt",
         "terminal_status",
         "recalled_at",
+    },
+    "proactive_events": {
+        "id",
+        "profile_id",
+        "local_date",
+        "trigger_kind",
+        "displayed_at",
+        "disposition",
+        "message_id",
     },
 }
 _REQUIRED_FTS_COLUMNS = {
@@ -682,6 +753,7 @@ class SQLiteDatabase:
         """Expose a small allow-listed PRAGMA reader for diagnostics/tests."""
 
         if name not in {
+            "application_id",
             "journal_mode",
             "foreign_keys",
             "busy_timeout",
@@ -703,6 +775,9 @@ class SQLiteDatabase:
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        if application_id != AMADEUS_APPLICATION_ID:
+            raise DatabaseMigrationError("database application ID is invalid")
         existing = {
             str(row[0])
             for row in connection.execute(
@@ -731,6 +806,12 @@ class SQLiteDatabase:
             normalized_sql = " ".join(indexes[name].lower().split())
             if any(marker not in normalized_sql for marker in markers):
                 raise DatabaseMigrationError("database active-generation index is invalid")
+        if not _REQUIRED_INDEX_SQL_MARKERS.keys() <= indexes.keys():
+            raise DatabaseMigrationError("database schema is missing required indexes")
+        for name, markers in _REQUIRED_INDEX_SQL_MARKERS.items():
+            normalized_sql = " ".join(indexes[name].lower().split())
+            if any(marker not in normalized_sql for marker in markers):
+                raise DatabaseMigrationError("database required index is invalid")
         for table, required_columns in _REQUIRED_COLUMNS.items():
             columns = {
                 str(row["name"])
@@ -789,3 +870,14 @@ def table_names(connection: sqlite3.Connection) -> Sequence[str]:
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name"
     ).fetchall()
     return tuple(str(row[0]) for row in rows)
+
+
+def validate_database_schema(connection: sqlite3.Connection) -> None:
+    """Apply the exact runtime schema/integrity gate to an existing connection."""
+
+    previous_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        SQLiteDatabase._validate_schema(connection)
+    finally:
+        connection.row_factory = previous_factory

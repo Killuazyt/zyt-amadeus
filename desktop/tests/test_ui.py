@@ -178,11 +178,70 @@ def test_control_window_close_requests_exit_without_tray(qtbot) -> None:
         window.close()
 
 
-def test_tray_double_click_requests_show(qtbot) -> None:
+def test_tray_double_click_requests_open_chat_and_legacy_show(qtbot) -> None:
     tray = TrayController(system_tray_factory=FakeSystemTrayIcon)  # type: ignore[arg-type]
     try:
-        with qtbot.waitSignal(tray.show_requested, timeout=1000):
+        opened: list[bool] = []
+        shown: list[bool] = []
+        tray.open_chat_requested.connect(lambda: opened.append(True))
+        tray.show_requested.connect(lambda: shown.append(True))
+        with qtbot.waitSignal(tray.open_chat_requested, timeout=1000):
             tray._on_activated(QSystemTrayIcon.ActivationReason.DoubleClick)
+        assert opened == [True]
+        assert shown == [True]
+    finally:
+        tray.close()
+
+
+def test_tray_has_exact_p6_action_order_and_state_sync_is_signal_safe(qtbot) -> None:
+    tray = TrayController(system_tray_factory=FakeSystemTrayIcon)  # type: ignore[arg-type]
+    try:
+        assert [action.text() for action in tray.actions] == [
+            "隐藏宠物",
+            "打开对话",
+            "记忆管理…",
+            "设置…",
+            "始终置顶",
+            "今天暂停主动互动",
+            "开机启动",
+            "退出",
+        ]
+        assert all(not action.isSeparator() for action in tray.actions)
+        assert [action.isCheckable() for action in tray.actions] == [
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+            False,
+        ]
+
+        topmost: list[bool] = []
+        paused: list[bool] = []
+        autostart: list[bool] = []
+        tray.always_on_top_changed.connect(topmost.append)
+        tray.pause_proactive_today_changed.connect(paused.append)
+        tray.launch_at_login_changed.connect(autostart.append)
+        tray.apply_state(
+            pet_visible=False,
+            always_on_top=True,
+            proactive_paused_today=True,
+            launch_at_login=True,
+        )
+        assert tray.toggle_action.text() == "显示宠物"
+        assert tray.always_on_top_action.isChecked()
+        assert tray.pause_proactive_today_action.isChecked()
+        assert tray.launch_at_login_action.isChecked()
+        assert topmost == [] and paused == [] and autostart == []
+
+        tray.always_on_top_action.trigger()
+        tray.pause_proactive_today_action.trigger()
+        tray.launch_at_login_action.trigger()
+        assert topmost == [False]
+        assert paused == [False]
+        assert autostart == [False]
     finally:
         tray.close()
 
@@ -423,6 +482,8 @@ def test_provider_switch_waits_for_slow_background_cancel_without_blocking_qt(
         assert heartbeats >= 5
         assert controller.settings["provider_enabled"] is True
         assert store.read_secret() == "new-invalid-test-key"
+        assert not controller.background_generation.is_paused
+        assert not controller.memory_jobs.is_paused
     finally:
         timer.stop()
         controller.request_exit()

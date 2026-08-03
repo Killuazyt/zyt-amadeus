@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
 from inspect import Parameter, signature
 from pathlib import Path
 
@@ -21,7 +21,11 @@ from amadeus_desktop.chat_models import (
     PromptRole,
     TurnTerminalReason,
 )
-from amadeus_desktop.conversation_store import BackgroundJobStore, ConversationStore
+from amadeus_desktop.conversation_store import (
+    BackgroundJobStore,
+    ConversationStore,
+    ProactiveInteractionStore,
+)
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
 from amadeus_desktop.database import SQLiteDatabase
 from amadeus_desktop.memory_models import MemoryKind as DomainMemoryKind
@@ -46,8 +50,10 @@ from amadeus_desktop.storage_models import (
     MemoryRecord,
     MemorySource,
     MessagePage,
+    ProactiveTrigger,
     StorageNotFoundError,
     StoredMessage,
+    StoredMessageOrigin,
     StoredMessageRole,
     StoredMessageStatus,
 )
@@ -70,9 +76,22 @@ class LocalDataStores:
     personas: PersonaRepository
     vectors: VectorStore
     jobs: BackgroundJobStore
+    proactive: ProactiveInteractionStore
 
     def close(self) -> None:
         self.database.close()
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationPresentationEntry:
+    """One chronologically ordered chat row, including standalone greetings."""
+
+    entry_id: str
+    turn_id: str
+    user_message: ChatMessage | None
+    assistant_message: ChatMessage | None
+    origin: StoredMessageOrigin
+    first_sequence: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +103,7 @@ class ConversationSnapshot:
     next_before_sequence: int | None
     read_only: bool
     migration_error_category: str | None = None
+    presentation_entries: tuple[ConversationPresentationEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +112,7 @@ class OlderMessagesSnapshot:
     messages: tuple[StoredMessage, ...]
     turns: tuple[ConversationTurn, ...]
     next_before_sequence: int | None
+    presentation_entries: tuple[ConversationPresentationEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +127,7 @@ class _PendingPromptPreparation:
     turn: object
     memory_enabled: bool
     memory_disable_epoch: int
+    follow_user_language: bool
     on_success: Callable[[PreparedPrompt], None]
     on_failure: Callable[[str], None]
     vector_future: Future[VectorRetrievalResult] | None = None
@@ -157,6 +179,7 @@ def create_local_data_stores(database_path: Path, backup_directory: Path) -> Loc
         personas=PersonaRepository(database),
         vectors=VectorStore(database),
         jobs=BackgroundJobStore(database),
+        proactive=ProactiveInteractionStore(database),
     )
 
 
@@ -169,12 +192,17 @@ class LocalDataService(QObject):
     older_messages_loaded = Signal(object)
     history_loaded = Signal(object, str)
     memories_loaded = Signal(object)
+    memories_cleared = Signal(int)
     memory_sources_loaded = Signal(str, object)
     source_context_loaded = Signal(object, str)
     operation_failed = Signal(str, str)
     write_availability_changed = Signal(bool)
     jobs_enqueued = Signal()
     index_rebuild_requested = Signal(str)
+    proactive_count_loaded = Signal(str, int)
+    proactive_event_displayed = Signal(object)
+    proactive_event_dismissed = Signal(object)
+    proactive_greeting_persisted = Signal(object, object)
     _vector_query_completed = Signal(str, object)
 
     def __init__(
@@ -182,6 +210,7 @@ class LocalDataService(QObject):
         runtime: SerialDataThread,
         *,
         memory_enabled: bool = True,
+        follow_user_language: bool = True,
         prompt_service: DefaultPromptContextService | None = None,
         vector_query: Callable[..., Future[VectorRetrievalResult]] | None = None,
         vector_timeout_ms: int = 500,
@@ -190,6 +219,7 @@ class LocalDataService(QObject):
         super().__init__(parent)
         self.runtime = runtime
         self._memory_enabled = bool(memory_enabled)
+        self._follow_user_language = bool(follow_user_language)
         self._memory_disable_epoch = 0
         self._prompt_service = prompt_service or DefaultPromptContextService()
         self._vector_query = vector_query
@@ -233,6 +263,9 @@ class LocalDataService(QObject):
             self._memory_disable_epoch += 1
         self._memory_enabled = normalized
 
+    def set_follow_user_language(self, enabled: bool) -> None:
+        self._follow_user_language = bool(enabled)
+
     def set_provider_metadata(self, provider_name: str | None, model_name: str | None) -> None:
         self._provider_name = provider_name
         self._model_name = model_name
@@ -275,6 +308,7 @@ class LocalDataService(QObject):
         if not self._accept_prompt_preparations or not self._writable or conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
+        follow_user_language = self._follow_user_language
         memory_disable_epoch = self._memory_disable_epoch
 
         def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
@@ -303,6 +337,7 @@ class LocalDataService(QObject):
                     turn,
                     memory_enabled=memory_enabled,
                     memory_disable_epoch=memory_disable_epoch,
+                    follow_user_language=follow_user_language,
                     on_success=on_success,
                     on_failure=on_failure,
                 ),
@@ -316,6 +351,7 @@ class LocalDataService(QObject):
         if not self._accept_prompt_preparations or not self._writable or conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
+        follow_user_language = self._follow_user_language
         memory_disable_epoch = self._memory_disable_epoch
 
         def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
@@ -359,6 +395,7 @@ class LocalDataService(QObject):
                     turn,
                     memory_enabled=memory_enabled,
                     memory_disable_epoch=memory_disable_epoch,
+                    follow_user_language=follow_user_language,
                     on_success=on_success,
                     on_failure=on_failure,
                 ),
@@ -374,6 +411,7 @@ class LocalDataService(QObject):
         *,
         memory_enabled: bool,
         memory_disable_epoch: int,
+        follow_user_language: bool,
         on_success: Callable[[PreparedPrompt], None],
         on_failure: Callable[[str], None],
     ) -> None:
@@ -385,6 +423,7 @@ class LocalDataService(QObject):
             turn=turn,
             memory_enabled=memory_enabled,
             memory_disable_epoch=memory_disable_epoch,
+            follow_user_language=follow_user_language,
             on_success=on_success,
             on_failure=on_failure,
         )
@@ -451,6 +490,7 @@ class LocalDataService(QObject):
                     memory_enabled=memory_enabled,
                     vector_result=vector_result,
                     prompt_service=self._prompt_service,
+                    follow_user_language=pending.follow_user_language,
                 )
             except Exception:
                 # The user row already committed in stage one.  Keep the stable
@@ -661,6 +701,123 @@ class LocalDataService(QObject):
             on_failure=lambda category: self.operation_failed.emit("memory_maintenance", category),
         )
 
+    # Proactive interaction --------------------------------------------
+    def load_proactive_display_count(
+        self,
+        local_date: date,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> bool:
+        request_id = self.runtime.submit(
+            lambda stores: stores.proactive.count_displayed_for_date(
+                local_date,
+                profile_id=profile_id,
+            ),
+            priority=DataPriority.FOREGROUND,
+            on_success=lambda count: self.proactive_count_loaded.emit(
+                local_date.isoformat(),
+                int(count),
+            ),
+            on_failure=lambda category: self.operation_failed.emit("proactive_count", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("proactive_count")
+            return False
+        return True
+
+    def record_proactive_display(
+        self,
+        trigger: ProactiveTrigger | str,
+        local_date: date,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        event_id: str | None = None,
+        displayed_at: datetime | None = None,
+    ) -> bool:
+        if not self._writable:
+            self.operation_failed.emit("proactive_display", "DatabaseReadOnlyError")
+            return False
+        request_id = self.runtime.submit(
+            lambda stores: stores.proactive.record_displayed(
+                trigger,
+                local_date,
+                profile_id=profile_id,
+                event_id=event_id,
+                displayed_at=displayed_at,
+            ),
+            priority=DataPriority.FOREGROUND,
+            on_success=self.proactive_event_displayed.emit,
+            on_failure=lambda category: self.operation_failed.emit("proactive_display", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("proactive_display")
+            return False
+        return True
+
+    def dismiss_proactive_event(self, event_id: str) -> bool:
+        if not self._writable:
+            self.operation_failed.emit("proactive_dismiss", "DatabaseReadOnlyError")
+            return False
+        request_id = self.runtime.submit(
+            lambda stores: stores.proactive.record_dismissed(event_id),
+            priority=DataPriority.FOREGROUND,
+            on_success=self.proactive_event_dismissed.emit,
+            on_failure=lambda category: self.operation_failed.emit("proactive_dismiss", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("proactive_dismiss")
+            return False
+        return True
+
+    def persist_proactive_greeting(
+        self,
+        event_id: str,
+        greeting: str,
+        *,
+        conversation_id: str | None = None,
+        message_id: str | None = None,
+        clicked_at: datetime | None = None,
+        provider_name: str | None = None,
+        model_name: str | None = None,
+    ) -> bool:
+        target_conversation_id = conversation_id or self._current_conversation_id
+        if not self._writable:
+            self.operation_failed.emit("proactive_click", "DatabaseReadOnlyError")
+            return False
+        if target_conversation_id is None:
+            self.operation_failed.emit("proactive_click", "ConversationUnavailable")
+            return False
+
+        def operation(stores: LocalDataStores) -> tuple[object, object, ConversationSnapshot]:
+            event, message = stores.proactive.persist_greeting_on_click(
+                event_id,
+                target_conversation_id,
+                greeting,
+                message_id=message_id,
+                clicked_at=clicked_at,
+                provider_name=provider_name,
+                model_name=model_name,
+            )
+            conversation = stores.conversations.get_conversation(target_conversation_id)
+            return event, message, _conversation_snapshot(stores, conversation)
+
+        def completed(value: tuple[object, object, ConversationSnapshot]) -> None:
+            event, message, snapshot = value
+            self._on_conversation_loaded(snapshot)
+            self.proactive_greeting_persisted.emit(event, message)
+            self.refresh_history()
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.FOREGROUND,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit("proactive_click", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("proactive_click")
+            return False
+        return True
+
     # History -----------------------------------------------------------
     def refresh_history(self) -> None:
         selected = self._current_conversation_id or ""
@@ -772,6 +929,7 @@ class LocalDataService(QObject):
                 page.items,
                 _turns_from_messages(page.items),
                 page.next_before_sequence,
+                _presentation_entries_from_messages(page.items),
             )
 
         request_id = self.runtime.submit(
@@ -912,6 +1070,27 @@ class LocalDataService(QObject):
         )
         if request_id is None:
             self._on_persistence_submission_failed("memories")
+
+    def clear_all_memories(self) -> bool:
+        if not self._writable:
+            self.operation_failed.emit("clear_memories", "DatabaseReadOnlyError")
+            return False
+
+        def completed(count: object) -> None:
+            self.memories_cleared.emit(int(count))
+            self.index_rebuild_requested.emit("user_memory")
+            self.refresh_memories()
+
+        request_id = self.runtime.submit(
+            lambda stores: stores.memories.clear_all_memories(profile_id=DEFAULT_PROFILE_ID),
+            priority=DataPriority.INTERACTIVE,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit("clear_memories", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("clear_memories")
+            return False
+        return True
 
     def load_memory_sources(self, memory_id: str) -> None:
         def operation(stores: LocalDataStores) -> tuple[dict[str, object], ...]:
@@ -1075,6 +1254,7 @@ def _snapshot_from_page(
         page.next_before_sequence,
         stores.database.read_only,
         _migration_error_category(stores.database),
+        _presentation_entries_from_messages(page.items),
     )
 
 
@@ -1148,6 +1328,8 @@ def _turns_from_messages(messages: tuple[StoredMessage, ...]) -> tuple[Conversat
     order: list[str] = []
     grouped: dict[str, dict[StoredMessageRole, StoredMessage]] = {}
     for message in messages:
+        if message.origin is not StoredMessageOrigin.CONVERSATION:
+            continue
         if message.turn_id not in grouped:
             order.append(message.turn_id)
             grouped[message.turn_id] = {}
@@ -1197,6 +1379,58 @@ def _turns_from_messages(messages: tuple[StoredMessage, ...]) -> tuple[Conversat
             )
         )
     return tuple(turns)
+
+
+def _presentation_entries_from_messages(
+    messages: tuple[StoredMessage, ...],
+) -> tuple[ConversationPresentationEntry, ...]:
+    """Build exact-order rows without forcing proactive messages into fake turns."""
+
+    turns = {turn.turn_id: turn for turn in _turns_from_messages(messages)}
+    entries: list[ConversationPresentationEntry] = []
+    seen_turns: set[str] = set()
+    for stored in messages:
+        if stored.origin is StoredMessageOrigin.PROACTIVE:
+            entries.append(
+                ConversationPresentationEntry(
+                    entry_id=stored.message_id,
+                    turn_id=stored.turn_id,
+                    user_message=(
+                        _chat_message(stored) if stored.role is StoredMessageRole.USER else None
+                    ),
+                    assistant_message=(
+                        _chat_message(stored)
+                        if stored.role is StoredMessageRole.ASSISTANT
+                        else None
+                    ),
+                    origin=stored.origin,
+                    first_sequence=stored.sequence,
+                )
+            )
+            continue
+        if stored.turn_id in seen_turns:
+            continue
+        seen_turns.add(stored.turn_id)
+        turn = turns.get(stored.turn_id)
+        if turn is not None:
+            user_message = turn.user_message
+            assistant_message = turn.assistant_message
+        else:
+            user_message = _chat_message(stored) if stored.role is StoredMessageRole.USER else None
+            assistant_message = (
+                _chat_message(stored) if stored.role is StoredMessageRole.ASSISTANT else None
+            )
+        entries.append(
+            ConversationPresentationEntry(
+                entry_id=stored.turn_id,
+                turn_id=stored.turn_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                origin=StoredMessageOrigin.CONVERSATION,
+                first_sequence=stored.sequence,
+            )
+        )
+    return tuple(entries)
 
 
 def _chat_message(message: StoredMessage, *, error: str | None = None) -> ChatMessage:

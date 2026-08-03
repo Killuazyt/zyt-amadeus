@@ -733,6 +733,26 @@ class MemoryStore:
     def delete(self, memory_id: str) -> bool:
         return self.delete_memory(memory_id)
 
+    def clear_all_memories(self, *, profile_id: str = DEFAULT_PROFILE_ID) -> int:
+        """Delete every logical user-memory group and cancel extraction jobs."""
+
+        with self._database.transaction() as connection:
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM memory_groups WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()[0]
+            )
+            connection.execute("DELETE FROM memory_fts WHERE profile_id = ?", (profile_id,))
+            connection.execute(
+                "DELETE FROM background_jobs WHERE kind = 'memory_extraction' AND profile_id = ?",
+                (profile_id,),
+            )
+            connection.execute("DELETE FROM memory_groups WHERE profile_id = ?", (profile_id,))
+        if count:
+            self._database.purge_deleted_content()
+        return count
+
     def list_versions(self, memory_id: str) -> tuple[MemoryVersion, ...]:
         rows = self._database.connection.execute(
             """

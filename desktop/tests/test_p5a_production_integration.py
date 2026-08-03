@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 import amadeus_desktop.controller as controller_module
@@ -28,6 +29,7 @@ from amadeus_desktop.chat_provider import (
 from amadeus_desktop.controller import ApplicationController
 from amadeus_desktop.credential_store import InMemoryCredentialStore
 from amadeus_desktop.data_runtime import SerialDataThread
+from amadeus_desktop.database import SCHEMA_VERSION
 from amadeus_desktop.local_data_service import (
     ConversationSnapshot,
     LocalDataService,
@@ -105,12 +107,14 @@ def _make_controller(
     *,
     memory_enabled: bool = False,
     background_jobs_enabled: bool | None = None,
+    follow_user_language: bool = True,
 ) -> ApplicationController:
     paths = AppPaths.for_current_user(local_app_data)
     paths.initialize()
     repository = SettingsRepository(paths.settings_file)
     settings = deepcopy(DEFAULT_SETTINGS)
     settings["memory"]["enabled"] = memory_enabled
+    settings["persona"]["follow_user_language"] = follow_user_language
     repository.save(settings)
     return ApplicationController(
         qapp,
@@ -206,6 +210,53 @@ def test_provider_is_called_only_after_user_turn_is_committed(qapp, qtbot, tmp_p
         assert len(controller.conversation.turns) == 1
         assert controller.conversation.turns[0].assistant_message.status is MessageStatus.COMPLETED
         assert not controller.background_generation.is_paused
+    finally:
+        _shutdown_controller(controller)
+
+
+@pytest.mark.parametrize(
+    ("follow_user_language", "expected_instruction", "excluded_instruction"),
+    (
+        (
+            True,
+            "默认使用用户当前消息的主要语言回答；用户切换语言时跟随切换。",
+            "默认使用简体中文回答，除非用户明确要求切换语言。",
+        ),
+        (
+            False,
+            "默认使用简体中文回答，除非用户明确要求切换语言。",
+            "默认使用用户当前消息的主要语言回答；用户切换语言时跟随切换。",
+        ),
+    ),
+)
+def test_follow_user_language_reaches_final_provider_system_prompt(
+    qapp,
+    qtbot,
+    tmp_path,
+    follow_user_language: bool,
+    expected_instruction: str,
+    excluded_instruction: str,
+) -> None:
+    provider = ScriptedChatProvider(chunks=("合成回复",), first_delay_ms=0)
+    controller = _make_controller(
+        qapp,
+        tmp_path,
+        provider,
+        follow_user_language=follow_user_language,
+    )
+    try:
+        _wait_ready(qtbot, controller)
+        controller._send_chat_message("Please answer this synthetic request.")
+        _wait_idle(qtbot, controller)
+
+        assert provider.call_count == 1
+        system_prompt = "".join(
+            message.content
+            for message in provider.requests[0].messages
+            if message.role.value == "system"
+        )
+        assert expected_instruction in system_prompt
+        assert excluded_instruction not in system_prompt
     finally:
         _shutdown_controller(controller)
 
@@ -757,7 +808,7 @@ def test_newer_database_opens_application_read_only_without_calling_provider(
     stores = create_local_data_stores(paths.database_file, paths.migration_backup_directory)
     try:
         stores.conversations.get_or_create_active_conversation()
-        stores.database.connection.execute("PRAGMA user_version = 3")
+        stores.database.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     finally:
         stores.close()
 

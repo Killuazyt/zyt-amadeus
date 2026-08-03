@@ -67,7 +67,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'isolated wheel install failed' }
           & $python -m pip check
           if ($LASTEXITCODE -ne 0) { throw 'isolated pip check failed' }
-          & $python -c "import amadeus_desktop; assert amadeus_desktop.__version__ == '0.5.0.dev5'"
+          & $python -c "import amadeus_desktop; assert amadeus_desktop.__version__ == '0.6.0.dev6'"
           if ($LASTEXITCODE -ne 0) { throw 'isolated version import failed' }
       - name: Build FTS-degraded onedir
         shell: powershell

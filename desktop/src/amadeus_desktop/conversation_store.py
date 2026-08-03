@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from uuid import uuid4
 
 from amadeus_desktop.database import SQLiteDatabase
@@ -17,11 +17,15 @@ from amadeus_desktop.storage_models import (
     ConversationStatus,
     ConversationSummary,
     MessagePage,
+    ProactiveDisposition,
+    ProactiveInteractionEvent,
+    ProactiveTrigger,
     Profile,
     StorageConflictError,
     StorageNotFoundError,
     StorageValidationError,
     StoredMessage,
+    StoredMessageOrigin,
     StoredMessageRole,
     StoredMessageStatus,
     SummaryProgress,
@@ -265,9 +269,9 @@ class ConversationStore:
                 connection.execute(
                     """
                     INSERT INTO messages(
-                        id, conversation_id, turn_id, role, content, status, attempt,
+                        id, conversation_id, turn_id, role, origin, content, status, attempt,
                         participates_in_memory, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, 'user', ?, 'completed', 1, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'user', 'conversation', ?, 'completed', 1, ?, ?, ?, ?)
                     """,
                     (
                         user_message_id,
@@ -283,9 +287,9 @@ class ConversationStore:
                 connection.execute(
                     """
                     INSERT INTO messages(
-                        id, conversation_id, turn_id, role, content, status, attempt,
+                        id, conversation_id, turn_id, role, origin, content, status, attempt,
                         participates_in_memory, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, 'assistant', '', 'pending', ?, 0, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, 'assistant', 'conversation', '', 'pending', ?, 0, ?, ?, NULL)
                     """,
                     (assistant_message_id, conversation_id, turn_id, attempt, now, now),
                 )
@@ -331,12 +335,14 @@ class ConversationStore:
         now = encode_utc(self._clock())
         with self._database.transaction() as connection:
             row = connection.execute(
-                "SELECT role, attempt FROM messages WHERE id = ?", (message_id,)
+                "SELECT role, origin, attempt FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
             if row is None:
                 raise StorageNotFoundError("message does not exist")
             if row["role"] != StoredMessageRole.ASSISTANT.value:
                 raise StorageConflictError("only assistant messages can be retried")
+            if row["origin"] != StoredMessageOrigin.CONVERSATION.value:
+                raise StorageConflictError("proactive messages cannot be retried")
             if int(row["attempt"]) >= attempt:
                 raise StorageConflictError("attempt must increase monotonically")
             connection.execute(
@@ -358,12 +364,14 @@ class ConversationStore:
         now = encode_utc(self._clock())
         with self._database.transaction() as connection:
             row = connection.execute(
-                "SELECT role, status, attempt FROM messages WHERE id = ?", (message_id,)
+                "SELECT role, origin, status, attempt FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
             if row is None:
                 raise StorageNotFoundError("message does not exist")
             if row["role"] != StoredMessageRole.ASSISTANT.value:
                 raise StorageConflictError("only assistant messages accept checkpoints")
+            if row["origin"] != StoredMessageOrigin.CONVERSATION.value:
+                raise StorageConflictError("proactive messages cannot accept checkpoints")
             if int(row["attempt"]) != attempt:
                 raise StorageConflictError("checkpoint belongs to a stale attempt")
             if row["status"] not in {
@@ -408,12 +416,14 @@ class ConversationStore:
         now = encode_utc(self._clock())
         with self._database.transaction() as connection:
             row = connection.execute(
-                "SELECT role, attempt FROM messages WHERE id = ?", (message_id,)
+                "SELECT role, origin, attempt FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
             if row is None:
                 raise StorageNotFoundError("message does not exist")
             if row["role"] != StoredMessageRole.ASSISTANT.value:
                 raise StorageConflictError("only assistant messages can be finalized")
+            if row["origin"] != StoredMessageOrigin.CONVERSATION.value:
+                raise StorageConflictError("proactive messages cannot be finalized")
             if int(row["attempt"]) != attempt:
                 raise StorageConflictError("terminal update belongs to a stale attempt")
             connection.execute(
@@ -441,14 +451,20 @@ class ConversationStore:
     def set_message_memory_eligibility(self, message_id: str, participates: bool) -> StoredMessage:
         now = encode_utc(self._clock())
         with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT origin FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageNotFoundError("message does not exist")
+            if participates and row["origin"] == StoredMessageOrigin.PROACTIVE.value:
+                raise StorageConflictError("proactive messages cannot participate in memory")
             cursor = connection.execute(
                 """
                 UPDATE messages SET participates_in_memory = ?, updated_at = ? WHERE id = ?
                 """,
                 (int(participates), now, message_id),
             )
-            if cursor.rowcount != 1:
-                raise StorageNotFoundError("message does not exist")
+            assert cursor.rowcount == 1
         return self.get_message(message_id)
 
     def recover_interrupted_messages(self) -> int:
@@ -461,7 +477,8 @@ class ConversationStore:
                 UPDATE messages
                 SET status = 'stopped', terminal_reason = 'shutdown',
                     updated_at = ?, completed_at = ?
-                WHERE role = 'assistant' AND status IN ('pending', 'streaming')
+                WHERE role = 'assistant' AND origin = 'conversation'
+                  AND status IN ('pending', 'streaming')
                 """,
                 (now, now),
             )
@@ -489,7 +506,11 @@ class ConversationStore:
         params: list[object] = [conversation_id]
         if before_sequence is not None:
             params.append(before_sequence)
-        params.append(limit + 1)
+        # Fetch two look-ahead rows: one may be needed to complete a regular
+        # user/assistant turn at the page boundary, while the second preserves
+        # an exact has-older decision after that expansion. Standalone proactive
+        # messages remain one independently ordered row.
+        params.append(limit + 2)
         rows = self._database.connection.execute(
             f"""
             SELECT * FROM messages
@@ -499,8 +520,17 @@ class ConversationStore:
             """,
             params,
         ).fetchall()
-        has_older = len(rows) > limit
         selected = rows[:limit]
+        if selected and len(rows) > limit:
+            oldest_selected = selected[-1]
+            next_older = rows[limit]
+            if (
+                oldest_selected["origin"] == StoredMessageOrigin.CONVERSATION.value
+                and next_older["origin"] == StoredMessageOrigin.CONVERSATION.value
+                and oldest_selected["turn_id"] == next_older["turn_id"]
+            ):
+                selected.append(next_older)
+        has_older = len(rows) > len(selected)
         items = tuple(_message_from_row(row) for row in reversed(selected))
         next_cursor = items[0].sequence if has_older and items else None
         return MessagePage(items=items, next_before_sequence=next_cursor)
@@ -520,6 +550,7 @@ class ConversationStore:
             """
             SELECT * FROM messages
             WHERE conversation_id = ?
+              AND origin = 'conversation'
               AND ((role = 'user' AND status = 'completed')
                    OR (role = 'assistant' AND status IN ('completed', 'stopped')
                        AND LENGTH(content) > 0))
@@ -567,6 +598,7 @@ class ConversationStore:
             """
             SELECT * FROM messages
             WHERE conversation_id = ? AND sequence > ?
+              AND origin = 'conversation'
               AND ((role = 'user' AND status = 'completed')
                    OR (role = 'assistant' AND status IN ('completed', 'stopped')
                        AND LENGTH(content) > 0))
@@ -652,6 +684,7 @@ class ConversationStore:
                    MAX(sequence) AS last_sequence
             FROM messages
             WHERE conversation_id = ? AND sequence > ?
+              AND origin = 'conversation'
               AND ((role = 'user' AND status = 'completed')
                    OR (role = 'assistant' AND status IN ('completed', 'stopped')
                        AND LENGTH(content) > 0))
@@ -678,6 +711,7 @@ class ConversationStore:
         created_at: datetime | None,
         completed: bool,
         participates_in_memory: bool,
+        origin: StoredMessageOrigin = StoredMessageOrigin.CONVERSATION,
     ) -> StoredMessage:
         _required_identifier(turn_id, "turn_id")
         _required_identifier(message_id, "message_id")
@@ -687,15 +721,16 @@ class ConversationStore:
                 connection.execute(
                     """
                     INSERT INTO messages(
-                        id, conversation_id, turn_id, role, content, status, attempt,
+                        id, conversation_id, turn_id, role, origin, content, status, attempt,
                         participates_in_memory, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message_id,
                         conversation_id,
                         turn_id,
                         role.value,
+                        origin.value,
                         content,
                         status.value,
                         attempt,
@@ -729,6 +764,262 @@ class ConversationStore:
             """,
             (now, now, message_id),
         )
+
+
+class ProactiveInteractionStore:
+    """Content-free display ledger plus atomic click-to-history persistence."""
+
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        clock: Clock = utc_now,
+        id_factory: IdFactory | None = None,
+    ) -> None:
+        self._database = database
+        self._clock = clock
+        self._id_factory = id_factory or (lambda: uuid4().hex)
+
+    def record_displayed(
+        self,
+        trigger: ProactiveTrigger | str,
+        local_date: date,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        event_id: str | None = None,
+        displayed_at: datetime | None = None,
+    ) -> ProactiveInteractionEvent:
+        """Count one greeting only after its bubble was actually displayed."""
+
+        trigger_value = _proactive_trigger(trigger)
+        date_value = _local_date(local_date)
+        profile_id = _required_identifier(profile_id, "profile_id")
+        event_id = _required_identifier(event_id or self._id_factory(), "event_id")
+        shown_at = encode_utc(displayed_at or self._clock())
+        try:
+            with self._database.transaction() as connection:
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM profiles WHERE id = ?", (profile_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    raise StorageNotFoundError("profile does not exist")
+                connection.execute(
+                    """
+                    INSERT INTO proactive_events(
+                        id, profile_id, local_date, trigger_kind, displayed_at,
+                        disposition, message_id
+                    ) VALUES (?, ?, ?, ?, ?, 'displayed', NULL)
+                    """,
+                    (event_id, profile_id, date_value, trigger_value.value, shown_at),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("proactive event ID already exists") from exc
+        return self.get(event_id)
+
+    def count_displayed_for_date(
+        self,
+        local_date: date,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> int:
+        """Return persisted displays regardless of their later disposition."""
+
+        row = self._database.connection.execute(
+            """
+            SELECT COUNT(*) AS event_count
+            FROM proactive_events
+            WHERE profile_id = ? AND local_date = ?
+            """,
+            (
+                _required_identifier(profile_id, "profile_id"),
+                _local_date(local_date),
+            ),
+        ).fetchone()
+        assert row is not None
+        return int(row["event_count"])
+
+    def count_for_date(
+        self,
+        local_date: date,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> int:
+        """Short alias used by the proactive policy boundary."""
+
+        return self.count_displayed_for_date(local_date, profile_id=profile_id)
+
+    def record_dismissed(self, event_id: str) -> ProactiveInteractionEvent:
+        event_id = _required_identifier(event_id, "event_id")
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT disposition FROM proactive_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageNotFoundError("proactive event does not exist")
+            disposition = ProactiveDisposition(row["disposition"])
+            if disposition is ProactiveDisposition.CLICKED:
+                raise StorageConflictError("clicked proactive events cannot be dismissed")
+            if disposition is ProactiveDisposition.DISPLAYED:
+                connection.execute(
+                    """
+                    UPDATE proactive_events SET disposition = 'dismissed'
+                    WHERE id = ? AND disposition = 'displayed'
+                    """,
+                    (event_id,),
+                )
+        return self.get(event_id)
+
+    def record_clicked(
+        self,
+        event_id: str,
+        conversation_id: str,
+        greeting: str,
+        *,
+        message_id: str | None = None,
+        clicked_at: datetime | None = None,
+        provider_name: str | None = None,
+        model_name: str | None = None,
+    ) -> tuple[ProactiveInteractionEvent, StoredMessage]:
+        """Persist a clicked greeting; this is intentionally the only click path."""
+
+        return self.persist_greeting_on_click(
+            event_id,
+            conversation_id,
+            greeting,
+            message_id=message_id,
+            clicked_at=clicked_at,
+            provider_name=provider_name,
+            model_name=model_name,
+        )
+
+    def persist_greeting_on_click(
+        self,
+        event_id: str,
+        conversation_id: str,
+        greeting: str,
+        *,
+        message_id: str | None = None,
+        clicked_at: datetime | None = None,
+        provider_name: str | None = None,
+        model_name: str | None = None,
+    ) -> tuple[ProactiveInteractionEvent, StoredMessage]:
+        """Atomically link one completed standalone assistant message to a click."""
+
+        event_id = _required_identifier(event_id, "event_id")
+        conversation_id = _required_identifier(conversation_id, "conversation_id")
+        greeting = _required_text(greeting, "greeting", strip=False)
+        candidate_message_id = _required_identifier(message_id or self._id_factory(), "message_id")
+        now = encode_utc(clicked_at or self._clock())
+        existing_message_id: str | None = None
+        try:
+            with self._database.transaction() as connection:
+                event = connection.execute(
+                    "SELECT * FROM proactive_events WHERE id = ?", (event_id,)
+                ).fetchone()
+                if event is None:
+                    raise StorageNotFoundError("proactive event does not exist")
+                disposition = ProactiveDisposition(event["disposition"])
+                if disposition is ProactiveDisposition.DISMISSED:
+                    raise StorageConflictError("dismissed proactive events cannot be clicked")
+                if disposition is ProactiveDisposition.CLICKED:
+                    existing_message_id = event["message_id"]
+                    if existing_message_id is None:
+                        raise StorageConflictError(
+                            "clicked proactive message is no longer available"
+                        )
+                else:
+                    conversation = connection.execute(
+                        "SELECT profile_id, status FROM conversations WHERE id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                    if conversation is None:
+                        raise StorageNotFoundError("conversation does not exist")
+                    if conversation["profile_id"] != event["profile_id"]:
+                        raise StorageConflictError(
+                            "proactive event and conversation profiles do not match"
+                        )
+                    if conversation["status"] != ConversationStatus.NORMAL.value:
+                        raise StorageConflictError(
+                            "proactive messages require an active conversation"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO messages(
+                            id, conversation_id, turn_id, role, origin, content,
+                            status, attempt, terminal_reason, provider_name, model_name,
+                            failure_code, participates_in_memory, created_at, updated_at,
+                            completed_at
+                        ) VALUES (
+                            ?, ?, ?, 'assistant', 'proactive', ?, 'completed', 1,
+                            'completed', ?, ?, NULL, 0, ?, ?, ?
+                        )
+                        """,
+                        (
+                            candidate_message_id,
+                            conversation_id,
+                            event_id,
+                            greeting,
+                            provider_name,
+                            model_name,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    cursor = connection.execute(
+                        """
+                        UPDATE proactive_events
+                        SET disposition = 'clicked', message_id = ?
+                        WHERE id = ? AND disposition = 'displayed'
+                        """,
+                        (candidate_message_id, event_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise StorageConflictError("proactive event state changed")
+                    ConversationStore._touch_conversation_for_message(
+                        connection, candidate_message_id, now
+                    )
+                    existing_message_id = candidate_message_id
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("proactive message could not be persisted") from exc
+
+        assert existing_message_id is not None
+        message = _message_from_row(
+            self._database.connection.execute(
+                "SELECT * FROM messages WHERE id = ?", (existing_message_id,)
+            ).fetchone()
+        )
+        return self.get(event_id), message
+
+    def get(self, event_id: str) -> ProactiveInteractionEvent:
+        row = self._database.connection.execute(
+            "SELECT * FROM proactive_events WHERE id = ?",
+            (_required_identifier(event_id, "event_id"),),
+        ).fetchone()
+        if row is None:
+            raise StorageNotFoundError("proactive event does not exist")
+        return _proactive_event_from_row(row)
+
+    def list_for_date(
+        self,
+        local_date: date,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> tuple[ProactiveInteractionEvent, ...]:
+        rows = self._database.connection.execute(
+            """
+            SELECT * FROM proactive_events
+            WHERE profile_id = ? AND local_date = ?
+            ORDER BY displayed_at, id
+            """,
+            (
+                _required_identifier(profile_id, "profile_id"),
+                _local_date(local_date),
+            ),
+        ).fetchall()
+        return tuple(_proactive_event_from_row(row) for row in rows)
 
 
 class BackgroundJobStore:
@@ -966,6 +1257,19 @@ def _required_text(value: str, field: str, *, strip: bool = True) -> str:
     return result
 
 
+def _proactive_trigger(value: ProactiveTrigger | str) -> ProactiveTrigger:
+    try:
+        return ProactiveTrigger(str(value))
+    except ValueError as exc:
+        raise StorageValidationError("unsupported proactive trigger") from exc
+
+
+def _local_date(value: date) -> str:
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise StorageValidationError("local_date must be a date")
+    return value.isoformat()
+
+
 def _validate_limit(limit: int, *, maximum: int) -> None:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
         raise StorageValidationError(f"limit must be between 1 and {maximum}")
@@ -1011,6 +1315,7 @@ def _message_from_row(row: sqlite3.Row) -> StoredMessage:
         conversation_id=str(row["conversation_id"]),
         turn_id=str(row["turn_id"]),
         role=StoredMessageRole(row["role"]),
+        origin=StoredMessageOrigin(row["origin"]),
         content=str(row["content"]),
         status=StoredMessageStatus(row["status"]),
         attempt=int(row["attempt"]),
@@ -1022,6 +1327,22 @@ def _message_from_row(row: sqlite3.Row) -> StoredMessage:
         created_at=_required_datetime(row["created_at"]),
         updated_at=_required_datetime(row["updated_at"]),
         completed_at=decode_utc(row["completed_at"]),
+    )
+
+
+def _proactive_event_from_row(row: sqlite3.Row) -> ProactiveInteractionEvent:
+    try:
+        local_date = date.fromisoformat(str(row["local_date"]))
+    except ValueError as exc:
+        raise StorageValidationError("proactive event local date is invalid") from exc
+    return ProactiveInteractionEvent(
+        event_id=str(row["id"]),
+        profile_id=str(row["profile_id"]),
+        local_date=local_date,
+        trigger=ProactiveTrigger(row["trigger_kind"]),
+        displayed_at=_required_datetime(row["displayed_at"]),
+        disposition=ProactiveDisposition(row["disposition"]),
+        message_id=row["message_id"],
     )
 
 

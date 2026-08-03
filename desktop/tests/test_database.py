@@ -6,6 +6,7 @@ import pytest
 
 from amadeus_desktop import database as database_module
 from amadeus_desktop.database import (
+    AMADEUS_APPLICATION_ID,
     SCHEMA_VERSION,
     DatabaseReadOnlyError,
     SQLiteDatabase,
@@ -13,10 +14,11 @@ from amadeus_desktop.database import (
 )
 
 
-def test_schema_v2_enables_required_pragmas_and_entities(tmp_path) -> None:
+def test_schema_v3_enables_required_pragmas_and_entities(tmp_path) -> None:
     path = tmp_path / "data" / "amadeus.sqlite3"
     with SQLiteDatabase(path, busy_timeout_ms=3_210) as database:
-        assert database.schema_version == SCHEMA_VERSION == 2
+        assert database.schema_version == SCHEMA_VERSION == 3
+        assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert str(database.pragma_value("journal_mode")).lower() == "wal"
         assert database.pragma_value("foreign_keys") == 1
         assert database.pragma_value("busy_timeout") == 3_210
@@ -40,13 +42,14 @@ def test_schema_v2_enables_required_pragmas_and_entities(tmp_path) -> None:
             "persona_embedding_generations",
             "persona_vectors",
             "persona_recall_events",
+            "proactive_events",
         }.issubset(table_names(database.connection))
 
     assert path.exists()
     assert path.parent.name == "data"
 
 
-def test_schema_v1_is_backed_up_and_migrated_to_v2_without_losing_data(tmp_path) -> None:
+def test_schema_v1_is_backed_up_and_migrated_to_v3_without_losing_data(tmp_path) -> None:
     path = tmp_path / "amadeus.sqlite3"
     legacy = sqlite3.connect(path)
     legacy.execute("PRAGMA foreign_keys = ON")
@@ -61,7 +64,8 @@ def test_schema_v1_is_backed_up_and_migrated_to_v2_without_losing_data(tmp_path)
     database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
     try:
         assert not database.read_only
-        assert database.schema_version == 2
+        assert database.schema_version == 3
+        assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert database.last_backup_path is not None
         assert (
             database.connection.execute(
@@ -78,6 +82,7 @@ def test_schema_v1_is_backed_up_and_migrated_to_v2_without_losing_data(tmp_path)
             "persona_embedding_generations",
             "persona_vectors",
             "persona_recall_events",
+            "proactive_events",
         }.issubset(table_names(database.connection))
     finally:
         database.close()
@@ -92,6 +97,81 @@ def test_schema_v1_is_backed_up_and_migrated_to_v2_without_losing_data(tmp_path)
             backup.execute("SELECT 1 FROM sqlite_master WHERE name = 'memory_vectors'").fetchone()
             is None
         )
+    finally:
+        backup.close()
+
+
+def test_schema_v2_migrates_messages_and_application_identity_without_data_loss(
+    tmp_path,
+) -> None:
+    path = tmp_path / "amadeus.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.execute("PRAGMA foreign_keys = ON")
+    database_module._migrate_to_v1(legacy)
+    database_module._migrate_to_v2(legacy)
+    legacy.execute("PRAGMA user_version = 2")
+    timestamp = "2026-08-03T00:00:00.000000Z"
+    legacy.execute("INSERT INTO profiles VALUES ('p', 'name', ?, ?)", (timestamp, timestamp))
+    legacy.execute(
+        """
+        INSERT INTO conversations(
+            id, profile_id, title, status, created_at, updated_at, last_activity_at
+        ) VALUES ('c', 'p', 'legacy', 'normal', ?, ?, ?)
+        """,
+        (timestamp, timestamp, timestamp),
+    )
+    legacy.execute(
+        """
+        INSERT INTO messages(
+            id, conversation_id, turn_id, role, content, status, attempt,
+            participates_in_memory, created_at, updated_at, completed_at
+        ) VALUES ('m', 'c', 't', 'user', 'preserved', 'completed', 1, 1, ?, ?, ?)
+        """,
+        (timestamp, timestamp, timestamp),
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
+    backup_path = database.last_backup_path
+    try:
+        assert not database.read_only
+        assert database.schema_version == 3
+        assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
+        row = database.connection.execute(
+            "SELECT content, origin FROM messages WHERE id = 'm'"
+        ).fetchone()
+        assert tuple(row) == ("preserved", "conversation")
+        assert "proactive_events" in table_names(database.connection)
+    finally:
+        database.close()
+
+    assert backup_path is not None
+    backup = sqlite3.connect(backup_path)
+    try:
+        assert backup.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert backup.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert backup.execute("SELECT content FROM messages WHERE id = 'm'").fetchone() == (
+            "preserved",
+        )
+        assert {row[1] for row in backup.execute("PRAGMA table_info(messages)")} == {
+            "sequence",
+            "id",
+            "conversation_id",
+            "turn_id",
+            "role",
+            "content",
+            "status",
+            "attempt",
+            "terminal_reason",
+            "provider_name",
+            "model_name",
+            "failure_code",
+            "participates_in_memory",
+            "created_at",
+            "updated_at",
+            "completed_at",
+        }
     finally:
         backup.close()
 
@@ -219,10 +299,24 @@ def test_claimed_current_but_incomplete_schema_fails_closed(tmp_path) -> None:
         ALTER TABLE memory_recall_events RENAME TO memory_recall_events_full;
         CREATE TABLE memory_recall_events(id TEXT PRIMARY KEY);
         """,
+        """
+        DROP TABLE proactive_events;
+        CREATE TABLE proactive_events(id TEXT PRIMARY KEY);
+        """,
+        """
+        PRAGMA application_id = 0;
+        """,
     ),
-    ids=("trigger-definition", "partial-unique-index", "fts-table", "v2-columns"),
+    ids=(
+        "trigger-definition",
+        "partial-unique-index",
+        "fts-table",
+        "v2-columns",
+        "v3-columns",
+        "application-id",
+    ),
 )
-def test_current_schema_with_corrupted_v2_invariant_fails_closed(tmp_path, corruption: str) -> None:
+def test_current_schema_with_corrupted_invariant_fails_closed(tmp_path, corruption: str) -> None:
     path = tmp_path / "amadeus.sqlite3"
     SQLiteDatabase(path).open().close()
     connection = sqlite3.connect(path)

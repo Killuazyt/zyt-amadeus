@@ -40,10 +40,16 @@ class PetWindow(QWidget):
         asset: LoadedPetAsset,
         *,
         scale_percent: int = 100,
+        animation_speed_percent: int = 100,
+        always_on_top: bool = True,
     ) -> None:
         super().__init__()
         self.asset = asset
-        self.animation = AnimationController(asset.manifest)
+        self.animation = AnimationController(
+            asset.manifest,
+            speed_percent=animation_speed_percent,
+        )
+        self._always_on_top = bool(always_on_top)
         self.scale_percent = max(MIN_SCALE_PERCENT, min(scale_percent, MAX_SCALE_PERCENT))
         self._sheet = QImage(str(asset.spritesheet_path))
         if self._sheet.isNull():
@@ -56,13 +62,7 @@ class PetWindow(QWidget):
         self._dragging = False
         self._drag_direction: str | None = None
 
-        flags = (
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus
-        )
-        self.setWindowFlags(flags)
+        self.setWindowFlags(self._window_flags())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -86,6 +86,51 @@ class PetWindow(QWidget):
         self.show()
         self.raise_()
 
+    @property
+    def always_on_top(self) -> bool:
+        return self._always_on_top
+
+    def set_always_on_top(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._always_on_top:
+            return
+        visible = self.isVisible()
+        position = self.pos()
+        self._always_on_top = enabled
+        self.setWindowFlags(self._window_flags())
+        self.move(position)
+        if visible:
+            self.show_without_activate()
+
+    def set_animation_speed_percent(self, value: int) -> None:
+        self.animation.set_speed_percent(value)
+
+    def replace_asset(self, asset: LoadedPetAsset) -> None:
+        """Replace a validated sprite asset while preserving placement and hot settings."""
+
+        was_running = self.animation.is_running
+        speed_percent = self.animation.speed_percent
+        previous = self.geometry()
+        self.animation.pause()
+        self.animation.frame_changed.disconnect(self._set_frame)
+        self.asset = asset
+        self._sheet = QImage(str(asset.spritesheet_path))
+        if self._sheet.isNull():
+            raise ValueError("The validated pet spritesheet could not be loaded.")
+        self.animation.deleteLater()
+        self.animation = AnimationController(asset.manifest, speed_percent=speed_percent)
+        self.animation.frame_changed.connect(self._set_frame)
+        self._frame_cache.clear()
+        self.setWindowTitle(asset.manifest.display_name)
+        self._resize_for_scale()
+        self._set_frame(self.animation.current_frame)
+        self.move(
+            round(previous.center().x() - self.width() / 2),
+            previous.bottom() - self.height() + 1,
+        )
+        if was_running:
+            self.animation.start()
+
     def set_scale_percent(self, value: int) -> None:
         value = max(MIN_SCALE_PERCENT, min(int(value), MAX_SCALE_PERCENT))
         if value == self.scale_percent:
@@ -105,6 +150,16 @@ class PetWindow(QWidget):
         width = max(1, round(spec.frame_width * self.scale_percent / 100))
         height = max(1, round(spec.frame_height * self.scale_percent / 100))
         self.setFixedSize(width, height)
+
+    def _window_flags(self) -> Qt.WindowType:
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        if self._always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        return flags
 
     def _source_frame(self, frame: FrameCoordinate) -> QImage:
         spec = self.asset.manifest.spritesheet

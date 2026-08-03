@@ -102,6 +102,9 @@ class MemoryPage(QWidget):
     memory_selected = Signal(str)
     verify_model_requested = Signal()
     rebuild_index_requested = Signal()
+    export_requested = Signal()
+    backup_requested = Signal()
+    clear_all_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -148,6 +151,20 @@ class MemoryPage(QWidget):
         retrieval_layout = QVBoxLayout(retrieval_group)
         retrieval_layout.addLayout(retrieval_actions)
         retrieval_layout.addWidget(self.retrieval_index_label)
+
+        self.export_button = QPushButton("导出记忆 JSON…")
+        self.export_button.setObjectName("exportMemories")
+        self.backup_button = QPushButton("备份数据库…")
+        self.backup_button.setObjectName("backupMemoryDatabase")
+        self.clear_all_button = QPushButton("清空全部记忆…")
+        self.clear_all_button.setObjectName("clearAllMemories")
+        data_actions = QHBoxLayout()
+        data_actions.addWidget(self.export_button)
+        data_actions.addWidget(self.backup_button)
+        data_actions.addStretch(1)
+        data_actions.addWidget(self.clear_all_button)
+        data_group = QGroupBox("记忆数据")
+        data_group.setLayout(data_actions)
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("memorySearch")
@@ -295,6 +312,7 @@ class MemoryPage(QWidget):
         layout.addWidget(explanation)
         layout.addLayout(enabled_row)
         layout.addWidget(retrieval_group)
+        layout.addWidget(data_group)
         layout.addLayout(filters)
         layout.addWidget(splitter, 1)
         layout.addWidget(failed_group)
@@ -321,6 +339,9 @@ class MemoryPage(QWidget):
         self.retry_task_button.clicked.connect(self._request_task_retry)
         self.verify_model_button.clicked.connect(self.verify_model_requested.emit)
         self.rebuild_index_button.clicked.connect(self.rebuild_index_requested.emit)
+        self.export_button.clicked.connect(self.export_requested.emit)
+        self.backup_button.clicked.connect(self.backup_requested.emit)
+        self.clear_all_button.clicked.connect(self._request_clear_all)
         self._sync_enabled_notice()
         self._sync_memory_detail()
         self._sync_task_action()
@@ -530,6 +551,19 @@ class MemoryPage(QWidget):
         )
         if answer == QMessageBox.StandardButton.Yes:
             self.delete_requested.emit(memory_id)
+
+    @Slot()
+    def _request_clear_all(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "清空全部长期记忆？",
+            "将永久删除全部长期记忆、不可变版本和来源关系。\n\n"
+            "原始聊天不会随之删除。此操作无法撤销，建议先导出记忆或创建备份。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.clear_all_requested.emit()
 
     @Slot(QListWidgetItem, QListWidgetItem)
     def _on_source_selection_changed(

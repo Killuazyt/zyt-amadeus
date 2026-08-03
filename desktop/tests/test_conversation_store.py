@@ -10,6 +10,7 @@ from amadeus_desktop.storage_models import (
     BackgroundJobStatus,
     StorageConflictError,
     StorageNotFoundError,
+    StoredMessageOrigin,
     StoredMessageStatus,
 )
 
@@ -92,12 +93,14 @@ def test_user_commit_checkpoint_terminal_and_retry_reuse_stable_ids(stores) -> N
         participates_in_memory=False,
     )
     assert user.status is StoredMessageStatus.COMPLETED
+    assert user.origin is StoredMessageOrigin.CONVERSATION
     assert not user.participates_in_memory
 
     assistant = store.create_assistant_placeholder(
         conversation.conversation_id, "turn-1", "assistant-1"
     )
     assert assistant.content == ""
+    assert assistant.origin is StoredMessageOrigin.CONVERSATION
     assert assistant.status is StoredMessageStatus.PENDING
     checkpoint = store.checkpoint_assistant("assistant-1", "部分", attempt=1)
     assert checkpoint.content == "部分"
