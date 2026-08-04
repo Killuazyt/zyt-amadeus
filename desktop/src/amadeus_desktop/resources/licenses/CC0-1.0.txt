@@ -1,0 +1,8 @@
+CC0 1.0 Universal
+=================
+
+The Amadeus generic robot spritesheet and the application icon derived from its
+first frame are dedicated to the public domain under Creative Commons CC0 1.0
+Universal, to the extent possible under law, without warranties.
+
+Canonical legal code: https://creativecommons.org/publicdomain/zero/1.0/legalcode

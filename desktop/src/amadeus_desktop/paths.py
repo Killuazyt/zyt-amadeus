@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from uuid import UUID
+
+_FOLDERID_LOCAL_APP_DATA = UUID("f1b32785-6fba-4fcf-9d55-7b8e7f157091")
 
 
 class AppDirectory(StrEnum):
@@ -28,12 +32,18 @@ class AppPaths:
 
     @classmethod
     def for_current_user(cls, local_app_data: Path | None = None) -> AppPaths:
-        r"""Resolve ``%LOCALAPPDATA%\Amadeus`` without depending on Qt."""
+        r"""Resolve ``%LOCALAPPDATA%\Amadeus`` with an injectable acceptance root."""
 
         if local_app_data is None:
             configured = os.environ.get("LOCALAPPDATA")
-            local_app_data = Path(configured) if configured else Path.home() / "AppData" / "Local"
+            local_app_data = Path(configured) if configured else _known_local_app_data()
         return cls(root=local_app_data / "Amadeus")
+
+    @classmethod
+    def for_trusted_current_user(cls) -> AppPaths:
+        """Resolve the destructive-maintenance root only through Windows Known Folder."""
+
+        return cls(root=_known_local_app_data() / "Amadeus")
 
     def directory(self, region: AppDirectory) -> Path:
         return self.root / region.value
@@ -85,3 +95,44 @@ class AppPaths:
         path = self.directory(region)
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+
+def _known_local_app_data() -> Path:
+    """Read FOLDERID_LocalAppData from the Windows shell, never from the environment."""
+
+    if os.name != "nt":  # pragma: no cover - developer-only portability fallback
+        return Path.home() / "AppData" / "Local"
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    except (AttributeError, OSError) as exc:  # pragma: no cover - Windows platform guard
+        raise OSError("Windows Known Folder APIs are unavailable.") from exc
+    guid_buffer = (ctypes.c_ubyte * 16).from_buffer_copy(_FOLDERID_LOCAL_APP_DATA.bytes_le)
+    path_pointer = ctypes.c_void_p()
+    shell32.SHGetKnownFolderPath.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+    ole32.CoTaskMemFree.restype = None
+    result = shell32.SHGetKnownFolderPath(
+        ctypes.byref(guid_buffer),
+        0,
+        None,
+        ctypes.byref(path_pointer),
+    )
+    if result != 0 or not path_pointer.value:
+        if path_pointer.value:
+            ole32.CoTaskMemFree(path_pointer)
+        raise OSError("Windows LocalAppData Known Folder could not be resolved.")
+    try:
+        value = ctypes.wstring_at(path_pointer.value)
+    finally:
+        ole32.CoTaskMemFree(path_pointer)
+    candidate = Path(value)
+    if not value or not candidate.is_absolute():
+        raise OSError("Windows LocalAppData Known Folder returned an invalid path.")
+    return candidate

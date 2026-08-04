@@ -1,5 +1,8 @@
 name: Desktop CI
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   pull_request:
@@ -7,6 +10,7 @@ on:
     paths:
       - "desktop/**"
       - "README.md"
+      - "LICENSE"
       - ".gitignore"
       - ".github/workflows/desktop-ci.yml"
   push:
@@ -14,6 +18,7 @@ on:
     paths:
       - "desktop/**"
       - "README.md"
+      - "LICENSE"
       - ".gitignore"
       - ".github/workflows/desktop-ci.yml"
 
@@ -47,6 +52,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'ruff check failed' }
           python -m ruff format --check .
           if ($LASTEXITCODE -ne 0) { throw 'ruff format check failed' }
+          python -m compileall -q src tests
+          if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
@@ -67,7 +74,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'isolated wheel install failed' }
           & $python -m pip check
           if ($LASTEXITCODE -ne 0) { throw 'isolated pip check failed' }
-          & $python -c "import amadeus_desktop; assert amadeus_desktop.__version__ == '0.6.0.dev6'"
+          & $python -c "import amadeus_desktop; assert amadeus_desktop.__version__ == '0.7.0.dev7'"
           if ($LASTEXITCODE -ne 0) { throw 'isolated version import failed' }
       - name: Build FTS-degraded onedir
         shell: powershell
@@ -89,3 +96,101 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "onedir exited with $($process.ExitCode)" }
       - name: Scan source and build artifacts
         run: python scripts/scan_artifacts.py --path ..
+
+  package-installer:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: desktop/requirements-dev.lock
+      - name: Install locked build dependencies
+        run: |
+          python -m pip install "pip>=24,<26"
+          if ($LASTEXITCODE -ne 0) { throw 'pip bootstrap failed' }
+          python -m pip install -r requirements-dev.lock
+          if ($LASTEXITCODE -ne 0) { throw 'locked dependency install failed' }
+          python -m pip install --no-deps .
+          if ($LASTEXITCODE -ne 0) { throw 'project install failed' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'pip check failed' }
+      - name: Audit dependency vulnerabilities
+        shell: powershell
+        run: |
+          $auditVenv = Join-Path $env:RUNNER_TEMP 'amadeus-pip-audit'
+          python -m venv $auditVenv
+          if ($LASTEXITCODE -ne 0) { throw 'pip-audit venv creation failed' }
+          $auditPython = Join-Path $auditVenv 'Scripts\python.exe'
+          & $auditPython -m pip install --disable-pip-version-check 'pip-audit==2.9.0'
+          if ($LASTEXITCODE -ne 0) { throw 'pinned pip-audit install failed' }
+          & $auditPython -m pip_audit -r requirements.lock --progress-spinner off
+          if ($LASTEXITCODE -ne 0) { throw 'dependency vulnerability audit failed' }
+      - name: Audit legacy architecture and source licenses
+        shell: powershell
+        run: |
+          .\scripts\audit-legacy.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'legacy architecture audit failed' }
+          .\scripts\check-release-licenses.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'release license closure check failed' }
+          python scripts/scan_artifacts.py --path ..
+          if ($LASTEXITCODE -ne 0) { throw 'source privacy scan failed' }
+      - name: Prepare pinned public embedding model
+        shell: powershell
+        run: |
+          $modelRoot = Join-Path $env:RUNNER_TEMP 'amadeus-p7-model'
+          python -m amadeus_desktop.tools.model prepare --models-root $modelRoot
+          if ($LASTEXITCODE -ne 0) { throw 'pinned public model preparation failed' }
+      - name: Install verified Inno Setup 6.7.3
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $downloadRoot = Join-Path $env:RUNNER_TEMP 'inno-download'
+          $innoRoot = Join-Path $env:RUNNER_TEMP 'Inno Setup 6.7.3'
+          New-Item -ItemType Directory -Path $downloadRoot -Force | Out-Null
+          gh release download is-6_7_3 --repo jrsoftware/issrc --pattern 'innosetup-6.7.3.exe' --dir $downloadRoot
+          if ($LASTEXITCODE -ne 0) { throw 'official Inno Setup download failed' }
+          $setup = Join-Path $downloadRoot 'innosetup-6.7.3.exe'
+          Push-Location $downloadRoot
+          try {
+            gh release verify is-6_7_3 --repo jrsoftware/issrc
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup immutable release verification failed' }
+            gh release verify-asset is-6_7_3 $setup --repo jrsoftware/issrc
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup release attestation failed' }
+          }
+          finally { Pop-Location }
+          $signature = Get-AuthenticodeSignature -LiteralPath $setup
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Pyrsys B\.V\.') {
+            throw 'Inno Setup Authenticode verification failed'
+          }
+          $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=`"$innoRoot`"") -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw 'Inno Setup installation failed' }
+      - name: Build verified Bundled onedir and unsigned installer
+        shell: powershell
+        run: |
+          $modelPath = Join-Path $env:RUNNER_TEMP 'amadeus-p7-model\bge-small-zh-v1.5\46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59'
+          $innoCompiler = Join-Path $env:RUNNER_TEMP 'Inno Setup 6.7.3\ISCC.exe'
+          $pythonPath = (Get-Command python -ErrorAction Stop).Source
+          .\scripts\build-installer.ps1 -ModelPath $modelPath -PythonPath $pythonPath -InnoSetupPath $innoCompiler
+          if ($LASTEXITCODE -ne 0) { throw 'P7 installer build failed' }
+          .\scripts\check-release-licenses.ps1 -OnedirPath .\build\onedir-dist\Amadeus
+          if ($LASTEXITCODE -ne 0) { throw 'frozen release license closure check failed' }
+      - name: Upload unsigned P7 test installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: amadeus-p7-unsigned-installer-${{ github.sha }}
+          path: |
+            desktop/build/installer/Amadeus-0.7.0.dev7-win64-setup.exe
+            desktop/build/installer/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

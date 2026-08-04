@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
+from datetime import date
 from typing import Any
 
 from PySide6.QtCore import Signal
@@ -96,6 +98,8 @@ class DiagnosticsPage(QWidget):
         explanation.setWordWrap(True)
 
         self.version_value = _value_label("diagnosticsVersion")
+        self.commit_value = _value_label("diagnosticsCommit")
+        self.build_date_value = _value_label("diagnosticsBuildDate")
         self.settings_schema_value = _value_label("diagnosticsSettingsSchema")
         self.database_schema_value = _value_label("diagnosticsDatabaseSchema")
         self.data_path_value = _value_label("diagnosticsDataPath")
@@ -108,6 +112,8 @@ class DiagnosticsPage(QWidget):
 
         build_form = QFormLayout()
         build_form.addRow("应用版本", self.version_value)
+        build_form.addRow("提交 SHA", self.commit_value)
+        build_form.addRow("构建日期（UTC）", self.build_date_value)
         build_form.addRow("设置 schema", self.settings_schema_value)
         build_form.addRow("SQLite schema", self.database_schema_value)
         build_group = QGroupBox("版本")
@@ -149,6 +155,10 @@ class DiagnosticsPage(QWidget):
 
     def set_diagnostics(self, value: Mapping[str, Any] | object) -> None:
         version = _bounded_plain_text(_member(value, "version", "app_version", default="未知"), 64)
+        commit_sha = _bounded_commit_text(_member(value, "commit_sha", default="unknown"))
+        build_date_utc = _bounded_build_date_text(
+            _member(value, "build_date_utc", default="unknown")
+        )
         settings_schema = _bounded_integer_text(
             _member(value, "settings_schema", "settings_schema_version", default=None)
         )
@@ -172,6 +182,8 @@ class DiagnosticsPage(QWidget):
         ).lower()
 
         self.version_value.setText(version)
+        self.commit_value.setText(commit_sha)
+        self.build_date_value.setText(build_date_utc)
         self.settings_schema_value.setText(settings_schema)
         self.database_schema_value.setText(database_schema)
         self.data_path_value.setText(data_path)
@@ -277,6 +289,25 @@ def _bounded_plain_text(value: object, limit: int) -> str:
         return "未知"
     text = " ".join(text.splitlines())
     return text if len(text) <= limit else f"{text[:limit]}…"
+
+
+def _bounded_commit_text(value: object) -> str:
+    normalized = str(value).strip().lower()
+    if normalized == "development":
+        return "开发环境"
+    return normalized if re.fullmatch(r"[0-9a-f]{40}", normalized) else "未知"
+
+
+def _bounded_build_date_text(value: object) -> str:
+    normalized = str(value).strip()
+    if normalized == "development":
+        return "开发环境"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized) is None:
+        return "未知"
+    try:
+        return normalized if date.fromisoformat(normalized).isoformat() == normalized else "未知"
+    except ValueError:
+        return "未知"
 
 
 def _enum_text(value: object) -> str:

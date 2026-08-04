@@ -1,12 +1,15 @@
 [build-system]
-requires = ["setuptools>=75,<82", "wheel>=0.45,<1"]
+requires = ["setuptools>=77,<82", "wheel>=0.45,<1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "amadeus-desktop"
-version = "0.6.0.dev6"
+version = "0.7.0.dev7"
 description = "Windows desktop pet with secure chat and auditable local memory"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "Killuazyt"}]
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "fastembed==0.8.0",
@@ -27,7 +30,7 @@ dev = [
     "pytest>=8.3,<10",
     "pytest-qt>=4.4,<5",
     "ruff>=0.9,<1",
-    "setuptools>=75,<82",
+    "setuptools>=77,<82",
     "wheel>=0.45,<1",
 ]
 
@@ -51,6 +54,7 @@ amadeus_desktop = [
     "resources/builtin_pet/*.json",
     "resources/builtin_pet/*.png",
     "resources/builtin_pet/*.txt",
+    "resources/licenses/*.json",
     "resources/licenses/*.txt",
 ]
 

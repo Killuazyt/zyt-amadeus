@@ -51,12 +51,26 @@ class _FakeModelSettings:
         self.results.append((success, message))
 
 
+class _FakeSignal:
+    def __init__(self) -> None:
+        self.disconnected: list[object] = []
+
+    def disconnect(self, callback: object) -> None:
+        self.disconnected.append(callback)
+
+
+class _FakeMemoryPage:
+    def set_retrieval_status(self, _status: object) -> None:
+        raise AssertionError("shutdown must not dispatch vector status to the UI")
+
+
 def _bare_controller() -> ApplicationController:
     return ApplicationController.__new__(ApplicationController)
 
 
 def test_vector_model_ready_recovery_requests_one_incremental_refresh() -> None:
     controller = _bare_controller()
+    controller._exiting = False
     controller._initial_index_refresh_requested = False
     controller._vector_index_available = False
     controller.vector_index = _FakeVectorIndex()
@@ -75,6 +89,26 @@ def test_vector_model_ready_recovery_requests_one_incremental_refresh() -> None:
     assert controller.vector_index.refresh_count == 1
     controller._on_vector_index_status_changed(SimpleNamespace(category="ready", available=True))
     assert controller.vector_index.refresh_count == 2
+
+
+def test_vector_and_diagnostics_callbacks_ignore_shutdown_updates() -> None:
+    controller = _bare_controller()
+    controller._exiting = True
+
+    controller._on_vector_index_status_changed(SimpleNamespace(category="ready", available=True))
+    controller._queue_vector_index_status(SimpleNamespace(category="ready"))
+    controller._on_vector_status_for_p6(SimpleNamespace(category="ready"))
+    controller._refresh_diagnostics()
+
+
+def test_shutdown_disconnects_all_vector_status_ui_callbacks() -> None:
+    controller = _bare_controller()
+    controller.memory_page = _FakeMemoryPage()
+    controller.vector_index = SimpleNamespace(status_changed=_FakeSignal())
+
+    controller._disconnect_vector_status_ui()
+
+    assert len(controller.vector_index.status_changed.disconnected) == 3
 
 
 def test_provider_switch_timeout_restores_stopped_maintenance_timer() -> None:

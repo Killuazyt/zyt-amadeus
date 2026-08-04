@@ -1,7 +1,8 @@
 # Amadeus Desktop
 
-P6 adds the complete settings, tray, proactive-interaction, and local-data-management closure on top
-of the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
+P7 adds reproducible Windows packaging, legacy-architecture auditing, and a clean-machine installer
+acceptance workflow on top of the complete P6 settings, tray, proactive-interaction, and local-data-management
+closure and the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
 text-model integration, and P5 auditable hybrid memory. The application includes safe local pet
 import/switch/removal, fixed-clock animation, transparent hit testing, manual drag placement,
 multi-screen recovery, a bundled CC0 placeholder pet, cancellable chat states, and an exact
@@ -102,6 +103,36 @@ recall, corpus mixing, leaked runtime/SQLite handles, or p95 above 300 ms.
 
 Wheel, sdist, and Degraded onedir outputs exclude the model, persona material, databases, and logs.
 Degraded mode proves packaged FTS recall and a model-missing lifecycle. Bundled mode accepts only the
-fixed verified public model, proves offline 512-D inference plus a model-ready full lifecycle, and
-remains a P5B smoke artifact rather than the P7 installer. Both modes reject child processes, TCP
+fixed verified public model, proves offline 512-D inference plus a model-ready full lifecycle, and is
+the sole onedir input accepted by the P7 installer build. Both modes reject child processes, TCP
 connections/listeners, unsafe assets, secrets, databases, logs, and unexpected model files.
+
+## P7 installer
+
+The release build requires official Inno Setup 6.7.3, a clean Git tree, and the verified pinned model.
+Run from this directory:
+
+```powershell
+$modelPath = Join-Path $env:LOCALAPPDATA 'Amadeus\models\bge-small-zh-v1.5\46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59'
+.\scripts\audit-legacy.ps1
+.\scripts\check-release-licenses.ps1
+.\scripts\build-installer.ps1 -ModelPath $modelPath
+```
+
+The formal output is `build\installer\Amadeus-0.7.0.dev7-win64-setup.exe`; `SHA256SUMS.txt`
+is generated beside it. For the complete offline Windows Sandbox acceptance matrix, first create the
+temporary lower-version package and then launch the generated `.wsb` configuration:
+
+```powershell
+.\scripts\build-installer.ps1 -ModelPath $modelPath -BuildAcceptanceBaseline
+.\scripts\start-sandbox-acceptance.ps1 `
+    -InstallerPath .\build\installer\Amadeus-0.7.0.dev7-win64-setup.exe `
+    -BaselineInstallerPath .\build\installer\Amadeus-0.6.0.dev6-win64-acceptance-baseline-setup.exe
+```
+
+The installer is current-user, x64, and does not download runtime resources. Login startup is offered
+only on a first install and is unchecked by default. Normal uninstall preserves local data and WinCred;
+the explicit `/DELETEUSERDATA=1` acceptance switch exercises the seven-region fail-closed cleanup.
+Legacy Chromium `localStorage`, legacy `.env` credentials, Token Plan configuration, and old character
+prompts are intentionally not migrated. P7 is an unsigned test package; P8 retains signing decisions,
+physical mixed-DPI/multi-monitor regression, three-day daily use, and eight-hour stability acceptance.

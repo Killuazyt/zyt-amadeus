@@ -13,10 +13,17 @@ from copy import deepcopy
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
-from amadeus_desktop import __version__
+from amadeus_desktop.build_info import BuildInfo, BuildInfoError, load_build_info
 from amadeus_desktop.controller import ApplicationController
+from amadeus_desktop.credential_store import run_wincred_acceptance_probe
 from amadeus_desktop.data_management import DataManagementError, recover_interrupted_restore
+from amadeus_desktop.installation_mutex import InstallationMutex, InstallationMutexError
 from amadeus_desktop.logging_config import close_logger, configure_logging
+from amadeus_desktop.maintenance import (
+    UNINSTALL_DELETE_DATA_ARGUMENT,
+    MaintenanceError,
+    delete_all_local_data_for_uninstall,
+)
 from amadeus_desktop.paths import AppPaths
 from amadeus_desktop.settings import DEFAULT_SETTINGS, SettingsError, SettingsRepository
 from amadeus_desktop.single_instance import DEFAULT_SERVER_NAME, SingleInstance
@@ -24,10 +31,36 @@ from amadeus_desktop.single_instance import DEFAULT_SERVER_NAME, SingleInstance
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv if argv is None else argv)
+    internal_arguments = arguments[1:]
+    if any(value.startswith("--uninstall-cleanup") for value in internal_arguments):
+        if internal_arguments != [UNINSTALL_DELETE_DATA_ARGUMENT] or not _is_frozen():
+            return 6
+        return _run_uninstall_cleanup()
+    if any(value.startswith("--wincred-acceptance-probe") for value in internal_arguments):
+        probe_id = _wincred_acceptance_probe_id(internal_arguments)
+        if probe_id is None or not _is_frozen():
+            return 6
+        return int(not run_wincred_acceptance_probe(probe_id))
     if "--embedding-model-probe" in arguments[1:]:
         return _run_embedding_model_probe()
     if "--fts-degraded-probe" in arguments[1:]:
         return _run_fts_degraded_probe()
+    lifecycle_mutex = InstallationMutex()
+    try:
+        lifecycle_mutex.acquire()
+    except InstallationMutexError:
+        return 5
+    try:
+        try:
+            build_info = load_build_info()
+        except BuildInfoError:
+            return 5
+        return _run_application(arguments, build_info)
+    finally:
+        lifecycle_mutex.close()
+
+
+def _run_application(arguments: list[str], build_info: BuildInfo) -> int:
     mock_chat = "--mock-chat" in arguments[1:]
     auto_exit_ms = _auto_exit_delay(arguments[1:])
     embedding_lifecycle_mode = _embedding_lifecycle_mode(arguments[1:])
@@ -43,7 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     application = QApplication(qt_arguments)
     application.setApplicationName("Amadeus")
     application.setApplicationDisplayName("Amadeus")
-    application.setApplicationVersion(__version__)
+    application.setApplicationVersion(build_info.version)
     application.setOrganizationName("Amadeus")
     application.setQuitOnLastWindowClosed(False)
 
@@ -54,7 +87,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = AppPaths.for_current_user()
     paths.initialize()
     logger = configure_logging(paths.log_file)
-    logger.info("Application starting version=%s", __version__)
+    logger.info(
+        "Application starting version=%s commit_sha=%s build_date_utc=%s",
+        build_info.version,
+        build_info.commit_sha,
+        build_info.build_date_utc,
+    )
 
     try:
         restore_recovered = recover_interrupted_restore(paths)
@@ -90,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         status_message=status_message,
         mock_chat=mock_chat,
         allow_saved_provider=settings_trusted,
+        build_info=build_info,
     )
     if auto_exit_ms is not None:
         QTimer.singleShot(auto_exit_ms, controller.request_exit)
@@ -110,6 +149,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         return 3
     return exit_code
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _wincred_acceptance_probe_id(arguments: Sequence[str]) -> str | None:
+    if len(arguments) != 1:
+        return None
+    prefix = "--wincred-acceptance-probe="
+    value = arguments[0]
+    if not value.startswith(prefix):
+        return None
+    probe_id = value.removeprefix(prefix)
+    return probe_id if re.fullmatch(r"[0-9a-f]{32}", probe_id) is not None else None
+
+
+def _run_uninstall_cleanup() -> int:
+    try:
+        delete_all_local_data_for_uninstall()
+    except MaintenanceError:
+        return 6
+    return 0
 
 
 def _auto_exit_delay(arguments: Sequence[str]) -> int | None:
@@ -176,7 +238,7 @@ def _configure_embedding_lifecycle_probe(
     def status_changed(status: object) -> None:
         category = str(getattr(status, "category", ""))
         if category == "ready":
-            finish(mode == "ready")
+            finish(mode == "ready" and _ready_lifecycle_surface_is_valid(application, controller))
         elif category in failure_categories:
             finish(mode == "degraded")
 
@@ -186,6 +248,26 @@ def _configure_embedding_lifecycle_probe(
     # well as subsequent signals so a terminal state cannot be missed.
     status_changed(controller.vector_index.status)
     QTimer.singleShot(30_000, application, lambda: finish(False))
+
+
+def _ready_lifecycle_surface_is_valid(
+    application: QApplication,
+    controller: ApplicationController,
+) -> bool:
+    """Require the real Windows Sandbox probe to exercise public pet and tray assets."""
+
+    if application.platformName().casefold() != "windows":
+        return True
+    try:
+        tray = controller.tray
+        return bool(
+            tray is not None
+            and tray.is_visible
+            and controller.pet_window.isVisible()
+            and controller.pet_window.asset.manifest.pet_id == "builtin-amadeus"
+        )
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def _run_embedding_model_probe() -> int:

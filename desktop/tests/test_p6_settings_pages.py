@@ -110,7 +110,9 @@ def test_diagnostics_page_renders_allowlisted_metadata_and_redacts_raw_errors(qt
     qtbot.addWidget(page)
     page.set_diagnostics(
         {
-            "version": "0.6.0.dev6",
+            "version": "0.7.0.dev7",
+            "commit_sha": "a" * 40,
+            "build_date_utc": "2026-08-04",
             "settings_schema": 5,
             "database_schema": 3,
             "data_path": "C:/Users/test/AppData/Local/Amadeus",
@@ -134,6 +136,8 @@ def test_diagnostics_page_renders_allowlisted_metadata_and_redacts_raw_errors(qt
         label.text()
         for label in (
             page.version_value,
+            page.commit_value,
+            page.build_date_value,
             page.settings_schema_value,
             page.database_schema_value,
             page.data_path_value,
@@ -145,7 +149,9 @@ def test_diagnostics_page_renders_allowlisted_metadata_and_redacts_raw_errors(qt
             page.errors_value,
         )
     )
-    assert "0.6.0.dev6" in rendered
+    assert "0.7.0.dev7" in rendered
+    assert "a" * 40 in rendered
+    assert "2026-08-04" in rendered
     assert "C:/Users/test/AppData/Local/Amadeus" in rendered
     assert "12 条" in rendered and "7 条" in rendered
     assert "离线模型缺失" in rendered
@@ -162,7 +168,7 @@ def test_diagnostics_page_accepts_canonical_snapshot_without_guessing_counts(
     qtbot.addWidget(page)
     page.set_diagnostics(
         DiagnosticSnapshot(
-            app_version="0.6.0.dev6",
+            app_version="0.7.0.dev7",
             settings_schema=5,
             sqlite_schema=3,
             data_root=tmp_path,
@@ -175,7 +181,9 @@ def test_diagnostics_page_accepts_canonical_snapshot_without_guessing_counts(
         )
     )
 
-    assert page.version_value.text() == "0.6.0.dev6"
+    assert page.version_value.text() == "0.7.0.dev7"
+    assert page.commit_value.text() == "开发环境"
+    assert page.build_date_value.text() == "开发环境"
     assert page.database_schema_value.text() == "3"
     assert page.data_path_value.text() == str(tmp_path)
     assert page.database_state_value.text() == "只读"

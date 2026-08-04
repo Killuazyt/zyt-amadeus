@@ -275,4 +275,5 @@ def test_pyinstaller_spec_copies_only_allowlisted_model_files_and_notices() -> N
         'datas.append((str(model_directory), "amadeus_desktop/resources/embedding_model"))'
         not in source
     )
-    assert "P5B_THIRD_PARTY_NOTICES.txt" in source
+    assert "THIRD_PARTY_NOTICES.txt" not in source
+    assert '"resources" / "licenses"' in source

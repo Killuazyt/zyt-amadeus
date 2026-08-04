@@ -1,0 +1,49 @@
+Qt / PySide6 6.11.1 LGPL compliance information
+=================================================
+
+License choice
+--------------
+Amadeus Desktop Pet uses the Qt for Python Community Edition under the GNU
+Lesser General Public License version 3 only. The corresponding GNU GPLv3 text
+is included because LGPLv3 incorporates GPLv3 terms. No Qt source was modified.
+
+Dynamic linking and replacement
+-------------------------------
+Qt, PySide6, and Shiboken are distributed as separate DLL/PYD/plugin files under
+the installed application's _internal\PySide6 and _internal\shiboken6 paths.
+They are not statically linked into Amadeus.exe. A recipient may replace those
+files with ABI-compatible, user-built Qt for Python 6.11.1 libraries for the
+same Windows x64 and CPython 3.11 ABI. The installer and application impose no
+signature check or technical restriction on such replacement.
+
+You may reverse engineer the combined work to debug modifications to the LGPL
+libraries. This permission is not limited by the project license or installer.
+Keep a recoverable copy of the installed directory before replacing libraries.
+
+Exact corresponding source
+--------------------------
+PySide6 and Shiboken6 6.11.1 source (SHA-256 shown by the official mirror list):
+https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz
+SHA-256: 6ffd9835bb0dd2c56f061d62f1616bb1707cfc0202b80e3165d6be087f3965e2
+
+Qt 6.11.1 complete source (covers the qtbase, qtsvg, and qtimageformats
+libraries/plugins distributed by this build):
+https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz
+SHA-256: 252acef8c5ae68074d91cadba2ee4a83465051bbb970dd26e8f0daa0f3904e03
+
+The source archives contain the upstream build instructions and third-party
+notices. The wheel versions are fixed at 6.11.1 in requirements.lock.
+
+Written offer
+-------------
+For three years after distribution of this P7 build, Killuazyt offers any
+recipient the same corresponding Qt/PySide source on a durable medium for no
+more than the reasonable cost of physically providing it. Submit a written
+request at https://github.com/Killuazyt/zyt-amadeus/issues and identify
+"Amadeus Desktop Pet 0.7.0.dev7 / Qt for Python 6.11.1".
+
+License texts
+-------------
+LGPL-3.0.txt contains GNU LGPL version 3. GPL-3.0.txt contains GNU GPL version 3.
+The upstream Qt licensing overview is https://www.qt.io/licensing/ and Qt for
+Python documentation is https://doc.qt.io/qtforpython-6/.

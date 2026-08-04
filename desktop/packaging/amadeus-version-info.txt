@@ -1,0 +1,33 @@
+# UTF-8
+# PyInstaller Windows VERSIONINFO resource. Keep numeric fields aligned with
+# the P7 public version; build-installer.ps1 verifies the project version first.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 7, 0, 7),
+    prodvers=(0, 7, 0, 7),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [
+          StringStruct(u'CompanyName', u'Killuazyt'),
+          StringStruct(u'FileDescription', u'Amadeus Desktop Pet'),
+          StringStruct(u'FileVersion', u'0.7.0.dev7'),
+          StringStruct(u'InternalName', u'Amadeus'),
+          StringStruct(u'LegalCopyright', u'Copyright (c) 2026 Killuazyt'),
+          StringStruct(u'OriginalFilename', u'Amadeus.exe'),
+          StringStruct(u'ProductName', u'Amadeus Desktop Pet'),
+          StringStruct(u'ProductVersion', u'0.7.0.dev7')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)

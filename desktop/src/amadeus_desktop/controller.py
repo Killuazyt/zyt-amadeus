@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QSystemTra
 from amadeus_desktop import __version__
 from amadeus_desktop.autostart import AutostartError, AutostartManager
 from amadeus_desktop.background_generation import BackgroundGenerationRunner
+from amadeus_desktop.build_info import BuildInfo, load_build_info
 from amadeus_desktop.chat_geometry import calculate_chat_panel_placement
 from amadeus_desktop.chat_models import ConversationState
 from amadeus_desktop.chat_provider import (
@@ -141,6 +142,7 @@ class ApplicationController:
         clock: Callable[[], datetime] = _local_now,
         proactive_startup_delay_ms: int = 5_000,
         proactive_poll_interval_ms: int = 60_000,
+        build_info: BuildInfo | None = None,
     ) -> None:
         self.application = application
         self.instance_guard = instance_guard
@@ -148,6 +150,7 @@ class ApplicationController:
         self.paths = paths
         self.settings_repository = settings_repository
         self.settings = settings
+        self.build_info = build_info or load_build_info()
         self._clock = clock
         self._exiting = False
         self._shutdown_clean: bool | None = None
@@ -367,7 +370,9 @@ class ApplicationController:
         self._connect_settings_ui()
         self._connect_data_ui()
         self.diagnostic_service = DiagnosticStatusService(
-            app_version=__version__,
+            app_version=self.build_info.version,
+            commit_sha=self.build_info.commit_sha,
+            build_date_utc=self.build_info.build_date_utc,
             settings_schema=CURRENT_SCHEMA_VERSION,
             sqlite_schema=SCHEMA_VERSION,
             data_root=self.paths.root,
@@ -970,6 +975,8 @@ class ApplicationController:
         return "read_write" if self._data_writable else "read_only"
 
     def _refresh_diagnostics(self) -> None:
+        if self._exiting:
+            return
         self.diagnostics_page.set_diagnostics(self.diagnostic_service.snapshot())
 
     def _on_proactive_status(self, category: str) -> None:
@@ -1742,6 +1749,8 @@ class ApplicationController:
         self.memory_page.set_status(f"已加载 {len(snapshot_object.rows)} 条本地记忆。")
 
     def _on_vector_index_status_changed(self, status: object) -> None:
+        if self._exiting:
+            return
         available = bool(getattr(status, "available", False))
         category = str(getattr(status, "category", ""))
         if not available:
@@ -1759,6 +1768,8 @@ class ApplicationController:
             self.vector_index.refresh_incremental()
 
     def _queue_vector_index_status(self, status: object) -> None:
+        if self._exiting:
+            return
         QTimer.singleShot(
             0,
             self.application,
@@ -1766,6 +1777,8 @@ class ApplicationController:
         )
 
     def _on_vector_status_for_p6(self, status: object) -> None:
+        if self._exiting:
+            return
         category = str(getattr(status, "category", "unknown"))
         generation = getattr(status, "persona_generation_id", None)
         count = int(getattr(status, "persona_count", 0))
@@ -1775,6 +1788,20 @@ class ApplicationController:
         if safe_error:
             self._last_safe_error_category = safe_error
         self._refresh_diagnostics()
+
+    def _disconnect_vector_status_ui(self) -> None:
+        """Stop shutdown-time status emissions from entering Qt widgets."""
+
+        for callback in (
+            self.memory_page.set_retrieval_status,
+            self._queue_vector_index_status,
+            self._on_vector_status_for_p6,
+        ):
+            try:
+                self.vector_index.status_changed.disconnect(callback)
+            except (RuntimeError, TypeError):
+                # Shutdown is idempotent and a callback may already be disconnected.
+                continue
 
     def _verify_local_embedding_model(self) -> None:
         self.memory_page.set_status("正在后台验证本地模型。")
@@ -2624,6 +2651,7 @@ class ApplicationController:
         self._proactive_pause_retry_timer.stop()
         self._foreground_lane_timer.stop()
         self._pending_foreground_action = None
+        self._disconnect_vector_status_ui()
         self.data_service.stop_prompt_preparations()
         total_ms = max(0, timeout_ms)
         deadline = time.monotonic() + total_ms / 1_000

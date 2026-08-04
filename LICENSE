@@ -1,30 +1,6 @@
-Amadeus P5B third-party notices
-================================
-
-FastEmbed 0.8.0
-Source: https://github.com/qdrant/fastembed/tree/v0.8.0
-License: Apache License 2.0
-
-ONNX Runtime 1.24.4
-Source: https://github.com/microsoft/onnxruntime
-License: MIT
-
-NumPy 2.4.2
-Source: https://github.com/numpy/numpy
-License: BSD-3-Clause
-
-PyInstaller 6.21.0 and pyinstaller-hooks-contrib 2026.6
-Sources: https://github.com/pyinstaller/pyinstaller and
-https://github.com/pyinstaller/pyinstaller-hooks-contrib
-License: GPL-2.0-or-later; PyInstaller's bootloader exception permits
-distribution of applications produced with PyInstaller.
-
-BAAI bge-small-zh-v1.5, converted and distributed by Qdrant
-Logical model: https://huggingface.co/BAAI/bge-small-zh-v1.5
-Fixed ONNX source: https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59
-License: MIT
-
 MIT License
+
+Copyright (c) 2026 Killuazyt
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -2,7 +2,7 @@
 
 Amadeus is being rebuilt as a Windows 10/11 x64 desktop pet using Python 3.11 and PySide6. The active MVP uses one local desktop process and does not require Electron, Node, a browser UI, a local HTTP service, or WebRTC.
 
-The canonical `main` branch contains the P1 application foundation, the P2 desktop-pet engine, the P3 attached chat flow, the P4 secure text-model integration, P5 local conversations plus auditable hybrid memory, and the P6 settings/tray/proactive-interaction closure. The pet supports safe local resource import and switching, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, complete tray controls, and a compact cancellable streaming chat panel.
+The canonical `main` branch contains the P1 application foundation, the P2 desktop-pet engine, the P3 attached chat flow, the P4 secure text-model integration, P5 local conversations plus auditable hybrid memory, the P6 settings/tray/proactive-interaction closure, and the P7 Windows packaging and migration-audit infrastructure. The pet supports safe local resource import and switching, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, complete tray controls, and a compact cancellable streaming chat panel.
 
 P4 supports DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom OpenAI-compatible HTTPS endpoint. API credentials are stored only in Windows Credential Manager. P5/P6 persist chat history, proactive-message origin, immutable user-memory versions, provenance, recall events, isolated local persona knowledge, and an interaction event ledger in SQLite schema v3. Recall combines injection-safe Chinese FTS5 with an explicitly prepared, CPU-only `BAAI/bge-small-zh-v1.5` model; a missing or invalid model degrades immediately to FTS5 without networking. P6 adds a single-instance eight-page settings center, exact eight-item tray, verified HKCU startup control, restrained local greetings, versioned JSON exports, consistent single-file backup/restore, diagnostics, and fail-closed factory reset. Speech, screen observation, tool execution, and autonomous desktop actions are not included.
 
@@ -40,7 +40,31 @@ Local persona knowledge is imported from `%LOCALAPPDATA%\Amadeus\personas\kurisu
 .\.venv\Scripts\amadeus-persona.exe import
 ```
 
-Wheels, source distributions, and the default CI onedir contain neither the embedding model nor local persona/user data. `scripts\build-onedir.ps1 -Mode Bundled` is an explicit local-only smoke mode for the verified public model; it is not an installer, and installer work remains P7 scope.
+Wheels, source distributions, and the Degraded onedir contain neither the embedding model nor local persona/user data. The P7 installer is built only from the Bundled PyInstaller onedir after the fixed public model, privacy scan, archive tags, and release-license closure pass verification.
+
+## P7 packaging and clean-machine acceptance
+
+Install the official Inno Setup 6.7.3 compiler, stop Amadeus, and run these commands from `desktop`. The installer build requires a clean Git tree and records the exact commit in the packaged diagnostics metadata.
+
+```powershell
+$modelPath = Join-Path $env:LOCALAPPDATA 'Amadeus\models\bge-small-zh-v1.5\46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59'
+.\scripts\audit-legacy.ps1
+.\scripts\check-release-licenses.ps1
+.\scripts\build-installer.ps1 -ModelPath $modelPath
+```
+
+The unsigned P7 test installer and its SHA-256 manifest are written to `desktop\build\installer`. Build the lower-version acceptance baseline and launch the offline Windows Sandbox matrix with:
+
+```powershell
+.\scripts\build-installer.ps1 -ModelPath $modelPath -BuildAcceptanceBaseline
+.\scripts\start-sandbox-acceptance.ps1 `
+    -InstallerPath .\build\installer\Amadeus-0.7.0.dev7-win64-setup.exe `
+    -BaselineInstallerPath .\build\installer\Amadeus-0.6.0.dev6-win64-acceptance-baseline-setup.exe
+```
+
+The Sandbox run covers install, lower-version upgrade, default data-preserving uninstall, explicit delete-data uninstall, lifecycle mutexes, and a user-local path containing Chinese characters and spaces. Its committed template disables networking and maps only read-only installers plus a writable aggregate-result folder. Evidence contains hashes, statuses, and counts only.
+
+P7 deliberately does not import the legacy Chromium `localStorage`, old `.env` secrets, Token Plan endpoints, or old character prompts. Default uninstall removes the program, shortcuts, uninstall entry, and HKCU startup value while preserving `%LOCALAPPDATA%\Amadeus` and Windows Credential Manager; `/DELETEUSERDATA=1` explicitly requests the fail-closed seven-region cleanup. P7 artifacts are unsigned test builds, so SmartScreen reputation warnings remain expected. P8 still owns code signing decisions, the physical 100%/150% and mixed-DPI multi-monitor matrix, three days of daily use, and the eight-hour stability run.
 
 P5B acceptance distinguishes the lower-level vector-cache benchmark from the complete production
 retrieval chain. Run `amadeus-embedding-acceptance production-benchmark` for the 10,000-memory,

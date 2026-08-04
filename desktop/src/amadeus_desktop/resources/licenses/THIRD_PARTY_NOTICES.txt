@@ -1,0 +1,77 @@
+Amadeus Desktop Pet 0.7.0.dev7 third-party notices
+==================================================
+
+This public Windows build contains the components listed below. Exact Python
+distribution license files and notices are retained inside their packaged
+*.dist-info metadata. The machine-readable authoritative inventory is
+runtime-license-manifest.json. License expressions below describe the license
+chosen for this distribution; upstream files remain authoritative.
+
+Runtime and packaging components
+--------------------------------
+Python 3.11.x | PSF-2.0 | https://www.python.org/downloads/source/
+PyInstaller bootloader 6.21.0 | GPL-2.0-or-later WITH Bootloader-exception | https://github.com/pyinstaller/pyinstaller/tree/v6.21.0
+Microsoft Visual C++ Runtime 14.x | Microsoft redistributable terms | https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/
+Inno Setup 6.7.3 | Inno Setup License | https://jrsoftware.org/isinfo.php
+
+The complete PyInstaller terms and bootloader exception are provided in
+PYINSTALLER_COPYING.txt. The complete Inno Setup terms are in
+INNO_SETUP_LICENSE.txt.
+
+Python runtime distributions
+----------------------------
+anyio 4.14.2 | MIT | https://github.com/agronholm/anyio
+certifi 2026.7.22 | MPL-2.0 | https://github.com/certifi/python-certifi
+charset-normalizer 3.4.9 | MIT | https://github.com/jawah/charset_normalizer
+click 8.4.2 | BSD-3-Clause | https://github.com/pallets/click
+colorama 0.4.6 | BSD-3-Clause | https://github.com/tartley/colorama
+fastembed 0.8.0 | Apache-2.0 | https://github.com/qdrant/fastembed/tree/v0.8.0
+filelock 3.32.2 | MIT | https://github.com/tox-dev/py-filelock
+flatbuffers 25.12.19 | Apache-2.0 | https://github.com/google/flatbuffers
+fsspec 2026.7.0 | BSD-3-Clause | https://github.com/fsspec/filesystem_spec
+h11 0.16.0 | MIT | https://github.com/python-hyper/h11
+hf-xet 1.5.2 | Apache-2.0 | https://github.com/huggingface/xet-core
+httpcore 1.0.9 | BSD-3-Clause | https://github.com/encode/httpcore
+httpx 0.28.1 | BSD-3-Clause | https://github.com/encode/httpx
+huggingface-hub 1.26.0 | Apache-2.0 | https://github.com/huggingface/huggingface_hub
+idna 3.18 | BSD-3-Clause | https://github.com/kjd/idna
+loguru 0.7.3 | MIT | https://github.com/Delgan/loguru
+mmh3 5.2.1 | MIT | https://github.com/hajimes/mmh3
+mpmath 1.3.0 | BSD-3-Clause | https://github.com/mpmath/mpmath
+numpy 2.4.2 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | https://github.com/numpy/numpy/tree/v2.4.2
+onnxruntime 1.24.4 | MIT | https://github.com/microsoft/onnxruntime/tree/v1.24.4
+packaging 26.2 | Apache-2.0 OR BSD-2-Clause | https://github.com/pypa/packaging
+pillow 12.3.0 | MIT-CMU | https://github.com/python-pillow/Pillow/tree/12.3.0
+protobuf 7.35.1 | BSD-3-Clause | https://github.com/protocolbuffers/protobuf
+py-rust-stemmers 0.1.8 | MIT | https://pypi.org/project/py-rust-stemmers/0.1.8/
+pyside6 6.11.1 | LGPL-3.0-only | https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/
+pyside6-addons 6.11.1 | LGPL-3.0-only | https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/
+pyside6-essentials 6.11.1 | LGPL-3.0-only | https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/
+pywin32 312 | PSF-2.0 | https://github.com/mhammond/pywin32/tree/b312
+pyyaml 6.0.3 | MIT | https://github.com/yaml/pyyaml/tree/6.0.3
+requests 2.34.2 | Apache-2.0 | https://github.com/psf/requests
+shiboken6 6.11.1 | LGPL-3.0-only | https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/
+sympy 1.14.0 | BSD-3-Clause | https://github.com/sympy/sympy/tree/1.14.0
+tokenizers 0.23.1 | Apache-2.0 | https://github.com/huggingface/tokenizers
+tqdm 4.70.0 | MPL-2.0 AND MIT | https://github.com/tqdm/tqdm/tree/v4.70.0
+typing-extensions 4.16.0 | PSF-2.0 | https://github.com/python/typing_extensions/tree/4.16.0
+urllib3 2.7.0 | MIT | https://github.com/urllib3/urllib3/tree/2.7.0
+win32-setctime 1.2.0 | MIT | https://github.com/Delgan/win32-setctime/tree/1.2.0
+
+Qt / PySide6
+------------
+The build selects LGPL-3.0-only for PySide6, PySide6 Essentials/Addons,
+Shiboken6, and the Qt libraries actually distributed. Amadeus dynamically
+loads Qt DLLs and does not ship the optional PDF or virtual-keyboard plugins.
+See QT_LGPL_COMPLIANCE.txt, LGPL-3.0.txt, and GPL-3.0.txt for source, replacement,
+reverse-engineering, and written-offer information.
+
+Public model and artwork
+------------------------
+Qdrant bge-small-zh-v1.5 ONNX bundle, revision
+46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59 | MIT |
+https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59
+
+The built-in generic robot spritesheet and the Windows icon derived from its
+first frame are dedicated under CC0-1.0. See CC0-1.0.txt and the built-in pet
+LICENSE.txt. No private character artwork is part of the public build.
