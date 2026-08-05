@@ -16,6 +16,6 @@
     </MappedFolder>
   </MappedFolders>
   <LogonCommand>
-    <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\AmadeusP7\Input\accept-installer-sandbox.ps1 -InstallerPath C:\AmadeusP7\Input\current-setup.exe -BaselineInstallerPath C:\AmadeusP7\Input\baseline-setup.exe -OutputPath C:\AmadeusP7\Output\acceptance-summary.json</Command>
+    <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\AmadeusP7\Input\accept-installer-sandbox.ps1 -InstallerPath C:\AmadeusP7\Input\current-setup.exe -BaselineInstallerPath C:\AmadeusP7\Input\baseline-setup.exe -ExpectedBuildInfoPath C:\AmadeusP7\Input\expected-build-info.json -OutputPath C:\AmadeusP7\Output\acceptance-summary.json</Command>
   </LogonCommand>
 </Configuration>

@@ -114,15 +114,133 @@ def test_installer_build_script_has_formal_and_acceptance_outputs() -> None:
     assert "Compiler engine version: Inno Setup 6\\.7\\.3" in source
 
 
-def test_sandbox_acceptance_requires_microsoft_defender_installer_scan() -> None:
+def test_sandbox_defender_is_the_only_elevated_fixed_path_helper() -> None:
+    main = (DESKTOP_ROOT / "scripts" / "accept-installer-sandbox.ps1").read_text(encoding="utf-8")
+    helper = (DESKTOP_ROOT / "scripts" / "invoke-sandbox-defender.ps1").read_text(encoding="utf-8")
+
+    assert main.count("-Verb RunAs") == 1
+    assert "Invoke-ElevatedDefenderAcceptance" in main
+    assert "defender_execution_identity_invalid" in main
+    assert "Assert-NonElevatedToken" in main
+    assert "MpCmdRun.exe" not in main
+    assert "Get-MpComputerStatus" not in main
+    assert "WaitForExit(1500000)" in main
+    for marker in (
+        "param()",
+        "$InstallerPath = 'C:\\AmadeusP7\\Input\\current-setup.exe'",
+        "$EvidencePath = 'C:\\AmadeusP7\\Output\\defender-evidence.json'",
+        "Programs\\Amadeus",
+        "AmadeusP7ElevatedTokenEvidence",
+        "integrity_not_high",
+        "Get-AuthenticodeSignature -LiteralPath $scanner",
+        "Get-MpComputerStatus -ErrorAction Stop",
+        "@('-Scan', '-ScanType', '3', '-File', $TargetPath, '-DisableRemediation')",
+        "remediation_disabled = $true",
+        "target_digest_verified_after_scan = $targetDigestStable",
+        "target_changed_during_scan",
+        "return ,$keys",
+        "Get-PayloadDigest -Root $TargetPath",
+        "amadeus-p7-sandbox-defender/v1",
+    ):
+        assert marker in helper
+    assert "Invoke-Installer" not in helper
+    assert "Invoke-Uninstaller" not in helper
+    assert "Remove-Item" not in helper
+    assert main.index("fresh_current_enabled_autostart_by_default") < main.index("# Upgrade case 1")
+    assert main.index(
+        "Assert-InstalledPrivacyAndModelBoundary -InstallRoot $freshCurrent.InstallLocation"
+    ) < main.index("Invoke-ElevatedDefenderAcceptance `")
+
+
+def test_sandbox_acceptance_hardens_identity_runtime_upgrade_and_sqlite_fts() -> None:
     source = (DESKTOP_ROOT / "scripts" / "accept-installer-sandbox.ps1").read_text(encoding="utf-8")
 
-    assert "Get-AuthenticodeSignature -LiteralPath $scanner" in source
-    assert "Get-MpComputerStatus" in source
-    assert "@('-Scan', '-ScanType', '3', '-File', $TargetPath)" in source
-    assert "defender_installer_scan_failed" in source
-    assert "antivirus_signature_version" in source
-    assert "defender = $script:DefenderEvidence" in source
+    for marker in (
+        "AmadeusP7TokenEvidence",
+        "ReadIntegrityRid",
+        "is_administrator_role",
+        "sandbox_token_is_elevated",
+        "sandbox_token_integrity_not_medium",
+        "forbidden_runtime_detection_count",
+        "Get-Command $commandName -All -CommandType Application",
+        "$item.PSObject.Properties['DisplayName']",
+        "Programs\\Python",
+        "Programs\\nodejs",
+        "app_execution_alias_count",
+        "upgrade_disabled_enabled_autostart_choice",
+        "upgrade_overrode_disabled_autostart_choice",
+        "credential_not_restored_after_reinstall",
+        "credential_not_preserved_after_reinstall_lifecycle",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS p7_acceptance_fts",
+        "p7_acceptance_fts MATCH 'marker:",
+        "sqlite3_initialize()",
+        "SetErrorMode(0x0001u | 0x0002u | 0x8000u)",
+        "_internal\\vcruntime140.dll",
+        "dependency_sha256",
+        "Invoke-SqliteFixtureProbe -Mode verify",
+        "$script:SqliteEvidence['fixture_row_count'] = 1",
+        "$script:SqliteEvidence['fts_match_count'] = 1",
+        "application_shortcut_count",
+        "uninstall_shortcut_count",
+        "installed_scan_credential_pattern",
+        "installed_scan_unauthorized_character_asset",
+        "installed_scan_model_bundle_incomplete",
+        "Assert-InstalledBuildInfo",
+        "fresh_current_enabled_autostart_by_default",
+        "fresh_current_data_region_not_removed",
+        "amadeus-p7-sandbox-acceptance/v2",
+    ):
+        assert marker in source
+    assert "'(?:sk|tp)-[A-Za-z0-9_-]{24,}'" in source
+    assert "'(?i)(?:sk|tp)-[A-Za-z0-9_-]{24,}'" not in source
+    assert "Get-ItemPropertyValue -LiteralPath $key.PSPath -Name DisplayName" not in source
+    installer_source = source[
+        source.index("function Invoke-Installer") : source.index("function Get-InstallRecords")
+    ]
+    uninstaller_source = source[
+        source.index("function Invoke-Uninstaller") : source.index(
+            "function Wait-UninstallCompletion"
+        )
+    ]
+    assert "RunAs" not in installer_source
+    assert "RunAs" not in uninstaller_source
+    assert "database_sha256" not in source
+    assert "forbidden_runtime_product_count = 0" not in source
+
+
+def test_sandbox_host_v2_fail_closed_contract_and_build_identity_handoff() -> None:
+    source = (DESKTOP_ROOT / "scripts" / "start-sandbox-acceptance.ps1").read_text(encoding="utf-8")
+    template = (PACKAGING_ROOT / "windows-sandbox" / "p7-acceptance.wsb.template").read_text(
+        encoding="utf-8"
+    )
+
+    for marker in (
+        "expected-build-info.json",
+        "invoke-sandbox-defender.ps1",
+        "sandbox_acceptance_git_worktree_dirty",
+        "sandbox_acceptance_build_info_not_current_head",
+        "amadeus-p7-sandbox-acceptance/v2",
+        "sandbox_acceptance_execution_identity_invalid",
+        "sandbox_acceptance_runtime_evidence_invalid",
+        "sandbox_acceptance_build_identity_mismatch",
+        "summary.defender.current_installer",
+        "summary.defender.installed_directory",
+        "summary.defender.execution_identity.integrity_level",
+        "summary.defender.product_status.scanner_publisher",
+        "defender-evidence.json",
+        "sandbox_acceptance_defender_evidence_copy_mismatch",
+        "sandbox_acceptance_defender_evidence_invalid",
+        "sandbox_acceptance_installed_payload_scan_invalid",
+        "sandbox_acceptance_sqlite_fixture_invalid",
+        "sandbox_acceptance_shortcut_evidence_invalid",
+        "WaitForExit(3600000)",
+        "sandbox-host-summary.json.tmp",
+        "[IO.File]::Move($hostSummaryTemporaryPath, $hostSummaryPath)",
+        "amadeus-p7-sandbox-host/v2",
+    ):
+        assert marker in source
+    assert "RunAs" not in source
+    assert "-ExpectedBuildInfoPath C:\\AmadeusP7\\Input\\expected-build-info.json" in template
 
 
 def test_onedir_build_reads_back_exact_git_and_windows_version_identity() -> None:
