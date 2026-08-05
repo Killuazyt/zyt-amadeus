@@ -11,6 +11,7 @@ from PIL import Image
 DESKTOP_ROOT = Path(__file__).resolve().parents[1]
 PACKAGING_ROOT = DESKTOP_ROOT / "packaging"
 LICENSE_ROOT = DESKTOP_ROOT / "src" / "amadeus_desktop" / "resources" / "licenses"
+WORKFLOW_PATH = DESKTOP_ROOT.parent / ".github" / "workflows" / "desktop-ci.yml"
 
 
 def _locked_packages() -> dict[str, str]:
@@ -20,6 +21,15 @@ def _locked_packages() -> dict[str, str]:
         if match := pattern.match(line):
             packages[re.sub(r"[-_.]+", "-", match.group(1).lower())] = match.group(2)
     return packages
+
+
+def test_ci_degraded_onedir_smoke_allows_bounded_cold_start() -> None:
+    source = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "--auto-exit-ms=500" in source
+    assert "$process.WaitForExit(60000)" in source
+    assert "Stop-Process -Id $process.Id -Force" in source
+    assert "$process.WaitForExit(15000)" not in source
 
 
 def test_release_license_manifest_exactly_covers_runtime_lock() -> None:

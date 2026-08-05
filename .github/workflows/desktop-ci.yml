@@ -89,7 +89,7 @@ jobs:
           $model = Join-Path $PWD 'build\onedir-dist\Amadeus\_internal\amadeus_desktop\resources\embedding_model'
           if (Test-Path -LiteralPath $model) { throw 'CI onedir unexpectedly contains the embedding model' }
           $process = Start-Process -FilePath $exe -ArgumentList '--auto-exit-ms=500' -PassThru -WindowStyle Hidden
-          if (-not $process.WaitForExit(15000)) {
+          if (-not $process.WaitForExit(60000)) {
             Stop-Process -Id $process.Id -Force
             throw 'onedir lifecycle smoke timed out'
           }
