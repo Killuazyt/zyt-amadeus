@@ -5,7 +5,7 @@ acceptance workflow on top of the complete P6 settings, tray, proactive-interact
 closure and the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
 text-model integration, and P5 auditable hybrid memory. The application includes safe local pet
 import/switch/removal, fixed-clock animation, transparent hit testing, manual drag placement,
-multi-screen recovery, a bundled CC0 placeholder pet, cancellable chat states, and an exact
+multi-screen recovery, the pinned P7A built-in Kurisu spritesheet, cancellable chat states, and an exact
 eight-item system tray.
 
 P4 provides DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom HTTPS provider. API
@@ -28,7 +28,7 @@ Run these commands from PowerShell:
 .\scripts\build.ps1
 ```
 
-Import the local transitional pet while Amadeus is fully stopped:
+Import an additional local pet while Amadeus is fully stopped:
 
 ```powershell
 .\scripts\import-pet.ps1 -Path 'D:\path\to\pet.codex-pet'
@@ -102,10 +102,18 @@ revalidation, RRF/quality/decay fusion, and final prompt budgeting. It fails on 
 recall, corpus mixing, leaked runtime/SQLite handles, or p95 above 300 ms.
 
 Wheel, sdist, and Degraded onedir outputs exclude the model, persona material, databases, and logs.
+They include the byte-identical P7A built-in lossless WebP at SHA-256
+`0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d`.
 Degraded mode proves packaged FTS recall and a model-missing lifecycle. Bundled mode accepts only the
 fixed verified public model, proves offline 512-D inference plus a model-ready full lifecycle, and is
 the sole onedir input accepted by the P7 installer build. Both modes reject child processes, TCP
-connections/listeners, unsafe assets, secrets, databases, logs, and unexpected model files.
+connections/listeners, media outside the exact built-in/icon hash allowlist, secrets, databases,
+logs, and unexpected model files.
+
+The built-in Kurisu source manifest did not declare an author, source, or license. Its packaged
+status is `NOASSERTION`; user approval to include it is recorded separately from third-party rights,
+which were not independently verified. See `resources\licenses\KURISU-ASSET-NOTICE.txt`. CC0 applies
+only to the independent generic application-icon source and derived Windows icon.
 
 ## P7 installer
 

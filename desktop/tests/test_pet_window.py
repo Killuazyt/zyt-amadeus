@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QImage, QMouseEvent
 
 from amadeus_desktop.pet_assets import PetAssetService
 from amadeus_desktop.ui.pet_window import PetWindow
@@ -48,6 +48,25 @@ def test_window_flags_and_alpha_hit_region(qapp, qtbot, tmp_path) -> None:
     assert window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     assert window.mask().contains(QPoint(window.width() // 2, round(window.height() * 0.65)))
     assert not window.mask().contains(QPoint(0, 0))
+
+
+def test_builtin_frame_is_pixel_exact_at_one_hundred_percent(qapp, qtbot, tmp_path) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+
+    source = window._source_frame(window.current_frame).convertToFormat(
+        QImage.Format.Format_RGBA8888
+    )
+    rendered_image = window._render_image(window.current_frame).convertToFormat(
+        QImage.Format.Format_RGBA8888
+    )
+
+    assert window.scale_percent == 100
+    assert (window.width(), window.height()) == (192, 208)
+    assert (source.width(), source.height()) == (192, 208)
+    assert rendered_image.size() == source.size()
+    assert rendered_image.bytesPerLine() == source.bytesPerLine()
+    assert rendered_image.constBits().tobytes() == source.constBits().tobytes()
 
 
 def test_show_starts_and_hide_pauses_animation(qapp, qtbot, tmp_path) -> None:

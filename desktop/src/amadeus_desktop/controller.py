@@ -221,7 +221,7 @@ class ApplicationController:
             candidate["pet"]["active_pet_id"] = asset.manifest.pet_id
             self._save_settings(candidate, category="pet_fallback")
             pet_settings = self.settings["pet"]
-            fallback_message = "当前桌宠资源不可用，已安全回退到内置通用宠物。"
+            fallback_message = "当前桌宠资源不可用，已安全回退到内置默认宠物。"
             status_message = (
                 f"{status_message}\n{fallback_message}" if status_message else fallback_message
             )

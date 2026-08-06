@@ -49,6 +49,7 @@
     {"name": "Microsoft Visual C++ Runtime", "version": "14.x", "license": "Microsoft Visual C++ Redistributable", "source": "https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/"},
     {"name": "Inno Setup", "version": "6.7.3", "license": "Inno Setup License", "source": "https://jrsoftware.org/isinfo.php"},
     {"name": "Qdrant bge-small-zh-v1.5 ONNX bundle", "version": "46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59", "license": "MIT", "source": "https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59"},
-    {"name": "Amadeus generic pet and derived icon", "version": "1", "license": "CC0-1.0", "source": "scripts/generate_builtin_pet.py and scripts/generate_app_icon.py"}
+    {"name": "Amadeus generic application icon source and derived icon", "version": "1", "license": "CC0-1.0", "source": "scripts/generate_builtin_pet.py and scripts/generate_app_icon.py"},
+    {"name": "Amadeus built-in Kurisu spritesheet", "version": "sha256:0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d", "license": "NOASSERTION", "source": "resources/builtin_pet/LICENSE.txt"}
   ]
 }

@@ -170,18 +170,26 @@ class PetWindow(QWidget):
             spec.frame_height,
         )
 
+    def _render_image(self, frame: FrameCoordinate) -> QImage:
+        """Return the source frame unchanged when the requested size is native."""
+
+        source = self._source_frame(frame)
+        if source.size() == self.size():
+            return source
+        return source.scaled(
+            self.size(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
     def _rendered_frame(self, frame: FrameCoordinate) -> tuple[QPixmap, QRegion]:
         key = (frame, self.scale_percent)
         cached = self._frame_cache.get(key)
         if cached is not None:
             return cached
-        scaled = self._source_frame(frame).scaled(
-            self.size(),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        pixmap = QPixmap.fromImage(scaled)
-        region = self._alpha_region(scaled)
+        rendered_image = self._render_image(frame)
+        pixmap = QPixmap.fromImage(rendered_image)
+        region = self._alpha_region(rendered_image)
         rendered = (pixmap, region)
         self._frame_cache[key] = rendered
         return rendered

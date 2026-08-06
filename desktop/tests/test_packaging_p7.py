@@ -4,6 +4,9 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
@@ -66,6 +69,84 @@ def test_release_notices_include_qt_compliance_and_canonical_license_texts() -> 
         encoding="utf-8"
     )
     assert "Inno Setup" in (LICENSE_ROOT / "INNO_SETUP_LICENSE.txt").read_text(encoding="utf-8")
+
+
+def test_builtin_kurisu_packaging_pins_webp_notice_and_license_manifest() -> None:
+    expected_hash = "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+    pyproject = (DESKTOP_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    notice = (LICENSE_ROOT / "KURISU-ASSET-NOTICE.txt").read_text(encoding="utf-8")
+    manifest = json.loads(
+        (LICENSE_ROOT / "runtime-license-manifest.json").read_text(encoding="utf-8")
+    )
+    components = {entry["name"]: entry for entry in manifest["bundled_components"]}
+
+    assert '"resources/builtin_pet/*.webp"' in pyproject
+    assert '"resources/licenses/*.txt"' in pyproject
+    assert expected_hash in notice
+    assert "NOASSERTION" in notice
+    assert components["Amadeus built-in Kurisu spritesheet"] == {
+        "name": "Amadeus built-in Kurisu spritesheet",
+        "version": f"sha256:{expected_hash}",
+        "license": "NOASSERTION",
+        "source": "resources/builtin_pet/LICENSE.txt",
+    }
+
+
+def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Path) -> None:
+    package_root = DESKTOP_ROOT / "src" / "amadeus_desktop"
+    relative_files = (
+        "resources/app_icon/LICENSE.txt",
+        "resources/app_icon/spritesheet.png",
+        "resources/builtin_pet/LICENSE.txt",
+        "resources/builtin_pet/pet.amadeus.json",
+        "resources/builtin_pet/spritesheet.webp",
+        "resources/licenses/CC0-1.0.txt",
+        "resources/licenses/KURISU-ASSET-NOTICE.txt",
+        "resources/licenses/runtime-license-manifest.json",
+    )
+    wheel = tmp_path / "amadeus_desktop-0.7.0.dev7-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for relative in relative_files:
+            archive.write(package_root / relative, f"amadeus_desktop/{relative}")
+
+    sdist = tmp_path / "amadeus_desktop-0.7.0.dev7.tar.gz"
+    with tarfile.open(sdist, "w:gz") as archive:
+        for relative in relative_files:
+            payload = (package_root / relative).read_bytes()
+            member = tarfile.TarInfo(f"amadeus_desktop-0.7.0.dev7/src/amadeus_desktop/{relative}")
+            member.size = len(payload)
+            archive.addfile(member, BytesIO(payload))
+
+    command = (
+        sys.executable,
+        str(DESKTOP_ROOT / "scripts" / "check_python_package_assets.py"),
+        "--dist",
+        str(tmp_path),
+    )
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert json.loads(completed.stdout)["status"] == "passed"
+    assert "python scripts/check_python_package_assets.py --dist dist" in WORKFLOW_PATH.read_text(
+        encoding="utf-8"
+    )
+
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for relative in relative_files:
+            payload = (package_root / relative).read_bytes()
+            if relative == "resources/builtin_pet/spritesheet.webp":
+                payload += b"tampered"
+            archive.writestr(f"amadeus_desktop/{relative}", payload)
+    failed = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert failed.returncode == 1
+    assert json.loads(failed.stdout)["status"] == "failed"
+    assert "built-in pet hash is invalid" in failed.stdout
 
 
 def test_pyinstaller_spec_has_p7_resources_and_excludes_unselected_qt_plugins() -> None:
@@ -359,9 +440,7 @@ def test_payload_manifest_is_generated_and_detects_changes(tmp_path: Path) -> No
 
 
 def test_cc0_icon_generator_produces_multisize_windows_icon(tmp_path: Path) -> None:
-    source = (
-        DESKTOP_ROOT / "src" / "amadeus_desktop" / "resources" / "builtin_pet" / "spritesheet.png"
-    )
+    source = DESKTOP_ROOT / "src" / "amadeus_desktop" / "resources" / "app_icon" / "spritesheet.png"
     output = tmp_path / "amadeus.ico"
     completed = subprocess.run(
         (

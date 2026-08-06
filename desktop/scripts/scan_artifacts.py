@@ -28,8 +28,14 @@ LOCAL_TOOL_CACHE_DIRS = frozenset(
 PRIVATE_MEDIA_SUFFIXES = frozenset(
     {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".wav", ".mp3", ".flac"}
 )
-PUBLIC_BUILTIN_SHEET = "amadeus_desktop/resources/builtin_pet/spritesheet.png"
-PUBLIC_BUILTIN_SHEET_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
+APPROVED_MEDIA_SHA256 = {
+    "amadeus_desktop/resources/builtin_pet/spritesheet.webp": (
+        "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+    ),
+    "amadeus_desktop/resources/app_icon/spritesheet.png": (
+        "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
+    ),
+}
 SECRET_PATTERNS = (
     re.compile(rb"(?:sk|tp)-[A-Za-z0-9_-]{24,}"),
     re.compile(rb"(?i)authorization\s*:\s*bearer\s+[A-Za-z0-9._-]{20,}"),
@@ -153,8 +159,19 @@ def _inspect(
     if "/personas/" in f"/{normalized}":
         violations["private_persona_data"] += 1
     if suffix in PRIVATE_MEDIA_SUFFIXES:
-        public_sheet = PUBLIC_BUILTIN_SHEET in normalized
-        if not public_sheet or hashlib.sha256(payload).hexdigest() != PUBLIC_BUILTIN_SHEET_SHA256:
+        expected_media_hash = next(
+            (
+                expected_hash
+                for approved_path, expected_hash in APPROVED_MEDIA_SHA256.items()
+                if normalized == approved_path
+                or normalized.endswith((f"/{approved_path}", f"!{approved_path}"))
+            ),
+            None,
+        )
+        if (
+            expected_media_hash is None
+            or hashlib.sha256(payload).hexdigest() != expected_media_hash
+        ):
             violations["unauthorized_character_asset"] += 1
     is_embedding_model_file = "embedding_model" in path.parts
     if is_embedding_model_file:

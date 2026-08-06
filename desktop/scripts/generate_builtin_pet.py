@@ -1,4 +1,4 @@
-"""Generate the deterministic CC0 placeholder desktop-pet spritesheet."""
+"""Generate the deterministic CC0 application-icon source spritesheet."""
 
 from __future__ import annotations
 
@@ -125,7 +125,7 @@ def main() -> int:
         / "src"
         / "amadeus_desktop"
         / "resources"
-        / "builtin_pet"
+        / "app_icon"
         / "spritesheet.png"
     )
     output.parent.mkdir(parents=True, exist_ok=True)

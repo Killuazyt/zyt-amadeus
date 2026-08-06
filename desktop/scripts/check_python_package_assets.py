@@ -1,0 +1,157 @@
+"""Verify pinned public media and notices in built wheel and source archives."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import tarfile
+import zipfile
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image
+
+KURISU_SHA256 = "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+ICON_SOURCE_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
+REQUIRED_FILES = (
+    "resources/app_icon/LICENSE.txt",
+    "resources/app_icon/spritesheet.png",
+    "resources/builtin_pet/LICENSE.txt",
+    "resources/builtin_pet/pet.amadeus.json",
+    "resources/builtin_pet/spritesheet.webp",
+    "resources/licenses/CC0-1.0.txt",
+    "resources/licenses/KURISU-ASSET-NOTICE.txt",
+    "resources/licenses/runtime-license-manifest.json",
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dist", type=Path, default=Path("dist"))
+    return parser
+
+
+def _single_artifact(dist: Path, pattern: str, label: str) -> Path:
+    artifacts = sorted(path for path in dist.glob(pattern) if path.is_file())
+    if len(artifacts) != 1:
+        raise ValueError(f"expected exactly one {label} artifact, found {len(artifacts)}")
+    return artifacts[0]
+
+
+def _read_wheel(path: Path) -> dict[str, bytes]:
+    payloads: dict[str, bytes] = {}
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        for relative in REQUIRED_FILES:
+            expected = f"amadeus_desktop/{relative}"
+            matches = [member for member in members if member.filename == expected]
+            if len(matches) != 1:
+                raise ValueError(f"wheel member count is invalid for {relative}")
+            payloads[relative] = archive.read(matches[0])
+    return payloads
+
+
+def _read_sdist(path: Path) -> dict[str, bytes]:
+    payloads: dict[str, bytes] = {}
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        for relative in REQUIRED_FILES:
+            suffix = f"/src/amadeus_desktop/{relative}"
+            matches = [
+                member for member in members if member.isfile() and member.name.endswith(suffix)
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"sdist member count is invalid for {relative}")
+            handle = archive.extractfile(matches[0])
+            if handle is None:
+                raise ValueError(f"sdist member is unreadable for {relative}")
+            payloads[relative] = handle.read()
+    return payloads
+
+
+def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
+    sheet = payloads["resources/builtin_pet/spritesheet.webp"]
+    if hashlib.sha256(sheet).hexdigest() != KURISU_SHA256:
+        raise ValueError(f"{label} built-in pet hash is invalid")
+    if (
+        hashlib.sha256(payloads["resources/app_icon/spritesheet.png"]).hexdigest()
+        != ICON_SOURCE_SHA256
+    ):
+        raise ValueError(f"{label} application icon source hash is invalid")
+
+    with Image.open(BytesIO(sheet)) as image:
+        image.load()
+        if image.format != "WEBP" or image.mode != "RGBA" or image.size != (1536, 1872):
+            raise ValueError(f"{label} built-in pet image metadata is invalid")
+
+    pet_manifest = json.loads(payloads["resources/builtin_pet/pet.amadeus.json"].decode("utf-8"))
+    sheet_spec = pet_manifest.get("spritesheet", {})
+    if (
+        pet_manifest.get("id") != "builtin-amadeus"
+        or pet_manifest.get("license") != "NOASSERTION"
+        or sheet_spec.get("path") != "spritesheet.webp"
+        or sheet_spec.get("frameWidth") != 192
+        or sheet_spec.get("frameHeight") != 208
+        or sheet_spec.get("columns") != 8
+        or sheet_spec.get("rows") != 9
+    ):
+        raise ValueError(f"{label} built-in pet manifest is invalid")
+
+    for relative in (
+        "resources/builtin_pet/LICENSE.txt",
+        "resources/licenses/KURISU-ASSET-NOTICE.txt",
+    ):
+        notice = payloads[relative].decode("utf-8")
+        if (
+            "NOASSERTION" not in notice
+            or KURISU_SHA256 not in notice
+            or "not independently verified" not in notice
+        ):
+            raise ValueError(f"{label} Kurisu notice is incomplete")
+
+    license_manifest = json.loads(
+        payloads["resources/licenses/runtime-license-manifest.json"].decode("utf-8")
+    )
+    components = {
+        component.get("name"): component
+        for component in license_manifest.get("bundled_components", [])
+    }
+    if components.get("Amadeus built-in Kurisu spritesheet") != {
+        "name": "Amadeus built-in Kurisu spritesheet",
+        "version": f"sha256:{KURISU_SHA256}",
+        "license": "NOASSERTION",
+        "source": "resources/builtin_pet/LICENSE.txt",
+    }:
+        raise ValueError(f"{label} runtime asset license identity is invalid")
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    try:
+        dist = arguments.dist.resolve(strict=True)
+        wheel = _single_artifact(dist, "*.whl", "wheel")
+        sdist = _single_artifact(dist, "*.tar.gz", "sdist")
+        _verify_payloads("wheel", _read_wheel(wheel))
+        _verify_payloads("sdist", _read_sdist(sdist))
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        json.JSONDecodeError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+    ) as exc:
+        print(json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False))
+        return 1
+    print(
+        json.dumps(
+            {"status": "passed", "archives": 2, "asset_sha256": KURISU_SHA256},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

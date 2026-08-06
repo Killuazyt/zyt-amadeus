@@ -41,6 +41,7 @@ foreach ($required in @(
     (Join-Path $LicenseRoot 'LGPL-3.0.txt'),
     (Join-Path $LicenseRoot 'GPL-3.0.txt'),
     (Join-Path $LicenseRoot 'CC0-1.0.txt'),
+    (Join-Path $LicenseRoot 'KURISU-ASSET-NOTICE.txt'),
     (Join-Path $LicenseRoot 'PYTHON-3.11-LICENSE.txt'),
     (Join-Path $LicenseRoot 'PYINSTALLER_COPYING.txt'),
     (Join-Path $LicenseRoot 'INNO_SETUP_LICENSE.txt')
@@ -104,6 +105,25 @@ if ($components['Inno Setup'] -ne '6.7.3') { throw 'Inno Setup license identity 
 if ($components['PyInstaller bootloader'] -ne '6.21.0') {
     throw 'PyInstaller bootloader license identity is not fixed'
 }
+$kurisuComponent = @(
+    $manifest.bundled_components |
+        Where-Object { [string]$_.name -eq 'Amadeus built-in Kurisu spritesheet' }
+)
+if (
+    $kurisuComponent.Count -ne 1 -or
+    [string]$kurisuComponent[0].version -ne 'sha256:0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d' -or
+    [string]$kurisuComponent[0].license -ne 'NOASSERTION'
+) {
+    throw 'Built-in Kurisu asset identity or NOASSERTION status is invalid'
+}
+$kurisuNotice = Get-Content -LiteralPath (Join-Path $LicenseRoot 'KURISU-ASSET-NOTICE.txt') -Raw -Encoding UTF8
+if (
+    $kurisuNotice -notmatch 'NOASSERTION' -or
+    $kurisuNotice -notmatch '0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d' -or
+    $kurisuNotice -notmatch 'not independently verified'
+) {
+    throw 'Built-in Kurisu asset risk notice is incomplete'
+}
 $devPackages = Read-LockedPackages $DevLockPath
 if ($devPackages['pyinstaller'] -ne $components['PyInstaller bootloader']) {
     throw 'PyInstaller bootloader notice differs from the development lock'
@@ -130,6 +150,7 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
         'LGPL-3.0.txt',
         'GPL-3.0.txt',
         'CC0-1.0.txt',
+        'KURISU-ASSET-NOTICE.txt',
         'PYTHON-3.11-LICENSE.txt',
         'PYINSTALLER_COPYING.txt',
         'INNO_SETUP_LICENSE.txt'
@@ -137,6 +158,41 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
         if (-not (Test-Path -LiteralPath (Join-Path $packagedLicenseRoot $name) -PathType Leaf)) {
             throw "Packaged license artifact is missing: $name"
         }
+    }
+
+    $packagedPetRoot = Join-Path $internal 'amadeus_desktop\resources\builtin_pet'
+    $packagedPetSheet = Join-Path $packagedPetRoot 'spritesheet.webp'
+    $packagedPetManifestPath = Join-Path $packagedPetRoot 'pet.amadeus.json'
+    $packagedPetNoticePath = Join-Path $packagedPetRoot 'LICENSE.txt'
+    foreach ($requiredPetFile in @($packagedPetSheet, $packagedPetManifestPath, $packagedPetNoticePath)) {
+        if (-not (Test-Path -LiteralPath $requiredPetFile -PathType Leaf)) {
+            throw 'Packaged built-in pet resource is incomplete'
+        }
+    }
+    if (
+        (Get-FileHash -LiteralPath $packagedPetSheet -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+        '0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d'
+    ) {
+        throw 'Packaged built-in pet spritesheet differs from the approved lossless WebP'
+    }
+    $packagedPetManifest = Get-Content -LiteralPath $packagedPetManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (
+        [string]$packagedPetManifest.id -ne 'builtin-amadeus' -or
+        [string]$packagedPetManifest.license -ne 'NOASSERTION' -or
+        [string]$packagedPetManifest.spritesheet.path -ne 'spritesheet.webp' -or
+        [int]$packagedPetManifest.spritesheet.frameWidth -ne 192 -or
+        [int]$packagedPetManifest.spritesheet.frameHeight -ne 208 -or
+        [int]$packagedPetManifest.spritesheet.columns -ne 8 -or
+        [int]$packagedPetManifest.spritesheet.rows -ne 9
+    ) {
+        throw 'Packaged built-in pet manifest identity is invalid'
+    }
+    $packagedPetNotice = Get-Content -LiteralPath $packagedPetNoticePath -Raw -Encoding UTF8
+    if (
+        $packagedPetNotice -notmatch 'NOASSERTION' -or
+        $packagedPetNotice -notmatch 'not independently verified'
+    ) {
+        throw 'Packaged built-in pet notice is incomplete'
     }
 
     $metadataPackages = @{}

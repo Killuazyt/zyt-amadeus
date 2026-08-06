@@ -17,7 +17,7 @@ dist/
 .env.*
 *.log
 
-# Local desktop data and imported/private assets
+# Local desktop data and runtime-imported/private assets
 desktop/local-data/
 desktop/config/
 desktop/data/

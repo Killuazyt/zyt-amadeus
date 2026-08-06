@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -70,6 +71,63 @@ def test_scanner_rejects_quoted_json_credentials_and_generic_private_media(tmp_p
         "credential_pattern": 1,
         "unauthorized_character_asset": 1,
     }
+
+
+def test_scanner_only_allows_exact_pinned_pet_and_icon_media(tmp_path) -> None:
+    resource_root = Path(__file__).resolve().parents[1] / "src" / "amadeus_desktop" / "resources"
+    bundled_pet = tmp_path / "amadeus_desktop" / "resources" / "builtin_pet"
+    app_icon = tmp_path / "amadeus_desktop" / "resources" / "app_icon"
+    bundled_pet.mkdir(parents=True)
+    app_icon.mkdir(parents=True)
+    copied_pet = bundled_pet / "spritesheet.webp"
+    shutil.copy2(resource_root / "builtin_pet" / "spritesheet.webp", copied_pet)
+    shutil.copy2(resource_root / "app_icon" / "spritesheet.png", app_icon / "spritesheet.png")
+
+    exit_code, result = _scan(tmp_path)
+
+    assert exit_code == 0
+    assert result["status"] == "passed"
+    assert result["violations_by_category"] == {}
+
+    tampered = bytearray(copied_pet.read_bytes())
+    tampered[-1] ^= 1
+    copied_pet.write_bytes(tampered)
+
+    exit_code, result = _scan(tmp_path)
+
+    assert exit_code == 1
+    assert result["status"] == "failed"
+    assert result["violations_by_category"] == {"unauthorized_character_asset": 1}
+
+
+def test_scanner_rejects_approved_media_hash_without_a_path_boundary(tmp_path) -> None:
+    resource_root = Path(__file__).resolve().parents[1] / "src" / "amadeus_desktop" / "resources"
+    misleading_root = tmp_path / "privateamadeus_desktop" / "resources" / "builtin_pet"
+    misleading_root.mkdir(parents=True)
+    shutil.copy2(resource_root / "builtin_pet" / "spritesheet.webp", misleading_root)
+
+    exit_code, result = _scan(tmp_path)
+
+    assert exit_code == 1
+    assert result["status"] == "failed"
+    assert result["violations_by_category"] == {"unauthorized_character_asset": 1}
+
+
+def test_scanner_allows_pinned_media_at_an_exact_wheel_member_path(tmp_path) -> None:
+    resource_root = Path(__file__).resolve().parents[1] / "src" / "amadeus_desktop" / "resources"
+    artifact = tmp_path / "package.whl"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.write(
+            resource_root / "builtin_pet" / "spritesheet.webp",
+            "amadeus_desktop/resources/builtin_pet/spritesheet.webp",
+        )
+
+    exit_code, result = _scan(tmp_path)
+
+    assert exit_code == 0
+    assert result["status"] == "passed"
+    assert result["archive_members_scanned"] == 1
+    assert result["violations_by_category"] == {}
 
 
 def test_scanner_rejects_every_embedding_model_file_without_allow_flag(tmp_path) -> None:

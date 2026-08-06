@@ -51,8 +51,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 amadeus_desktop = [
+    "resources/app_icon/*.png",
+    "resources/app_icon/*.txt",
     "resources/builtin_pet/*.json",
     "resources/builtin_pet/*.png",
+    "resources/builtin_pet/*.webp",
     "resources/builtin_pet/*.txt",
     "resources/licenses/*.json",
     "resources/licenses/*.txt",

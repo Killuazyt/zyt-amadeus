@@ -2,7 +2,7 @@
 
 Amadeus is being rebuilt as a Windows 10/11 x64 desktop pet using Python 3.11 and PySide6. The active MVP uses one local desktop process and does not require Electron, Node, a browser UI, a local HTTP service, or WebRTC.
 
-The canonical `main` branch contains the P1 application foundation, the P2 desktop-pet engine, the P3 attached chat flow, the P4 secure text-model integration, P5 local conversations plus auditable hybrid memory, the P6 settings/tray/proactive-interaction closure, and the P7 Windows packaging and migration-audit infrastructure. The pet supports safe local resource import and switching, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, complete tray controls, and a compact cancellable streaming chat panel.
+The canonical `main` branch contains the P1 application foundation, the P2 desktop-pet engine, the P3 attached chat flow, the P4 secure text-model integration, P5 local conversations plus auditable hybrid memory, the P6 settings/tray/proactive-interaction closure, the P7 Windows packaging and migration-audit infrastructure, and the user-approved P7A built-in appearance replacement. The pet supports safe local resource import and switching, fixed-clock sprite animation, transparent hit testing, drag placement, DPI-aware screen recovery, complete tray controls, and a compact cancellable streaming chat panel.
 
 P4 supports DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom OpenAI-compatible HTTPS endpoint. API credentials are stored only in Windows Credential Manager. P5/P6 persist chat history, proactive-message origin, immutable user-memory versions, provenance, recall events, isolated local persona knowledge, and an interaction event ledger in SQLite schema v3. Recall combines injection-safe Chinese FTS5 with an explicitly prepared, CPU-only `BAAI/bge-small-zh-v1.5` model; a missing or invalid model degrades immediately to FTS5 without networking. P6 adds a single-instance eight-page settings center, exact eight-item tray, verified HKCU startup control, restrained local greetings, versioned JSON exports, consistent single-file backup/restore, diagnostics, and fail-closed factory reset. Speech, screen observation, tool execution, and autonomous desktop actions are not included.
 
@@ -40,7 +40,9 @@ Local persona knowledge is imported from `%LOCALAPPDATA%\Amadeus\personas\kurisu
 .\.venv\Scripts\amadeus-persona.exe import
 ```
 
-Wheels, source distributions, and the Degraded onedir contain neither the embedding model nor local persona/user data. The P7 installer is built only from the Bundled PyInstaller onedir after the fixed public model, privacy scan, archive tags, and release-license closure pass verification.
+Wheels, source distributions, and the Degraded onedir contain neither the embedding model nor local persona/user data. They do include the P7A built-in Kurisu lossless WebP at its pinned SHA-256. The P7 installer is built only from the Bundled PyInstaller onedir after the fixed public model, privacy scan, archive tags, and release-notice closure pass verification.
+
+The built-in Kurisu source manifest declared no author, source, or license. Its packaged status is `NOASSERTION`: the repository owner explicitly approved its inclusion on 2026-08-06, but third-party redistribution rights were not independently verified. See `desktop/src/amadeus_desktop/resources/licenses/KURISU-ASSET-NOTICE.txt`. The project MIT license and the CC0 application-icon notice do not cover that spritesheet.
 
 ## P7 packaging and clean-machine acceptance
 

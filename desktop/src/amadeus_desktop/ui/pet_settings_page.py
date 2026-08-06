@@ -129,7 +129,7 @@ class PetSettingsPage(QWidget):
             None,
         )
         if selected is None:
-            self.metadata.setText("资源不可用，将使用内置通用宠物。")
+            self.metadata.setText("资源不可用，将使用内置默认宠物。")
         else:
             author = selected.manifest.author or "未声明"
             license_name = selected.manifest.license_name or "未声明"

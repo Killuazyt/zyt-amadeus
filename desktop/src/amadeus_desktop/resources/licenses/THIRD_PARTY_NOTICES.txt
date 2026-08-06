@@ -66,12 +66,19 @@ loads Qt DLLs and does not ship the optional PDF or virtual-keyboard plugins.
 See QT_LGPL_COMPLIANCE.txt, LGPL-3.0.txt, and GPL-3.0.txt for source, replacement,
 reverse-engineering, and written-offer information.
 
-Public model and artwork
-------------------------
+Public model and bundled artwork
+--------------------------------
 Qdrant bge-small-zh-v1.5 ONNX bundle, revision
 46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59 | MIT |
 https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59
 
-The built-in generic robot spritesheet and the Windows icon derived from its
-first frame are dedicated under CC0-1.0. See CC0-1.0.txt and the built-in pet
-LICENSE.txt. No private character artwork is part of the public build.
+The generic application-icon source spritesheet and the Windows icon derived
+from its first frame are dedicated under CC0-1.0. See CC0-1.0.txt.
+
+The built-in Kurisu desktop-pet spritesheet is included at the repository
+owner's explicit direction from 2026-08-06 and is pinned to SHA-256
+0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d.
+Its source pet.json declared no author, source, or license. Its license status
+is NOASSERTION; third-party redistribution rights were not independently
+verified. See KURISU-ASSET-NOTICE.txt and the built-in pet LICENSE.txt. This
+asset is not covered by the project MIT license or the CC0 icon notice.

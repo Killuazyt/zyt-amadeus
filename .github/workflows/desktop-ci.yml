@@ -60,6 +60,8 @@ jobs:
         run: python -m pytest
       - name: Build Python package
         run: python -m build --no-isolation
+      - name: Verify Python package assets
+        run: python scripts/check_python_package_assets.py --dist dist
       - name: Verify isolated wheel install
         shell: powershell
         run: |

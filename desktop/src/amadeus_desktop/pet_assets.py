@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ AMadeus_MANIFEST_NAME = "pet.amadeus.json"
 LEGACY_MANIFEST_NAME = "pet.json"
 LEGACY_PROFILE = "legacy-8x9-192x208"
 BUILTIN_PET_ID = "builtin-amadeus"
+BUILTIN_SPRITESHEET_SHA256 = "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
 
 MAX_FILE_COUNT = 256
 MAX_SINGLE_FILE_BYTES = 32 * 1024 * 1024
@@ -389,12 +391,25 @@ def builtin_pet_root() -> Path:
     return Path(__file__).parent / "resources" / "builtin_pet"
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class PetAssetService:
     def __init__(self, pets_root: Path) -> None:
         self.pets_root = pets_root
 
     def load_builtin(self, *, fallback: bool = False) -> LoadedPetAsset:
         asset = validate_package(builtin_pet_root())
+        if (
+            asset.spritesheet_path.name != "spritesheet.webp"
+            or _file_sha256(asset.spritesheet_path) != BUILTIN_SPRITESHEET_SHA256
+        ):
+            raise InvalidPetAssetError("The bundled pet spritesheet identity is invalid.")
         return LoadedPetAsset(asset.manifest, asset.root, asset.spritesheet_path, fallback)
 
     def load_active(self, pet_id: str) -> LoadedPetAsset:

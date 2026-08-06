@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import stat
@@ -46,23 +47,34 @@ def write_legacy_package(destination: Path) -> Path:
     return package
 
 
-def test_builtin_pet_is_valid_and_redistributable(qapp) -> None:
+def test_builtin_pet_matches_approved_exact_asset(qapp) -> None:
     asset = validate_package(builtin_pet_root())
+    sheet = QImage(str(asset.spritesheet_path))
 
     assert asset.manifest.pet_id == BUILTIN_PET_ID
-    assert asset.manifest.license_name == "CC0-1.0"
+    assert asset.manifest.license_name == "NOASSERTION"
+    assert asset.spritesheet_path.name == "spritesheet.webp"
+    assert hashlib.sha256(asset.spritesheet_path.read_bytes()).hexdigest() == (
+        "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+    )
+    assert not sheet.isNull()
+    assert (sheet.width(), sheet.height()) == (1536, 1872)
+    assert asset.manifest.spritesheet.frame_width == 192
+    assert asset.manifest.spritesheet.frame_height == 208
     assert asset.manifest.spritesheet.columns == 8
     assert asset.manifest.spritesheet.rows == 9
-    assert set(asset.manifest.animations) >= {
-        "idle",
-        "move_left",
-        "move_right",
-        "greeting",
-        "jump",
-        "error",
-        "responding",
-        "waiting",
-        "thinking",
+    assert {
+        name: len(animation.frames) for name, animation in asset.manifest.animations.items()
+    } == {
+        "idle": 6,
+        "move_right": 8,
+        "move_left": 8,
+        "greeting": 4,
+        "jump": 5,
+        "error": 8,
+        "responding": 6,
+        "waiting": 6,
+        "thinking": 6,
     }
 
 
@@ -213,7 +225,7 @@ def test_wrong_spritesheet_dimensions_are_rejected(qapp, tmp_path: Path) -> None
     source = copy_builtin(tmp_path)
     image = QImage(32, 32, QImage.Format.Format_ARGB32)
     image.fill(Qt.GlobalColor.transparent)
-    assert image.save(str(source / "spritesheet.png"), "PNG")
+    assert image.save(str(source / "spritesheet.webp"), "WEBP")
 
     with pytest.raises(InvalidPetAssetError, match="dimensions"):
         validate_package(source)
@@ -221,7 +233,7 @@ def test_wrong_spritesheet_dimensions_are_rejected(qapp, tmp_path: Path) -> None
 
 def test_corrupt_spritesheet_is_rejected(qapp, tmp_path: Path) -> None:
     source = copy_builtin(tmp_path)
-    (source / "spritesheet.png").write_bytes(b"not an image")
+    (source / "spritesheet.webp").write_bytes(b"not an image")
 
     with pytest.raises(InvalidPetAssetError, match="cannot be decoded"):
         validate_package(source)
@@ -232,7 +244,7 @@ def test_failed_replacement_preserves_installed_pet(qapp, tmp_path: Path) -> Non
     original_source = copy_builtin(tmp_path / "original")
     service.import_package(original_source)
     replacement_source = copy_builtin(tmp_path / "replacement")
-    (replacement_source / "spritesheet.png").write_bytes(b"not an image")
+    (replacement_source / "spritesheet.webp").write_bytes(b"not an image")
 
     with pytest.raises(InvalidPetAssetError):
         service.import_package(replacement_source, replace=True)

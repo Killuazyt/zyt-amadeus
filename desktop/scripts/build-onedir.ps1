@@ -95,7 +95,7 @@ function New-DeterministicPackagingResources {
     $env:PYTHONHASHSEED = '0'
 
     $iconScript = Join-Path $DesktopRoot 'scripts\generate_app_icon.py'
-    $iconSource = Join-Path $DesktopRoot 'src\amadeus_desktop\resources\builtin_pet\spritesheet.png'
+    $iconSource = Join-Path $DesktopRoot 'src\amadeus_desktop\resources\app_icon\spritesheet.png'
     & $PythonPath $iconScript --source $iconSource --output $IconPath
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $IconPath)) {
         throw 'CC0 application icon generation failed'

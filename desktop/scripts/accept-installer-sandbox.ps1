@@ -744,11 +744,11 @@ function Assert-InstalledPrivacyAndModelBoundary {
         )
         Assert-True -Condition (-not $hasPrivateMaterial) -Category 'installed_scan_private_material'
         if ($suffix -in @('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.wav', '.mp3', '.flac')) {
-            $isPublicSheet = $normalized -eq '_internal/amadeus_desktop/resources/builtin_pet/spritesheet.png'
+            $isApprovedSheet = $normalized -eq '_internal/amadeus_desktop/resources/builtin_pet/spritesheet.webp'
             $mediaHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             Assert-True -Condition (
-                $isPublicSheet -and
-                $mediaHash -ceq '2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e'
+                $isApprovedSheet -and
+                $mediaHash -ceq '0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d'
             ) -Category 'installed_scan_unauthorized_character_asset'
         }
         if ($normalized.StartsWith($modelRootRelative, [StringComparison]::Ordinal)) {
@@ -1088,8 +1088,9 @@ function Assert-InstalledPayload {
         'qwindows.dll',
         'qjpeg.dll',
         'qico.dll',
+        'qwebp.dll',
         'model_optimized.onnx',
-        'spritesheet.png',
+        'spritesheet.webp',
         'pet.amadeus.json'
     )
     foreach ($leaf in $requiredLeaves) {
