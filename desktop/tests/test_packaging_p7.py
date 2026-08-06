@@ -29,6 +29,9 @@ def _locked_packages() -> dict[str, str]:
 def test_ci_degraded_onedir_smoke_allows_bounded_cold_start() -> None:
     source = WORKFLOW_PATH.read_text(encoding="utf-8")
 
+    assert "timeout-minutes: 15" in source
+    assert "faulthandler_timeout=300" in source
+    assert "python -m pytest -vv --durations=30" in source
     assert "--auto-exit-ms=500" in source
     assert "$process.WaitForExit(60000)" in source
     assert "Stop-Process -Id $process.Id -Force" in source
@@ -128,6 +131,7 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
@@ -142,7 +146,7 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
             if relative == "resources/builtin_pet/spritesheet.webp":
                 payload += b"tampered"
             archive.writestr(f"amadeus_desktop/{relative}", payload)
-    failed = subprocess.run(command, check=False, capture_output=True, text=True)
+    failed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
 
     assert failed.returncode == 1
     assert json.loads(failed.stdout)["status"] == "failed"

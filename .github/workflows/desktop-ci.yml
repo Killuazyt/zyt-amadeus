@@ -55,9 +55,10 @@ jobs:
           python -m compileall -q src tests
           if ($LASTEXITCODE -ne 0) { throw 'compileall failed' }
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest
+        run: python -m pytest -vv --durations=30 -o faulthandler_timeout=300
       - name: Build Python package
         run: python -m build --no-isolation
       - name: Verify Python package assets

@@ -16,6 +16,7 @@ def _scan(path: Path) -> tuple[int, dict[str, object]]:
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     return completed.returncode, json.loads(completed.stdout)
 
@@ -148,6 +149,7 @@ def test_scanner_reports_missing_input_without_path_or_traceback(tmp_path) -> No
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     result = json.loads(completed.stdout)
 
