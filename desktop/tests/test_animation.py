@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from amadeus_desktop.animation import AnimationController
-from amadeus_desktop.pet_assets import builtin_pet_root, validate_package
+from amadeus_desktop.pet_assets import PetAssetService
 
 
 def make_controller() -> AnimationController:
-    return AnimationController(validate_package(builtin_pet_root()).manifest)
+    return AnimationController(PetAssetService(Path()).load_builtin().manifest)
 
 
 def test_priority_and_same_state_do_not_restart(qapp) -> None:

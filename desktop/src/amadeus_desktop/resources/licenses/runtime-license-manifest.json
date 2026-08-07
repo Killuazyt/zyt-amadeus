@@ -50,6 +50,6 @@
     {"name": "Inno Setup", "version": "6.7.3", "license": "Inno Setup License", "source": "https://jrsoftware.org/isinfo.php"},
     {"name": "Qdrant bge-small-zh-v1.5 ONNX bundle", "version": "46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59", "license": "MIT", "source": "https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59"},
     {"name": "Amadeus generic application icon source and derived icon", "version": "1", "license": "CC0-1.0", "source": "scripts/generate_builtin_pet.py and scripts/generate_app_icon.py"},
-    {"name": "Amadeus built-in Kurisu spritesheet", "version": "sha256:0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d", "license": "NOASSERTION", "source": "resources/builtin_pet/LICENSE.txt"}
+    {"name": "Amadeus built-in Kurisu 4x high-resolution spritesheet derivative", "version": "sha256:cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7", "license": "NOASSERTION", "source": "resources/builtin_pet/LICENSE.txt"}
   ]
 }

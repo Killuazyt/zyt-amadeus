@@ -107,11 +107,11 @@ if ($components['PyInstaller bootloader'] -ne '6.21.0') {
 }
 $kurisuComponent = @(
     $manifest.bundled_components |
-        Where-Object { [string]$_.name -eq 'Amadeus built-in Kurisu spritesheet' }
+        Where-Object { [string]$_.name -eq 'Amadeus built-in Kurisu 4x high-resolution spritesheet derivative' }
 )
 if (
     $kurisuComponent.Count -ne 1 -or
-    [string]$kurisuComponent[0].version -ne 'sha256:0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d' -or
+    [string]$kurisuComponent[0].version -ne 'sha256:cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7' -or
     [string]$kurisuComponent[0].license -ne 'NOASSERTION'
 ) {
     throw 'Built-in Kurisu asset identity or NOASSERTION status is invalid'
@@ -119,7 +119,7 @@ if (
 $kurisuNotice = Get-Content -LiteralPath (Join-Path $LicenseRoot 'KURISU-ASSET-NOTICE.txt') -Raw -Encoding UTF8
 if (
     $kurisuNotice -notmatch 'NOASSERTION' -or
-    $kurisuNotice -notmatch '0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d' -or
+    $kurisuNotice -notmatch 'cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7' -or
     $kurisuNotice -notmatch 'not independently verified'
 ) {
     throw 'Built-in Kurisu asset risk notice is incomplete'
@@ -171,7 +171,7 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
     }
     if (
         (Get-FileHash -LiteralPath $packagedPetSheet -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-        '0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d'
+        'cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7'
     ) {
         throw 'Packaged built-in pet spritesheet differs from the approved lossless WebP'
     }
@@ -180,8 +180,10 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
         [string]$packagedPetManifest.id -ne 'builtin-amadeus' -or
         [string]$packagedPetManifest.license -ne 'NOASSERTION' -or
         [string]$packagedPetManifest.spritesheet.path -ne 'spritesheet.webp' -or
-        [int]$packagedPetManifest.spritesheet.frameWidth -ne 192 -or
-        [int]$packagedPetManifest.spritesheet.frameHeight -ne 208 -or
+        [int]$packagedPetManifest.spritesheet.frameWidth -ne 768 -or
+        [int]$packagedPetManifest.spritesheet.frameHeight -ne 832 -or
+        [int]$packagedPetManifest.spritesheet.logicalFrameWidth -ne 192 -or
+        [int]$packagedPetManifest.spritesheet.logicalFrameHeight -ne 208 -or
         [int]$packagedPetManifest.spritesheet.columns -ne 8 -or
         [int]$packagedPetManifest.spritesheet.rows -ne 9
     ) {

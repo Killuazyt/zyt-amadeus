@@ -75,9 +75,10 @@ https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfd
 The generic application-icon source spritesheet and the Windows icon derived
 from its first frame are dedicated under CC0-1.0. See CC0-1.0.txt.
 
-The built-in Kurisu desktop-pet spritesheet is included at the repository
-owner's explicit direction from 2026-08-06 and is pinned to SHA-256
-0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d.
+The built-in Kurisu desktop-pet 4x high-resolution spritesheet derivative is
+included at the repository owner's explicit direction from 2026-08-07 and is
+pinned to SHA-256
+cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7.
 Its source pet.json declared no author, source, or license. Its license status
 is NOASSERTION; third-party redistribution rights were not independently
 verified. See KURISU-ASSET-NOTICE.txt and the built-in pet LICENSE.txt. This

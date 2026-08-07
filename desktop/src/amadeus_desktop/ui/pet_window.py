@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from collections import OrderedDict
+
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import (
     QBitmap,
     QHideEvent,
@@ -23,6 +25,12 @@ from amadeus_desktop.pet_models import FrameCoordinate
 
 MIN_SCALE_PERCENT = 50
 MAX_SCALE_PERCENT = 200
+MAX_CACHED_FRAMES = 16
+_RENDER_INVALIDATION_EVENTS = frozenset(
+    event_type
+    for name in ("DevicePixelRatioChange", "ScreenChangeInternal")
+    if (event_type := getattr(QEvent.Type, name, None)) is not None
+)
 
 
 class PetWindow(QWidget):
@@ -54,7 +62,9 @@ class PetWindow(QWidget):
         self._sheet = QImage(str(asset.spritesheet_path))
         if self._sheet.isNull():
             raise ValueError("The validated pet spritesheet could not be loaded.")
-        self._frame_cache: dict[tuple[FrameCoordinate, int], tuple[QPixmap, QRegion]] = {}
+        self._frame_cache: OrderedDict[
+            tuple[FrameCoordinate, int, int], tuple[QPixmap, QRegion]
+        ] = OrderedDict()
         self._current_pixmap = QPixmap()
         self._press_global: QPoint | None = None
         self._press_window_position: QPoint | None = None
@@ -147,8 +157,8 @@ class PetWindow(QWidget):
 
     def _resize_for_scale(self) -> None:
         spec = self.asset.manifest.spritesheet
-        width = max(1, round(spec.frame_width * self.scale_percent / 100))
-        height = max(1, round(spec.frame_height * self.scale_percent / 100))
+        width = max(1, round(spec.logical_frame_width * self.scale_percent / 100))
+        height = max(1, round(spec.logical_frame_height * self.scale_percent / 100))
         self.setFixedSize(width, height)
 
     def _window_flags(self) -> Qt.WindowType:
@@ -170,28 +180,61 @@ class PetWindow(QWidget):
             spec.frame_height,
         )
 
-    def _render_image(self, frame: FrameCoordinate) -> QImage:
-        """Return the source frame unchanged when the requested size is native."""
+    def _effective_device_pixel_ratio(self) -> float:
+        return max(1.0, float(self.devicePixelRatioF()))
 
-        source = self._source_frame(frame)
-        if source.size() == self.size():
+    @staticmethod
+    def _scaled_image(source: QImage, width: int, height: int) -> QImage:
+        if source.width() == width and source.height() == height:
             return source
         return source.scaled(
-            self.size(),
+            width,
+            height,
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
 
+    def _render_image(
+        self,
+        frame: FrameCoordinate,
+        device_pixel_ratio: float | None = None,
+    ) -> QImage:
+        """Render directly from the source frame at the screen's physical pixel size."""
+
+        source = self._source_frame(frame)
+        device_pixel_ratio = (
+            self._effective_device_pixel_ratio()
+            if device_pixel_ratio is None
+            else max(1.0, float(device_pixel_ratio))
+        )
+        rendered = self._scaled_image(
+            source,
+            max(1, round(self.width() * device_pixel_ratio)),
+            max(1, round(self.height() * device_pixel_ratio)),
+        )
+        rendered.setDevicePixelRatio(device_pixel_ratio)
+        return rendered
+
     def _rendered_frame(self, frame: FrameCoordinate) -> tuple[QPixmap, QRegion]:
-        key = (frame, self.scale_percent)
+        device_pixel_ratio = self._effective_device_pixel_ratio()
+        key = (frame, self.scale_percent, round(device_pixel_ratio * 1000))
         cached = self._frame_cache.get(key)
         if cached is not None:
+            self._frame_cache.move_to_end(key)
             return cached
-        rendered_image = self._render_image(frame)
+        rendered_image = self._render_image(frame, device_pixel_ratio)
         pixmap = QPixmap.fromImage(rendered_image)
-        region = self._alpha_region(rendered_image)
+        pixmap.setDevicePixelRatio(device_pixel_ratio)
+        logical_image = self._scaled_image(
+            self._source_frame(frame),
+            self.width(),
+            self.height(),
+        )
+        region = self._alpha_region(logical_image)
         rendered = (pixmap, region)
         self._frame_cache[key] = rendered
+        if len(self._frame_cache) > MAX_CACHED_FRAMES:
+            self._frame_cache.popitem(last=False)
         return rendered
 
     def _alpha_region(self, image: QImage) -> QRegion:
@@ -221,6 +264,11 @@ class PetWindow(QWidget):
         self._current_pixmap, region = self._rendered_frame(frame)
         self.setMask(region)
         self.update()
+
+    def _invalidate_render_cache(self) -> None:
+        self._frame_cache.clear()
+        if hasattr(self, "animation") and not self._sheet.isNull():
+            self._set_frame(self.animation.current_frame)
 
     def _set_drag_direction(self, direction: str | None) -> None:
         if direction == self._drag_direction:
@@ -289,6 +337,12 @@ class PetWindow(QWidget):
     def moveEvent(self, event: QMoveEvent) -> None:  # noqa: N802 - Qt API name
         super().moveEvent(event)
         self.position_changed.emit(self.pos())
+
+    def event(self, event: QEvent) -> bool:  # noqa: N802 - Qt API name
+        handled = super().event(event)
+        if event.type() in _RENDER_INVALIDATION_EVENTS and hasattr(self, "_frame_cache"):
+            self._invalidate_render_cache()
+        return handled
 
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt API name
         super().showEvent(event)

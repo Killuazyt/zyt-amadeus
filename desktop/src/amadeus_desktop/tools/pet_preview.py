@@ -10,13 +10,32 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QVBoxLayout, QWidget
 
-from amadeus_desktop.pet_assets import LoadedPetAsset, PetAssetError, validate_package
+from amadeus_desktop.pet_assets import (
+    LoadedPetAsset,
+    PetAssetError,
+    PetAssetService,
+    builtin_pet_root,
+    validate_package,
+)
 
 
-def frame_image(asset: LoadedPetAsset, column: int, row: int) -> QImage:
+def _load_spritesheet(asset: LoadedPetAsset) -> QImage:
     sheet = QImage(str(asset.spritesheet_path))
+    if sheet.isNull():
+        raise PetAssetError(f"Could not decode spritesheet {asset.spritesheet_path}.")
+    return sheet
+
+
+def frame_image(
+    asset: LoadedPetAsset,
+    column: int,
+    row: int,
+    *,
+    sheet: QImage | None = None,
+) -> QImage:
+    source = sheet if sheet is not None else _load_spritesheet(asset)
     spec = asset.manifest.spritesheet
-    return sheet.copy(
+    return source.copy(
         column * spec.frame_width,
         row * spec.frame_height,
         spec.frame_width,
@@ -28,6 +47,7 @@ def export_contact_sheets(asset: LoadedPetAsset, destination: Path) -> list[Path
     destination.mkdir(parents=True, exist_ok=True)
     outputs: list[Path] = []
     spec = asset.manifest.spritesheet
+    sheet = _load_spritesheet(asset)
     for index, (name, animation) in enumerate(asset.manifest.animations.items()):
         output = QImage(
             spec.frame_width * len(animation.frames),
@@ -37,7 +57,12 @@ def export_contact_sheets(asset: LoadedPetAsset, destination: Path) -> list[Path
         output.fill(Qt.GlobalColor.transparent)
         painter = QPainter(output)
         for frame_index, frame in enumerate(animation.frames):
-            image = frame_image(asset, frame.column, frame.row)
+            image = frame_image(
+                asset,
+                frame.column,
+                frame.row,
+                sheet=sheet,
+            )
             painter.drawImage(frame_index * spec.frame_width, 0, image)
         painter.end()
         path = destination / f"{index:02d}-{name}.png"
@@ -51,13 +76,19 @@ class PreviewWindow(QWidget):
     def __init__(self, asset: LoadedPetAsset) -> None:
         super().__init__()
         self.asset = asset
+        self.sheet = _load_spritesheet(asset)
         self.frame_index = 0
         self.selector = QComboBox()
         self.selector.addItems(list(asset.manifest.animations))
         self.selector.currentTextChanged.connect(self._reset)
         self.image = QLabel()
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image.setMinimumSize(QSize(384, 416))
+        spec = asset.manifest.spritesheet
+        self.preview_size = QSize(
+            spec.logical_frame_width * 2,
+            spec.logical_frame_height * 2,
+        )
+        self.image.setMinimumSize(self.preview_size)
         self.status = QLabel()
         layout = QVBoxLayout(self)
         layout.addWidget(self.selector)
@@ -84,10 +115,17 @@ class PreviewWindow(QWidget):
     def _show_frame(self) -> None:
         animation = self._current_animation()
         frame = animation.frames[self.frame_index]
-        pixmap = QPixmap.fromImage(frame_image(self.asset, frame.column, frame.row))
+        pixmap = QPixmap.fromImage(
+            frame_image(
+                self.asset,
+                frame.column,
+                frame.row,
+                sheet=self.sheet,
+            )
+        )
         self.image.setPixmap(
             pixmap.scaled(
-                pixmap.size() * 2,
+                self.preview_size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -109,11 +147,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_preview_asset(source: Path) -> LoadedPetAsset:
+    """Use the narrowly pinned large-file exception only for the built-in package."""
+
+    if source.resolve() == builtin_pet_root().resolve():
+        return PetAssetService(source.parent).load_builtin()
+    return validate_package(source)
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
-    application = QApplication(sys.argv[:1])
+    application = QApplication.instance() or QApplication(sys.argv[:1])
     try:
-        asset = validate_package(arguments.source)
+        asset = _load_preview_asset(arguments.source)
         if arguments.export_dir:
             for path in export_contact_sheets(asset, arguments.export_dir):
                 print(path)

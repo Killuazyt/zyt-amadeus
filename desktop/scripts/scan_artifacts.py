@@ -30,7 +30,7 @@ PRIVATE_MEDIA_SUFFIXES = frozenset(
 )
 APPROVED_MEDIA_SHA256 = {
     "amadeus_desktop/resources/builtin_pet/spritesheet.webp": (
-        "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+        "cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7"
     ),
     "amadeus_desktop/resources/app_icon/spritesheet.png": (
         "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"

@@ -29,7 +29,8 @@ AMadeus_MANIFEST_NAME = "pet.amadeus.json"
 LEGACY_MANIFEST_NAME = "pet.json"
 LEGACY_PROFILE = "legacy-8x9-192x208"
 BUILTIN_PET_ID = "builtin-amadeus"
-BUILTIN_SPRITESHEET_SHA256 = "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+BUILTIN_SPRITESHEET_SHA256 = "cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7"
+BUILTIN_SPRITESHEET_BYTES = 50_744_436
 
 MAX_FILE_COUNT = 256
 MAX_SINGLE_FILE_BYTES = 32 * 1024 * 1024
@@ -133,14 +134,28 @@ def manifest_from_document(document: dict[str, Any]) -> PetManifest:
     raw_sheet = _require_mapping(document.get("spritesheet"), "spritesheet")
     path = _require_string(raw_sheet.get("path"), "spritesheet.path")
     _relative_parts(path, "spritesheet.path")
+    frame_width = _require_int(raw_sheet.get("frameWidth"), "frameWidth", 1, 8192)
+    frame_height = _require_int(raw_sheet.get("frameHeight"), "frameHeight", 1, 8192)
     sheet = SpriteSheetSpec(
         path=path,
-        frame_width=_require_int(raw_sheet.get("frameWidth"), "frameWidth", 1, 8192),
-        frame_height=_require_int(raw_sheet.get("frameHeight"), "frameHeight", 1, 8192),
+        frame_width=frame_width,
+        frame_height=frame_height,
         columns=_require_int(raw_sheet.get("columns"), "columns", 1, 256),
         rows=_require_int(raw_sheet.get("rows"), "rows", 1, 256),
         default_scale_percent=_require_int(
             raw_sheet.get("defaultScalePercent", 100), "defaultScalePercent", 50, 200
+        ),
+        logical_frame_width=_require_int(
+            raw_sheet.get("logicalFrameWidth", frame_width),
+            "logicalFrameWidth",
+            1,
+            8192,
+        ),
+        logical_frame_height=_require_int(
+            raw_sheet.get("logicalFrameHeight", frame_height),
+            "logicalFrameHeight",
+            1,
+            8192,
         ),
         alpha_threshold=_require_int(raw_sheet.get("alphaThreshold", 8), "alphaThreshold", 1, 254),
         hit_padding=_require_int(raw_sheet.get("hitPadding", 2), "hitPadding", 0, 16),
@@ -202,6 +217,8 @@ def manifest_to_document(manifest: PetManifest) -> dict[str, Any]:
             "columns": manifest.spritesheet.columns,
             "rows": manifest.spritesheet.rows,
             "defaultScalePercent": manifest.spritesheet.default_scale_percent,
+            "logicalFrameWidth": manifest.spritesheet.logical_frame_width,
+            "logicalFrameHeight": manifest.spritesheet.logical_frame_height,
             "alphaThreshold": manifest.spritesheet.alpha_threshold,
             "hitPadding": manifest.spritesheet.hit_padding,
         },
@@ -242,7 +259,7 @@ def legacy_manifest_from_document(document: dict[str, Any]) -> PetManifest:
         raise InvalidPetAssetError("Legacy id contains unsafe characters.")
     image_path = _require_string(document.get("spritesheetPath"), "spritesheetPath")
     _relative_parts(image_path, "spritesheetPath")
-    sheet = SpriteSheetSpec(image_path, 192, 208, 8, 9, 100)
+    sheet = SpriteSheetSpec(image_path, 192, 208, 8, 9, 100, 192, 208)
     animations = {
         "idle": _legacy_animation("idle", 0, 6, 6, True),
         "move_right": _legacy_animation("move_right", 1, 8, 10, True),
@@ -271,7 +288,7 @@ def legacy_manifest_from_document(document: dict[str, Any]) -> PetManifest:
     )
 
 
-def _validate_files(root: Path) -> None:
+def _validate_files(root: Path, *, allow_exact_builtin_spritesheet: bool = False) -> None:
     count = 0
     total = 0
     root_resolved = root.resolve()
@@ -285,7 +302,15 @@ def _validate_files(root: Path) -> None:
         total += size
         if count > MAX_FILE_COUNT:
             raise InvalidPetAssetError(f"Pet package exceeds {MAX_FILE_COUNT} files.")
-        if size > MAX_SINGLE_FILE_BYTES:
+        relative_path = path.relative_to(root).as_posix()
+        allowed_builtin_spritesheet = (
+            allow_exact_builtin_spritesheet
+            and root_resolved == builtin_pet_root().resolve()
+            and relative_path == "spritesheet.webp"
+            and size == BUILTIN_SPRITESHEET_BYTES
+            and _file_sha256(path) == BUILTIN_SPRITESHEET_SHA256
+        )
+        if size > MAX_SINGLE_FILE_BYTES and not allowed_builtin_spritesheet:
             raise InvalidPetAssetError("A pet package file exceeds 32 MiB.")
         if total > MAX_TOTAL_BYTES:
             raise InvalidPetAssetError("Pet package exceeds 64 MiB total.")
@@ -297,8 +322,15 @@ def _validate_files(root: Path) -> None:
             raise InvalidPetAssetError("Pet package file escapes the package root.") from exc
 
 
-def load_manifest(root: Path) -> PetManifest:
-    _validate_files(root)
+def _load_manifest(
+    root: Path,
+    *,
+    allow_exact_builtin_spritesheet: bool = False,
+) -> PetManifest:
+    _validate_files(
+        root,
+        allow_exact_builtin_spritesheet=allow_exact_builtin_spritesheet,
+    )
     modern_path = root / AMadeus_MANIFEST_NAME
     if modern_path.is_file():
         return manifest_from_document(_read_json(modern_path, AMadeus_MANIFEST_NAME))
@@ -310,8 +342,19 @@ def load_manifest(root: Path) -> PetManifest:
     )
 
 
-def validate_package(root: Path) -> LoadedPetAsset:
-    manifest = load_manifest(root)
+def load_manifest(root: Path) -> PetManifest:
+    return _load_manifest(root)
+
+
+def _validate_package(
+    root: Path,
+    *,
+    allow_exact_builtin_spritesheet: bool = False,
+) -> LoadedPetAsset:
+    manifest = _load_manifest(
+        root,
+        allow_exact_builtin_spritesheet=allow_exact_builtin_spritesheet,
+    )
     parts = _relative_parts(manifest.spritesheet.path, "spritesheet.path")
     image_path = root.joinpath(*parts)
     if not image_path.is_file():
@@ -330,6 +373,10 @@ def validate_package(root: Path) -> LoadedPetAsset:
             f"({size.width()}x{size.height()} != {expected_width}x{expected_height})."
         )
     return LoadedPetAsset(manifest, root, image_path)
+
+
+def validate_package(root: Path) -> LoadedPetAsset:
+    return _validate_package(root)
 
 
 def _validate_source_name(source: Path) -> None:
@@ -404,12 +451,17 @@ class PetAssetService:
         self.pets_root = pets_root
 
     def load_builtin(self, *, fallback: bool = False) -> LoadedPetAsset:
-        asset = validate_package(builtin_pet_root())
+        root = builtin_pet_root()
+        spritesheet_path = root / "spritesheet.webp"
         if (
-            asset.spritesheet_path.name != "spritesheet.webp"
-            or _file_sha256(asset.spritesheet_path) != BUILTIN_SPRITESHEET_SHA256
+            not spritesheet_path.is_file()
+            or spritesheet_path.stat().st_size != BUILTIN_SPRITESHEET_BYTES
+            or _file_sha256(spritesheet_path) != BUILTIN_SPRITESHEET_SHA256
         ):
             raise InvalidPetAssetError("The bundled pet spritesheet identity is invalid.")
+        asset = _validate_package(root, allow_exact_builtin_spritesheet=True)
+        if asset.spritesheet_path != spritesheet_path:
+            raise InvalidPetAssetError("The bundled pet spritesheet path is invalid.")
         return LoadedPetAsset(asset.manifest, asset.root, asset.spritesheet_path, fallback)
 
     def load_active(self, pet_id: str) -> LoadedPetAsset:

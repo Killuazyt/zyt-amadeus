@@ -12,8 +12,9 @@ from pathlib import Path
 
 from PIL import Image
 
-KURISU_SHA256 = "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+KURISU_SHA256 = "cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7"
 ICON_SOURCE_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
+VALID_FRAME_COUNTS = (6, 8, 8, 4, 5, 8, 6, 6, 6)
 REQUIRED_FILES = (
     "resources/app_icon/LICENSE.txt",
     "resources/app_icon/spritesheet.png",
@@ -82,8 +83,20 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
 
     with Image.open(BytesIO(sheet)) as image:
         image.load()
-        if image.format != "WEBP" or image.mode != "RGBA" or image.size != (1536, 1872):
+        if image.format != "WEBP" or image.mode != "RGBA" or image.size != (6144, 7488):
             raise ValueError(f"{label} built-in pet image metadata is invalid")
+        alpha = image.getchannel("A")
+        for row, frame_count in enumerate(VALID_FRAME_COUNTS):
+            for column in range(8):
+                box = (
+                    column * 768,
+                    row * 832,
+                    (column + 1) * 768,
+                    (row + 1) * 832,
+                )
+                is_empty = alpha.crop(box).getbbox() is None
+                if is_empty != (column >= frame_count):
+                    raise ValueError(f"{label} built-in pet frame occupancy is invalid")
 
     pet_manifest = json.loads(payloads["resources/builtin_pet/pet.amadeus.json"].decode("utf-8"))
     sheet_spec = pet_manifest.get("spritesheet", {})
@@ -91,8 +104,10 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
         pet_manifest.get("id") != "builtin-amadeus"
         or pet_manifest.get("license") != "NOASSERTION"
         or sheet_spec.get("path") != "spritesheet.webp"
-        or sheet_spec.get("frameWidth") != 192
-        or sheet_spec.get("frameHeight") != 208
+        or sheet_spec.get("frameWidth") != 768
+        or sheet_spec.get("frameHeight") != 832
+        or sheet_spec.get("logicalFrameWidth") != 192
+        or sheet_spec.get("logicalFrameHeight") != 208
         or sheet_spec.get("columns") != 8
         or sheet_spec.get("rows") != 9
     ):
@@ -117,8 +132,9 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
         component.get("name"): component
         for component in license_manifest.get("bundled_components", [])
     }
-    if components.get("Amadeus built-in Kurisu spritesheet") != {
-        "name": "Amadeus built-in Kurisu spritesheet",
+    component_name = "Amadeus built-in Kurisu 4x high-resolution spritesheet derivative"
+    if components.get(component_name) != {
+        "name": component_name,
         "version": f"sha256:{KURISU_SHA256}",
         "license": "NOASSERTION",
         "source": "resources/builtin_pet/LICENSE.txt",

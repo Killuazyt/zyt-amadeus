@@ -75,7 +75,7 @@ def test_release_notices_include_qt_compliance_and_canonical_license_texts() -> 
 
 
 def test_builtin_kurisu_packaging_pins_webp_notice_and_license_manifest() -> None:
-    expected_hash = "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+    expected_hash = "cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7"
     pyproject = (DESKTOP_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     notice = (LICENSE_ROOT / "KURISU-ASSET-NOTICE.txt").read_text(encoding="utf-8")
     manifest = json.loads(
@@ -87,8 +87,9 @@ def test_builtin_kurisu_packaging_pins_webp_notice_and_license_manifest() -> Non
     assert '"resources/licenses/*.txt"' in pyproject
     assert expected_hash in notice
     assert "NOASSERTION" in notice
-    assert components["Amadeus built-in Kurisu spritesheet"] == {
-        "name": "Amadeus built-in Kurisu spritesheet",
+    component_name = "Amadeus built-in Kurisu 4x high-resolution spritesheet derivative"
+    assert components[component_name] == {
+        "name": component_name,
         "version": f"sha256:{expected_hash}",
         "license": "NOASSERTION",
         "source": "resources/builtin_pet/LICENSE.txt",
@@ -113,7 +114,7 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
             archive.write(package_root / relative, f"amadeus_desktop/{relative}")
 
     sdist = tmp_path / "amadeus_desktop-0.7.0.dev7.tar.gz"
-    with tarfile.open(sdist, "w:gz") as archive:
+    with tarfile.open(sdist, "w:gz", compresslevel=1) as archive:
         for relative in relative_files:
             payload = (package_root / relative).read_bytes()
             member = tarfile.TarInfo(f"amadeus_desktop-0.7.0.dev7/src/amadeus_desktop/{relative}")
@@ -131,7 +132,7 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
     )
 
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
@@ -146,7 +147,7 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
             if relative == "resources/builtin_pet/spritesheet.webp":
                 payload += b"tampered"
             archive.writestr(f"amadeus_desktop/{relative}", payload)
-    failed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
+    failed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=120)
 
     assert failed.returncode == 1
     assert json.loads(failed.stdout)["status"] == "failed"

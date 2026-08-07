@@ -16,7 +16,7 @@ def _scan(path: Path) -> tuple[int, dict[str, object]]:
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
     )
     return completed.returncode, json.loads(completed.stdout)
 
@@ -90,9 +90,11 @@ def test_scanner_only_allows_exact_pinned_pet_and_icon_media(tmp_path) -> None:
     assert result["status"] == "passed"
     assert result["violations_by_category"] == {}
 
-    tampered = bytearray(copied_pet.read_bytes())
-    tampered[-1] ^= 1
-    copied_pet.write_bytes(tampered)
+    with copied_pet.open("r+b") as handle:
+        handle.seek(-1, 2)
+        final_byte = handle.read(1)
+        handle.seek(-1, 2)
+        handle.write(bytes((final_byte[0] ^ 1,)))
 
     exit_code, result = _scan(tmp_path)
 

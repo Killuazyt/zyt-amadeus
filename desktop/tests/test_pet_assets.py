@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import stat
 import zipfile
 from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QImageReader
 
 import amadeus_desktop.pet_assets as pet_assets
 from amadeus_desktop.pet_assets import (
@@ -24,10 +23,58 @@ from amadeus_desktop.pet_assets import (
 )
 
 
-def copy_builtin(destination: Path) -> Path:
+def write_modern_package(
+    destination: Path,
+    *,
+    pet_id: str = "sample-test",
+    include_logical_dimensions: bool = True,
+) -> Path:
     package = destination / "sample.codex-pet"
-    shutil.copytree(builtin_pet_root(), package)
+    package.mkdir(parents=True)
+    spritesheet = {
+        "path": "spritesheet.webp",
+        "frameWidth": 4,
+        "frameHeight": 5,
+        "columns": 8,
+        "rows": 9,
+        "defaultScalePercent": 100,
+        "alphaThreshold": 8,
+        "hitPadding": 2,
+    }
+    if include_logical_dimensions:
+        spritesheet.update({"logicalFrameWidth": 2, "logicalFrameHeight": 3})
+    document = {
+        "schemaVersion": 1,
+        "id": pet_id,
+        "displayName": "Synthetic Test Pet",
+        "description": "small package used by import tests",
+        "kind": "generic",
+        "author": "test",
+        "source": "generated test fixture",
+        "license": "CC0-1.0",
+        "spritesheet": spritesheet,
+        "animations": {
+            "idle": {
+                "frames": [[0, 0]],
+                "fps": 6,
+                "loop": True,
+                "fallback": "idle",
+            }
+        },
+    }
+    (package / AMadeus_MANIFEST_NAME).write_text(
+        json.dumps(document),
+        encoding="utf-8",
+    )
+    image = QImage(32, 45, QImage.Format.Format_ARGB32)
+    image.fill(Qt.GlobalColor.transparent)
+    assert image.save(str(package / "spritesheet.webp"), "WEBP")
     return package
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def write_legacy_package(destination: Path) -> Path:
@@ -47,20 +94,23 @@ def write_legacy_package(destination: Path) -> Path:
     return package
 
 
-def test_builtin_pet_matches_approved_exact_asset(qapp) -> None:
-    asset = validate_package(builtin_pet_root())
-    sheet = QImage(str(asset.spritesheet_path))
+def test_builtin_pet_matches_approved_exact_asset(qapp, tmp_path: Path) -> None:
+    asset = PetAssetService(tmp_path / "pets").load_builtin()
+    reader = QImageReader(str(asset.spritesheet_path))
 
     assert asset.manifest.pet_id == BUILTIN_PET_ID
     assert asset.manifest.license_name == "NOASSERTION"
     assert asset.spritesheet_path.name == "spritesheet.webp"
-    assert hashlib.sha256(asset.spritesheet_path.read_bytes()).hexdigest() == (
-        "0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d"
+    assert asset.spritesheet_path.stat().st_size == 50_744_436
+    assert file_sha256(asset.spritesheet_path) == (
+        "cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7"
     )
-    assert not sheet.isNull()
-    assert (sheet.width(), sheet.height()) == (1536, 1872)
-    assert asset.manifest.spritesheet.frame_width == 192
-    assert asset.manifest.spritesheet.frame_height == 208
+    assert reader.canRead()
+    assert (reader.size().width(), reader.size().height()) == (6144, 7488)
+    assert asset.manifest.spritesheet.frame_width == 768
+    assert asset.manifest.spritesheet.frame_height == 832
+    assert asset.manifest.spritesheet.logical_frame_width == 192
+    assert asset.manifest.spritesheet.logical_frame_height == 208
     assert asset.manifest.spritesheet.columns == 8
     assert asset.manifest.spritesheet.rows == 9
     assert {
@@ -84,6 +134,8 @@ def test_verified_legacy_profile_uses_nine_rows(qapp, tmp_path: Path) -> None:
     assert asset.manifest.compatibility_profile == LEGACY_PROFILE
     assert asset.manifest.spritesheet.frame_width == 192
     assert asset.manifest.spritesheet.frame_height == 208
+    assert asset.manifest.spritesheet.logical_frame_width == 192
+    assert asset.manifest.spritesheet.logical_frame_height == 208
     assert [len(asset.manifest.animations[name].frames) for name in asset.manifest.animations] == [
         6,
         8,
@@ -95,6 +147,29 @@ def test_verified_legacy_profile_uses_nine_rows(qapp, tmp_path: Path) -> None:
         6,
         6,
     ]
+
+
+def test_modern_manifest_without_logical_dimensions_uses_source_size(
+    qapp,
+    tmp_path: Path,
+) -> None:
+    source = write_modern_package(tmp_path, include_logical_dimensions=False)
+
+    asset = validate_package(source)
+
+    assert asset.manifest.spritesheet.frame_width == 4
+    assert asset.manifest.spritesheet.frame_height == 5
+    assert asset.manifest.spritesheet.logical_frame_width == 4
+    assert asset.manifest.spritesheet.logical_frame_height == 5
+
+
+def test_modern_manifest_preserves_explicit_logical_dimensions(qapp, tmp_path: Path) -> None:
+    asset = validate_package(write_modern_package(tmp_path))
+
+    assert asset.manifest.spritesheet.frame_width == 4
+    assert asset.manifest.spritesheet.frame_height == 5
+    assert asset.manifest.spritesheet.logical_frame_width == 2
+    assert asset.manifest.spritesheet.logical_frame_height == 3
 
 
 def test_directory_import_copies_and_writes_legacy_supplement(qapp, tmp_path: Path) -> None:
@@ -109,7 +184,7 @@ def test_directory_import_copies_and_writes_legacy_supplement(qapp, tmp_path: Pa
 
 
 def test_archive_import_supports_existing_codex_pet_zip(qapp, tmp_path: Path) -> None:
-    source = copy_builtin(tmp_path / "source")
+    source = write_modern_package(tmp_path / "source")
     archive = tmp_path / "sample.codex-pet.zip"
     with zipfile.ZipFile(archive, "w") as handle:
         for path in source.iterdir():
@@ -118,12 +193,12 @@ def test_archive_import_supports_existing_codex_pet_zip(qapp, tmp_path: Path) ->
 
     imported = PetAssetService(tmp_path / "pets").import_package(archive)
 
-    assert imported.manifest.pet_id == BUILTIN_PET_ID
+    assert imported.manifest.pet_id == "sample-test"
     assert imported.spritesheet_path.is_file()
 
 
 def test_duplicate_import_requires_explicit_replace(qapp, tmp_path: Path) -> None:
-    source = copy_builtin(tmp_path / "source")
+    source = write_modern_package(tmp_path / "source")
     service = PetAssetService(tmp_path / "pets")
     service.import_package(source)
 
@@ -131,7 +206,7 @@ def test_duplicate_import_requires_explicit_replace(qapp, tmp_path: Path) -> Non
         service.import_package(source)
 
     replaced = service.import_package(source, replace=True)
-    assert replaced.manifest.pet_id == BUILTIN_PET_ID
+    assert replaced.manifest.pet_id == "sample-test"
 
 
 def test_missing_active_pet_falls_back_without_overwriting(qapp, tmp_path: Path) -> None:
@@ -167,7 +242,7 @@ def test_archive_path_escape_is_rejected(qapp, tmp_path: Path, entry: str) -> No
 
 
 def test_unsupported_executable_is_rejected(qapp, tmp_path: Path) -> None:
-    source = copy_builtin(tmp_path)
+    source = write_modern_package(tmp_path)
     (source / "payload.exe").write_bytes(b"MZ")
 
     with pytest.raises(InvalidPetAssetError, match="Unsupported"):
@@ -185,16 +260,16 @@ def test_archive_size_limit_is_enforced(qapp, tmp_path: Path, monkeypatch) -> No
 
 
 def test_directory_file_count_limit_is_enforced(qapp, tmp_path: Path, monkeypatch) -> None:
-    source = copy_builtin(tmp_path)
+    source = write_modern_package(tmp_path)
     (source / "extra.txt").write_text("extra", encoding="utf-8")
-    monkeypatch.setattr(pet_assets, "MAX_FILE_COUNT", 3)
+    monkeypatch.setattr(pet_assets, "MAX_FILE_COUNT", 2)
 
     with pytest.raises(InvalidPetAssetError, match="files"):
         PetAssetService(tmp_path / "pets").import_package(source)
 
 
 def test_directory_total_size_limit_is_enforced(qapp, tmp_path: Path, monkeypatch) -> None:
-    source = copy_builtin(tmp_path)
+    source = write_modern_package(tmp_path)
     monkeypatch.setattr(pet_assets, "MAX_TOTAL_BYTES", 1)
 
     with pytest.raises(InvalidPetAssetError, match="total"):
@@ -222,7 +297,7 @@ def test_invalid_zip_is_rejected(qapp, tmp_path: Path) -> None:
 
 
 def test_wrong_spritesheet_dimensions_are_rejected(qapp, tmp_path: Path) -> None:
-    source = copy_builtin(tmp_path)
+    source = write_modern_package(tmp_path)
     image = QImage(32, 32, QImage.Format.Format_ARGB32)
     image.fill(Qt.GlobalColor.transparent)
     assert image.save(str(source / "spritesheet.webp"), "WEBP")
@@ -232,7 +307,7 @@ def test_wrong_spritesheet_dimensions_are_rejected(qapp, tmp_path: Path) -> None
 
 
 def test_corrupt_spritesheet_is_rejected(qapp, tmp_path: Path) -> None:
-    source = copy_builtin(tmp_path)
+    source = write_modern_package(tmp_path)
     (source / "spritesheet.webp").write_bytes(b"not an image")
 
     with pytest.raises(InvalidPetAssetError, match="cannot be decoded"):
@@ -241,21 +316,21 @@ def test_corrupt_spritesheet_is_rejected(qapp, tmp_path: Path) -> None:
 
 def test_failed_replacement_preserves_installed_pet(qapp, tmp_path: Path) -> None:
     service = PetAssetService(tmp_path / "pets")
-    original_source = copy_builtin(tmp_path / "original")
+    original_source = write_modern_package(tmp_path / "original")
     service.import_package(original_source)
-    replacement_source = copy_builtin(tmp_path / "replacement")
+    replacement_source = write_modern_package(tmp_path / "replacement")
     (replacement_source / "spritesheet.webp").write_bytes(b"not an image")
 
     with pytest.raises(InvalidPetAssetError):
         service.import_package(replacement_source, replace=True)
 
-    installed = service.load_active(BUILTIN_PET_ID)
+    installed = service.load_active("sample-test")
     assert installed.is_fallback is False
-    assert installed.manifest.pet_id == BUILTIN_PET_ID
+    assert installed.manifest.pet_id == "sample-test"
 
 
 def test_non_string_compatibility_profile_is_rejected(qapp, tmp_path: Path) -> None:
-    source = copy_builtin(tmp_path)
+    source = write_modern_package(tmp_path)
     manifest_path = source / AMadeus_MANIFEST_NAME
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     document["compatibilityProfile"] = 9
@@ -263,3 +338,22 @@ def test_non_string_compatibility_profile_is_rejected(qapp, tmp_path: Path) -> N
 
     with pytest.raises(InvalidPetAssetError, match="compatibilityProfile"):
         validate_package(source)
+
+
+def test_builtin_large_file_exception_does_not_relax_import_limit(
+    qapp,
+    tmp_path: Path,
+) -> None:
+    service = PetAssetService(tmp_path / "pets")
+    source = write_modern_package(tmp_path / "source")
+    with (source / "spritesheet.webp").open("r+b") as handle:
+        handle.truncate(pet_assets.MAX_SINGLE_FILE_BYTES + 1)
+
+    assert service.load_builtin().manifest.pet_id == BUILTIN_PET_ID
+    with pytest.raises(InvalidPetAssetError, match="exceeds 32 MiB"):
+        service.import_package(source)
+
+
+def test_builtin_directory_is_not_a_general_large_package_exception(qapp) -> None:
+    with pytest.raises(InvalidPetAssetError, match="exceeds 32 MiB"):
+        validate_package(builtin_pet_root())

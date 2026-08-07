@@ -29,6 +29,8 @@ class SpriteSheetSpec:
     columns: int
     rows: int
     default_scale_percent: int
+    logical_frame_width: int
+    logical_frame_height: int
     alpha_threshold: int = 8
     hit_padding: int = 2
 

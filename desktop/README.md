@@ -5,7 +5,7 @@ acceptance workflow on top of the complete P6 settings, tray, proactive-interact
 closure and the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
 text-model integration, and P5 auditable hybrid memory. The application includes safe local pet
 import/switch/removal, fixed-clock animation, transparent hit testing, manual drag placement,
-multi-screen recovery, the pinned P7A built-in Kurisu spritesheet, cancellable chat states, and an exact
+multi-screen recovery, the pinned P7B high-resolution built-in Kurisu spritesheet, cancellable chat states, and an exact
 eight-item system tray.
 
 P4 provides DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom HTTPS provider. API
@@ -102,8 +102,9 @@ revalidation, RRF/quality/decay fusion, and final prompt budgeting. It fails on 
 recall, corpus mixing, leaked runtime/SQLite handles, or p95 above 300 ms.
 
 Wheel, sdist, and Degraded onedir outputs exclude the model, persona material, databases, and logs.
-They include the byte-identical P7A built-in lossless WebP at SHA-256
-`0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d`.
+They include the byte-identical P7B built-in 4x high-resolution lossless WebP at SHA-256
+`cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7`. Its source frames are
+768x832 while the desktop pet remains 192x208 logical pixels at 100% application scale.
 Degraded mode proves packaged FTS recall and a model-missing lifecycle. Bundled mode accepts only the
 fixed verified public model, proves offline 512-D inference plus a model-ready full lifecycle, and is
 the sole onedir input accepted by the P7 installer build. Both modes reject child processes, TCP

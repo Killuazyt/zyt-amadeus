@@ -1,15 +1,54 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
-from PySide6.QtGui import QImage, QMouseEvent
+import json
 
-from amadeus_desktop.pet_assets import PetAssetService
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QImage, QMouseEvent, QPixmap
+
+from amadeus_desktop.pet_assets import PetAssetService, validate_package
 from amadeus_desktop.ui.pet_window import PetWindow
 
 
 def make_window(tmp_path) -> PetWindow:
     asset = PetAssetService(tmp_path / "pets").load_builtin()
     return PetWindow(asset)
+
+
+def make_low_resolution_asset(tmp_path):
+    root = tmp_path / "low-resolution-pet"
+    root.mkdir()
+    document = {
+        "schemaVersion": 1,
+        "id": "low-resolution-test",
+        "displayName": "Low Resolution Test",
+        "description": "synthetic hot-replacement fixture",
+        "kind": "generic",
+        "author": "test",
+        "source": "generated test fixture",
+        "license": "CC0-1.0",
+        "spritesheet": {
+            "path": "spritesheet.webp",
+            "frameWidth": 4,
+            "frameHeight": 5,
+            "logicalFrameWidth": 2,
+            "logicalFrameHeight": 3,
+            "columns": 1,
+            "rows": 1,
+        },
+        "animations": {
+            "idle": {
+                "frames": [[0, 0]],
+                "fps": 6,
+                "loop": True,
+                "fallback": "idle",
+            }
+        },
+    }
+    (root / "pet.amadeus.json").write_text(json.dumps(document), encoding="utf-8")
+    sheet = QImage(4, 5, QImage.Format.Format_ARGB32)
+    sheet.fill(Qt.GlobalColor.red)
+    assert sheet.save(str(root / "spritesheet.webp"), "WEBP")
+    return validate_package(root)
 
 
 def send_mouse(
@@ -50,23 +89,133 @@ def test_window_flags_and_alpha_hit_region(qapp, qtbot, tmp_path) -> None:
     assert not window.mask().contains(QPoint(0, 0))
 
 
-def test_builtin_frame_is_pixel_exact_at_one_hundred_percent(qapp, qtbot, tmp_path) -> None:
+def test_builtin_frame_uses_high_resolution_source_and_logical_window(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
     window = make_window(tmp_path)
     qtbot.addWidget(window)
 
     source = window._source_frame(window.current_frame).convertToFormat(
         QImage.Format.Format_RGBA8888
     )
-    rendered_image = window._render_image(window.current_frame).convertToFormat(
+    rendered_image = window._render_image(window.current_frame, 4.0).convertToFormat(
         QImage.Format.Format_RGBA8888
     )
 
     assert window.scale_percent == 100
     assert (window.width(), window.height()) == (192, 208)
-    assert (source.width(), source.height()) == (192, 208)
+    assert (source.width(), source.height()) == (768, 832)
     assert rendered_image.size() == source.size()
+    assert rendered_image.devicePixelRatio() == 4.0
     assert rendered_image.bytesPerLine() == source.bytesPerLine()
     assert rendered_image.constBits().tobytes() == source.constBits().tobytes()
+
+
+def test_rendered_frame_uses_physical_pixels_and_logical_hit_region(
+    qapp,
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+    monkeypatch.setattr(window, "_effective_device_pixel_ratio", lambda: 1.25)
+    window._frame_cache.clear()
+
+    pixmap, region = window._rendered_frame(window.current_frame)
+
+    assert (pixmap.width(), pixmap.height()) == (240, 260)
+    assert pixmap.devicePixelRatio() == 1.25
+    assert (
+        round(pixmap.deviceIndependentSize().width()),
+        round(pixmap.deviceIndependentSize().height()),
+    ) == (
+        192,
+        208,
+    )
+    assert region.boundingRect().right() < window.width()
+    assert region.boundingRect().bottom() < window.height()
+    assert any(key[2] == 1250 for key in window._frame_cache)
+
+
+def test_dpr_change_event_invalidates_and_rebuilds_cache(
+    qapp,
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+    ratio = [1.0]
+    monkeypatch.setattr(window, "_effective_device_pixel_ratio", lambda: ratio[0])
+    window._frame_cache.clear()
+    window._set_frame(window.current_frame)
+    assert any(key[2] == 1000 for key in window._frame_cache)
+
+    ratio[0] = 1.5
+    event_type = getattr(QEvent.Type, "DevicePixelRatioChange", QEvent.Type.ScreenChangeInternal)
+    qapp.sendEvent(window, QEvent(event_type))
+
+    assert len(window._frame_cache) == 1
+    assert next(iter(window._frame_cache))[2] == 1500
+    assert (window._current_pixmap.width(), window._current_pixmap.height()) == (288, 312)
+    assert window._current_pixmap.devicePixelRatio() == 1.5
+
+
+def test_application_scale_and_dpr_render_matrix(qapp, qtbot, tmp_path) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+    cases = (
+        (100, 1.0, (192, 208), (192, 208)),
+        (100, 1.25, (192, 208), (240, 260)),
+        (100, 1.5, (192, 208), (288, 312)),
+        (100, 2.0, (192, 208), (384, 416)),
+        (125, 1.25, (240, 260), (300, 325)),
+        (150, 1.25, (288, 312), (360, 390)),
+    )
+
+    for scale_percent, dpr, logical_size, physical_size in cases:
+        window.set_scale_percent(scale_percent)
+        rendered = window._render_image(window.current_frame, dpr)
+        pixmap = QPixmap.fromImage(rendered)
+
+        assert (window.width(), window.height()) == logical_size
+        assert (rendered.width(), rendered.height()) == physical_size
+        assert rendered.devicePixelRatio() == dpr
+        assert pixmap.devicePixelRatio() == dpr
+        assert (
+            round(pixmap.deviceIndependentSize().width()),
+            round(pixmap.deviceIndependentSize().height()),
+        ) == logical_size
+
+
+def test_frame_cache_is_bounded_and_hot_replace_releases_high_resolution_sheet(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    window = make_window(tmp_path)
+    qtbot.addWidget(window)
+
+    for animation in window.asset.manifest.animations.values():
+        for frame in animation.frames:
+            window._rendered_frame(frame)
+
+    assert len(window._frame_cache) == 16
+    assert window._sheet.size().width() == 6144
+    assert window._sheet.size().height() == 7488
+
+    replacement = make_low_resolution_asset(tmp_path)
+    window.replace_asset(replacement)
+
+    assert window.asset.manifest.pet_id == "low-resolution-test"
+    assert (window._sheet.width(), window._sheet.height()) == (4, 5)
+    assert (window.width(), window.height()) == (2, 3)
+    assert len(window._frame_cache) == 1
+    pixmap, _region = next(iter(window._frame_cache.values()))
+    assert (pixmap.width(), pixmap.height()) == (2, 3)
 
 
 def test_show_starts_and_hide_pauses_animation(qapp, qtbot, tmp_path) -> None:

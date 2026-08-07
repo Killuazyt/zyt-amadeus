@@ -3,11 +3,11 @@ Amadeus built-in Kurisu asset notice
 
 License status: NOASSERTION
 
-The repository owner explicitly approved inclusion of the exact
-kurisu-makise-wgt spritesheet in the public repository and Windows installer on
-2026-08-06. The approved lossless WebP is pinned by SHA-256:
+The repository owner explicitly approved inclusion of the exact 4x high-resolution
+derivative of the kurisu-makise-wgt spritesheet in the public repository and
+Windows installer on 2026-08-07. The approved lossless WebP is pinned by SHA-256:
 
-0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d
+cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7
 
 The source pet.json did not identify an author, source, or license. Third-party
 redistribution rights were not independently verified. This notice

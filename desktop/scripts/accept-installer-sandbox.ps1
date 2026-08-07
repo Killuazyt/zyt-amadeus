@@ -748,7 +748,7 @@ function Assert-InstalledPrivacyAndModelBoundary {
             $mediaHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             Assert-True -Condition (
                 $isApprovedSheet -and
-                $mediaHash -ceq '0fc585eff61ce454c025f12661e61c8ca1cce36be0198b34fab5863e151c405d'
+                $mediaHash -ceq 'cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7'
             ) -Category 'installed_scan_unauthorized_character_asset'
         }
         if ($normalized.StartsWith($modelRootRelative, [StringComparison]::Ordinal)) {
