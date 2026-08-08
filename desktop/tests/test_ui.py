@@ -156,7 +156,7 @@ class SlowCancellationProvider:
         yield "late synthetic output"
 
 
-def test_generic_icon_requires_no_external_asset(qapp) -> None:
+def test_pinned_application_icon_loads(qapp) -> None:
     assert create_app_icon().isNull() is False
 
 

@@ -13,4 +13,6 @@ The source pet.json did not identify an author, source, or license. Third-party
 redistribution rights were not independently verified, and this notice
 does not grant rights beyond those held by the repository owner. In particular,
 this artwork is not covered by the project's MIT license or by the CC0 notice
-for the independently generated generic application-icon source.
+for the independently generated generic robot fallback/test fixture. The
+separate Kurisu portrait application icon is also NOASSERTION and has its own
+notice.

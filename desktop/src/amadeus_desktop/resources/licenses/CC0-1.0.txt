@@ -1,11 +1,12 @@
 CC0 1.0 Universal
 =================
 
-The Amadeus generic application-icon source spritesheet and the Windows icon
-derived from its first frame are dedicated to the public domain under Creative
-Commons CC0 1.0 Universal, to the extent possible under law, without warranties.
+The Amadeus generic robot fallback/test spritesheet is dedicated to the public
+domain under Creative Commons CC0 1.0 Universal, to the extent possible under
+law, without warranties.
 
-This notice does not cover the built-in Kurisu desktop-pet spritesheet. See
-KURISU-ASSET-NOTICE.txt for that asset's separate NOASSERTION status.
+This notice does not cover the built-in Kurisu desktop-pet spritesheet or the
+Kurisu portrait application icon. See KURISU-ASSET-NOTICE.txt and
+KURISU-ICON-NOTICE.txt for their separate NOASSERTION status.
 
 Canonical legal code: https://creativecommons.org/publicdomain/zero/1.0/legalcode

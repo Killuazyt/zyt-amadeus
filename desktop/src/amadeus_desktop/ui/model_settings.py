@@ -1,4 +1,4 @@
-"""P4-only provider settings dialog with cancellable connection validation."""
+"""Provider settings page with cancellable connection validation."""
 
 from __future__ import annotations
 
@@ -9,19 +9,22 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDialog,
     QDoubleSpinBox,
+    QFrame,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from amadeus_desktop.chat_provider import (
@@ -91,8 +94,8 @@ class _ConnectionTestWorker(QObject):
             self.done.emit()
 
 
-class ModelSettingsWindow(QDialog):
-    """Single reusable P4 model page; no P5/P6 settings are exposed."""
+class ModelSettingsWindow(QWidget):
+    """Reusable provider settings page that can also be shown standalone."""
 
     save_requested = Signal(object, object)
 
@@ -107,8 +110,7 @@ class ModelSettingsWindow(QDialog):
         super().__init__()
         self.setWindowTitle("对话模型设置")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.setModal(False)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(420)
 
         self._credential_reader = credential_reader
         self._tester = tester or ProviderConnectionTester()
@@ -154,29 +156,41 @@ class ModelSettingsWindow(QDialog):
         self.top_p_spin.setSingleStep(0.05)
         self.stream_check = QCheckBox("启用流式输出")
 
-        form = QFormLayout()
-        form.addRow("预设", self.preset_combo)
-        form.addRow("Base URL", self.base_url_edit)
-        form.addRow("模型", self.model_edit)
-        form.addRow("鉴权方式", self.auth_combo)
-        form.addRow("API 密钥", self.secret_edit)
-        form.addRow("连接超时", self.connect_timeout_spin)
-        form.addRow("总请求超时", self.request_timeout_spin)
-        form.addRow("输出上限", self.output_limit_spin)
-        form.addRow("上限字段", self.limit_field_combo)
-        form.addRow("temperature", self.temperature_spin)
-        form.addRow("top_p", self.top_p_spin)
-        form.addRow("", self.stream_check)
+        self.form_layout = QFormLayout()
+        self.form_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+        self.form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.form_layout.addRow("预设", self.preset_combo)
+        self.form_layout.addRow("Base URL", self.base_url_edit)
+        self.form_layout.addRow("模型", self.model_edit)
+        self.form_layout.addRow("鉴权方式", self.auth_combo)
+        self.form_layout.addRow("API 密钥", self.secret_edit)
+        self.form_layout.addRow("连接超时", self.connect_timeout_spin)
+        self.form_layout.addRow("总请求超时", self.request_timeout_spin)
+        self.form_layout.addRow("输出上限", self.output_limit_spin)
+        self.form_layout.addRow("上限字段", self.limit_field_combo)
+        self.form_layout.addRow("temperature", self.temperature_spin)
+        self.form_layout.addRow("top_p", self.top_p_spin)
+        self.form_layout.addRow("", self.stream_check)
 
-        privacy = QLabel(
+        self.privacy_notice = QLabel(
             "密钥只保存到 Windows 凭据管理器，不写入设置、日志或对话。"
             "已保存的密钥不会回显；留空表示继续使用它。"
         )
-        privacy.setWordWrap(True)
-        privacy.setObjectName("credentialPrivacyNotice")
+        self.privacy_notice.setWordWrap(True)
+        self.privacy_notice.setObjectName("credentialPrivacyNotice")
+        self.privacy_notice.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setObjectName("modelSettingsStatus")
+        self.status_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
 
         self.test_button = QPushButton("测试连接")
         self.test_button.clicked.connect(self._start_test)
@@ -190,9 +204,25 @@ class ModelSettingsWindow(QDialog):
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.close_button)
 
+        self.scroll_content = QWidget()
+        content_layout = QVBoxLayout(self.scroll_content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        content_layout.addLayout(self.form_layout)
+        content_layout.addWidget(self.privacy_notice)
+        content_layout.addStretch(1)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("modelSettingsScrollArea")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.scroll_area.setWidget(self.scroll_content)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(privacy)
+        layout.addWidget(self.scroll_area, 1)
         layout.addWidget(self.status_label)
         layout.addLayout(buttons)
 
@@ -324,6 +354,13 @@ class ModelSettingsWindow(QDialog):
 
         self.cancel_test()
         self.hide()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt API name
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     @Slot()
     def _on_preset_changed(self) -> None:

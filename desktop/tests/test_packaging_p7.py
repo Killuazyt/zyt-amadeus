@@ -100,12 +100,14 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
     package_root = DESKTOP_ROOT / "src" / "amadeus_desktop"
     relative_files = (
         "resources/app_icon/LICENSE.txt",
+        "resources/app_icon/amadeus-kurisu.png",
         "resources/app_icon/spritesheet.png",
         "resources/builtin_pet/LICENSE.txt",
         "resources/builtin_pet/pet.amadeus.json",
         "resources/builtin_pet/spritesheet.webp",
         "resources/licenses/CC0-1.0.txt",
         "resources/licenses/KURISU-ASSET-NOTICE.txt",
+        "resources/licenses/KURISU-ICON-NOTICE.txt",
         "resources/licenses/runtime-license-manifest.json",
     )
     wheel = tmp_path / "amadeus_desktop-0.7.0.dev7-py3-none-any.whl"
@@ -444,8 +446,15 @@ def test_payload_manifest_is_generated_and_detects_changes(tmp_path: Path) -> No
     assert "payload hash differs" in rejected.stderr
 
 
-def test_cc0_icon_generator_produces_multisize_windows_icon(tmp_path: Path) -> None:
-    source = DESKTOP_ROOT / "src" / "amadeus_desktop" / "resources" / "app_icon" / "spritesheet.png"
+def test_kurisu_icon_generator_produces_multisize_windows_icon(tmp_path: Path) -> None:
+    source = (
+        DESKTOP_ROOT
+        / "src"
+        / "amadeus_desktop"
+        / "resources"
+        / "app_icon"
+        / "amadeus-kurisu.png"
+    )
     output = tmp_path / "amadeus.ico"
     completed = subprocess.run(
         (

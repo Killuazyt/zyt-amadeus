@@ -49,7 +49,8 @@
     {"name": "Microsoft Visual C++ Runtime", "version": "14.x", "license": "Microsoft Visual C++ Redistributable", "source": "https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/"},
     {"name": "Inno Setup", "version": "6.7.3", "license": "Inno Setup License", "source": "https://jrsoftware.org/isinfo.php"},
     {"name": "Qdrant bge-small-zh-v1.5 ONNX bundle", "version": "46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59", "license": "MIT", "source": "https://huggingface.co/Qdrant/bge-small-zh-v1.5/tree/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59"},
-    {"name": "Amadeus generic application icon source and derived icon", "version": "1", "license": "CC0-1.0", "source": "scripts/generate_builtin_pet.py and scripts/generate_app_icon.py"},
-    {"name": "Amadeus built-in Kurisu 4x high-resolution spritesheet derivative", "version": "sha256:cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7", "license": "NOASSERTION", "source": "resources/builtin_pet/LICENSE.txt"}
+    {"name": "Amadeus generic fallback icon spritesheet", "version": "sha256:2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e", "license": "CC0-1.0", "source": "resources/app_icon/LICENSE.txt"},
+    {"name": "Amadeus built-in Kurisu 4x high-resolution spritesheet derivative", "version": "sha256:cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7", "license": "NOASSERTION", "source": "resources/builtin_pet/LICENSE.txt"},
+    {"name": "Amadeus Kurisu portrait application icon derivative", "version": "sha256:ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5", "license": "NOASSERTION", "source": "resources/licenses/KURISU-ICON-NOTICE.txt"}
   ]
 }

@@ -113,8 +113,14 @@ logs, and unexpected model files.
 
 The built-in Kurisu source manifest did not declare an author, source, or license. Its packaged
 status is `NOASSERTION`; user approval to include it is recorded separately from third-party rights,
-which were not independently verified. See `resources\licenses\KURISU-ASSET-NOTICE.txt`. CC0 applies
-only to the independent generic application-icon source and derived Windows icon.
+which were not independently verified. See `resources\licenses\KURISU-ASSET-NOTICE.txt`.
+
+The application, settings windows, tray, EXE, and installer use the user-selected Kurisu portrait
+icon at SHA-256 `ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5`.
+It is an AI-generated character derivative with `NOASSERTION` status; third-party character and
+redistribution rights were not independently verified. See
+`resources\licenses\KURISU-ICON-NOTICE.txt`. CC0 applies only to the retained generic robot
+fallback/test fixture.
 
 ## P7 installer
 

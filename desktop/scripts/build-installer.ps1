@@ -164,7 +164,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $OnedirPath 'Amadeus.exe') -PathType
 & $PythonPath (Join-Path $DesktopRoot 'scripts\payload_manifest.py') verify --root $OnedirPath
 if ($LASTEXITCODE -ne 0) { throw 'Bundled onedir payload manifest verification failed' }
 if (-not (Test-Path -LiteralPath $IconPath -PathType Leaf)) {
-    throw 'Generated CC0 application icon is missing'
+    throw 'Generated Kurisu application icon is missing'
 }
 if (-not (Test-Path -LiteralPath $ProjectLicense -PathType Leaf)) {
     throw 'Project MIT license is missing'

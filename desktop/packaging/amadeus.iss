@@ -20,7 +20,7 @@
   #error NumericVersion must be provided by build-installer.ps1
 #endif
 #ifndef AppIcon
-  #error AppIcon must identify the generated CC0 application icon
+  #error AppIcon must identify the generated Kurisu application icon
 #endif
 #ifndef ProjectLicense
   #error ProjectLicense must identify the project MIT license

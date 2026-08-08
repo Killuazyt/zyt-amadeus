@@ -803,7 +803,14 @@ class LocalDataService(QObject):
 
         def completed(value: tuple[object, object, ConversationSnapshot]) -> None:
             event, message, snapshot = value
-            self._on_conversation_loaded(snapshot)
+            # A greeting click can finish after the user has switched away.
+            # Persist it in its original conversation without pulling the UI
+            # and current-conversation cursor back to that older conversation.
+            if self._current_conversation_id == target_conversation_id:
+                self._on_conversation_loaded(
+                    snapshot,
+                    failure_operation="proactive_click",
+                )
             self.proactive_greeting_persisted.emit(event, message)
             self.refresh_history()
 
@@ -845,8 +852,13 @@ class LocalDataService(QObject):
         request_id = self.runtime.submit(
             operation,
             priority=DataPriority.INTERACTIVE,
-            on_success=self._on_conversation_loaded,
-            on_failure=lambda category: self.operation_failed.emit("create_conversation", category),
+            on_success=lambda value: self._on_conversation_loaded(
+                value,
+                failure_operation="create_conversation",
+            ),
+            on_failure=lambda category: self.operation_failed.emit(
+                "create_conversation", category
+            ),
         )
         if request_id is None:
             self._on_persistence_submission_failed("create_conversation")
@@ -887,8 +899,13 @@ class LocalDataService(QObject):
         request_id = self.runtime.submit(
             operation,
             priority=DataPriority.INTERACTIVE,
-            on_success=self._on_conversation_loaded,
-            on_failure=lambda category: self.operation_failed.emit("delete_conversation", category),
+            on_success=lambda value: self._on_conversation_loaded(
+                value,
+                failure_operation="delete_conversation",
+            ),
+            on_failure=lambda category: self.operation_failed.emit(
+                "delete_conversation", category
+            ),
         )
         if request_id is None:
             self._on_persistence_submission_failed("delete_conversation")
@@ -906,7 +923,10 @@ class LocalDataService(QObject):
         request_id = self.runtime.submit(
             operation,
             priority=DataPriority.INTERACTIVE,
-            on_success=self._on_conversation_loaded,
+            on_success=lambda value: self._on_conversation_loaded(
+                value,
+                failure_operation="clear_history",
+            ),
             on_failure=lambda category: self.operation_failed.emit("clear_history", category),
         )
         if request_id is None:
@@ -971,18 +991,24 @@ class LocalDataService(QObject):
             else:
                 self._on_conversation_loaded(value)
 
+        operation_name = "conversation" if source_message_id is None else "source_context"
         request_id = self.runtime.submit(
             operation,
             priority=DataPriority.INTERACTIVE,
             on_success=loaded,
-            on_failure=lambda category: self.operation_failed.emit("conversation", category),
+            on_failure=lambda category: self.operation_failed.emit(operation_name, category),
         )
         if request_id is None:
-            self._on_persistence_submission_failed("conversation")
+            self._on_persistence_submission_failed(operation_name)
 
-    def _on_conversation_loaded(self, value: object) -> None:
+    def _on_conversation_loaded(
+        self,
+        value: object,
+        *,
+        failure_operation: str = "conversation",
+    ) -> None:
         if not isinstance(value, ConversationSnapshot):
-            self.operation_failed.emit("conversation", "InvalidConversationSnapshot")
+            self.operation_failed.emit(failure_operation, "InvalidConversationSnapshot")
             return
         self._current_conversation_id = (
             None if value.conversation is None else value.conversation.conversation_id

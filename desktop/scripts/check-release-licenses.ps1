@@ -42,6 +42,7 @@ foreach ($required in @(
     (Join-Path $LicenseRoot 'GPL-3.0.txt'),
     (Join-Path $LicenseRoot 'CC0-1.0.txt'),
     (Join-Path $LicenseRoot 'KURISU-ASSET-NOTICE.txt'),
+    (Join-Path $LicenseRoot 'KURISU-ICON-NOTICE.txt'),
     (Join-Path $LicenseRoot 'PYTHON-3.11-LICENSE.txt'),
     (Join-Path $LicenseRoot 'PYINSTALLER_COPYING.txt'),
     (Join-Path $LicenseRoot 'INNO_SETUP_LICENSE.txt')
@@ -124,6 +125,25 @@ if (
 ) {
     throw 'Built-in Kurisu asset risk notice is incomplete'
 }
+$kurisuIconComponent = @(
+    $manifest.bundled_components |
+        Where-Object { [string]$_.name -eq 'Amadeus Kurisu portrait application icon derivative' }
+)
+if (
+    $kurisuIconComponent.Count -ne 1 -or
+    [string]$kurisuIconComponent[0].version -ne 'sha256:ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5' -or
+    [string]$kurisuIconComponent[0].license -ne 'NOASSERTION'
+) {
+    throw 'Kurisu application icon identity or NOASSERTION status is invalid'
+}
+$kurisuIconNotice = Get-Content -LiteralPath (Join-Path $LicenseRoot 'KURISU-ICON-NOTICE.txt') -Raw -Encoding UTF8
+if (
+    $kurisuIconNotice -notmatch 'NOASSERTION' -or
+    $kurisuIconNotice -notmatch 'ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5' -or
+    $kurisuIconNotice -notmatch 'not independently verified'
+) {
+    throw 'Kurisu application icon risk notice is incomplete'
+}
 $devPackages = Read-LockedPackages $DevLockPath
 if ($devPackages['pyinstaller'] -ne $components['PyInstaller bootloader']) {
     throw 'PyInstaller bootloader notice differs from the development lock'
@@ -151,6 +171,7 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
         'GPL-3.0.txt',
         'CC0-1.0.txt',
         'KURISU-ASSET-NOTICE.txt',
+        'KURISU-ICON-NOTICE.txt',
         'PYTHON-3.11-LICENSE.txt',
         'PYINSTALLER_COPYING.txt',
         'INNO_SETUP_LICENSE.txt'
@@ -195,6 +216,28 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
         $packagedPetNotice -notmatch 'not independently verified'
     ) {
         throw 'Packaged built-in pet notice is incomplete'
+    }
+
+    $packagedIconRoot = Join-Path $internal 'amadeus_desktop\resources\app_icon'
+    $packagedKurisuIcon = Join-Path $packagedIconRoot 'amadeus-kurisu.png'
+    $packagedIconNotice = Join-Path $packagedIconRoot 'LICENSE.txt'
+    foreach ($requiredIconFile in @($packagedKurisuIcon, $packagedIconNotice)) {
+        if (-not (Test-Path -LiteralPath $requiredIconFile -PathType Leaf)) {
+            throw 'Packaged application icon resource is incomplete'
+        }
+    }
+    if (
+        (Get-FileHash -LiteralPath $packagedKurisuIcon -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+        'ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5'
+    ) {
+        throw 'Packaged Kurisu application icon differs from the approved PNG'
+    }
+    $packagedIconNoticeText = Get-Content -LiteralPath $packagedIconNotice -Raw -Encoding UTF8
+    if (
+        $packagedIconNoticeText -notmatch 'NOASSERTION' -or
+        $packagedIconNoticeText -notmatch 'not independently verified'
+    ) {
+        throw 'Packaged Kurisu application icon notice is incomplete'
     }
 
     $metadataPackages = @{}

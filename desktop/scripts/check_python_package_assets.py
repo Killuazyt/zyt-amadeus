@@ -13,16 +13,19 @@ from pathlib import Path
 from PIL import Image
 
 KURISU_SHA256 = "cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7"
-ICON_SOURCE_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
+KURISU_ICON_SHA256 = "ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5"
+GENERIC_ICON_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
 VALID_FRAME_COUNTS = (6, 8, 8, 4, 5, 8, 6, 6, 6)
 REQUIRED_FILES = (
     "resources/app_icon/LICENSE.txt",
+    "resources/app_icon/amadeus-kurisu.png",
     "resources/app_icon/spritesheet.png",
     "resources/builtin_pet/LICENSE.txt",
     "resources/builtin_pet/pet.amadeus.json",
     "resources/builtin_pet/spritesheet.webp",
     "resources/licenses/CC0-1.0.txt",
     "resources/licenses/KURISU-ASSET-NOTICE.txt",
+    "resources/licenses/KURISU-ICON-NOTICE.txt",
     "resources/licenses/runtime-license-manifest.json",
 )
 
@@ -75,11 +78,22 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
     sheet = payloads["resources/builtin_pet/spritesheet.webp"]
     if hashlib.sha256(sheet).hexdigest() != KURISU_SHA256:
         raise ValueError(f"{label} built-in pet hash is invalid")
-    if (
-        hashlib.sha256(payloads["resources/app_icon/spritesheet.png"]).hexdigest()
-        != ICON_SOURCE_SHA256
+    icon = payloads["resources/app_icon/amadeus-kurisu.png"]
+    if hashlib.sha256(icon).hexdigest() != KURISU_ICON_SHA256:
+        raise ValueError(f"{label} Kurisu application icon hash is invalid")
+    if hashlib.sha256(payloads["resources/app_icon/spritesheet.png"]).hexdigest() != (
+        GENERIC_ICON_SHA256
     ):
-        raise ValueError(f"{label} application icon source hash is invalid")
+        raise ValueError(f"{label} generic fallback icon hash is invalid")
+
+    with Image.open(BytesIO(icon)) as image:
+        image.load()
+        if (
+            image.format != "PNG"
+            or image.mode not in {"RGB", "RGBA"}
+            or image.size != (1254, 1254)
+        ):
+            raise ValueError(f"{label} Kurisu application icon metadata is invalid")
 
     with Image.open(BytesIO(sheet)) as image:
         image.load()
@@ -140,6 +154,21 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
         "source": "resources/builtin_pet/LICENSE.txt",
     }:
         raise ValueError(f"{label} runtime asset license identity is invalid")
+    icon_component_name = "Amadeus Kurisu portrait application icon derivative"
+    if components.get(icon_component_name) != {
+        "name": icon_component_name,
+        "version": f"sha256:{KURISU_ICON_SHA256}",
+        "license": "NOASSERTION",
+        "source": "resources/licenses/KURISU-ICON-NOTICE.txt",
+    }:
+        raise ValueError(f"{label} runtime icon license identity is invalid")
+    icon_notice = payloads["resources/licenses/KURISU-ICON-NOTICE.txt"].decode("utf-8")
+    if (
+        "NOASSERTION" not in icon_notice
+        or KURISU_ICON_SHA256 not in icon_notice
+        or "not independently verified" not in icon_notice
+    ):
+        raise ValueError(f"{label} Kurisu application icon notice is incomplete")
 
 
 def main() -> int:
@@ -162,7 +191,12 @@ def main() -> int:
         return 1
     print(
         json.dumps(
-            {"status": "passed", "archives": 2, "asset_sha256": KURISU_SHA256},
+            {
+                "status": "passed",
+                "archives": 2,
+                "asset_sha256": KURISU_SHA256,
+                "icon_sha256": KURISU_ICON_SHA256,
+            },
             sort_keys=True,
         )
     )

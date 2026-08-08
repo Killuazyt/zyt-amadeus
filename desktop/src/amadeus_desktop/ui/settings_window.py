@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QEvent, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QHideEvent, QKeyEvent, QShowEvent
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QCursor, QHideEvent, QKeyEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -40,6 +41,40 @@ _PAGE_SPECS = (
 )
 _PAGE_INDEX = {name: index for index, (name, _label) in enumerate(_PAGE_SPECS)}
 _INDEX_PAGE = {index: name for name, index in _PAGE_INDEX.items()}
+_WINDOW_FLAGS = (
+    Qt.WindowType.Window
+    | Qt.WindowType.WindowTitleHint
+    | Qt.WindowType.WindowSystemMenuHint
+    | Qt.WindowType.WindowMinimizeButtonHint
+    | Qt.WindowType.WindowMaximizeButtonHint
+    | Qt.WindowType.WindowCloseButtonHint
+)
+
+
+class _CurrentPageStack(QStackedWidget):
+    """Size the shell from the visible page instead of every hidden page."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.currentChanged.connect(self._refresh_size_hint)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt API name
+        current = self.currentWidget()
+        if current is None:
+            return super().sizeHint()
+        hint = current.sizeHint()
+        return hint if hint.isValid() else super().sizeHint()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt API name
+        current = self.currentWidget()
+        if current is None:
+            return super().minimumSizeHint()
+        hint = current.minimumSizeHint()
+        return hint if hint.isValid() else super().minimumSizeHint()
+
+    @Slot(int)
+    def _refresh_size_hint(self, _index: int) -> None:
+        self.updateGeometry()
 
 
 class SettingsWindow(QDialog):
@@ -64,10 +99,14 @@ class SettingsWindow(QDialog):
         super().__init__(parent)
         self.setObjectName("settingsWindow")
         self.setWindowTitle("Amadeus 设置")
+        # Keep this as an ordinary taskbar window with explicit native controls;
+        # QDialog's platform-default hints do not include that complete contract.
+        self.setWindowFlags(_WINDOW_FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setModal(False)
         self.resize(1080, 760)
-        self.setMinimumSize(820, 580)
+        self.setMinimumSize(680, 440)
+        self._activation_generation = 0
 
         self.general_page = general_page or GeneralSettingsPage()
         self.pet_page = pet_page or PetSettingsPage()
@@ -105,7 +144,7 @@ class SettingsWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, name)
             self.navigation.addItem(item)
 
-        self.stack = QStackedWidget()
+        self.stack = _CurrentPageStack()
         self.stack.setObjectName("settingsPages")
         for page in self._pages:
             self.stack.addWidget(page)
@@ -159,12 +198,31 @@ class SettingsWindow(QDialog):
     def show_and_activate(self, page: str | None = None) -> None:
         if page is not None:
             self.show_page(page)
+        normal_geometry = self.normalGeometry()
+        if (
+            (self.isMinimized() or self.isMaximized() or self.isFullScreen())
+            and normal_geometry.isValid()
+        ):
+            preferred_size = QSize(normal_geometry.size())
+        else:
+            preferred_size = QSize(self.size())
         current_widget = self.stack.currentWidget()
         if current_widget is not None:
+            current_widget.ensurePolished()
             current_widget.show()
+        self.ensurePolished()
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        self._activation_generation += 1
+        generation = self._activation_generation
         self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        self._finish_activation(generation, preferred_size)
+        QTimer.singleShot(
+            0,
+            self,
+            lambda: self._finish_activation(generation, preferred_size),
+        )
 
     def shutdown(self, wait_ms: int = 2_000) -> bool:
         """Cancel optional embedded background work before application shutdown."""
@@ -227,11 +285,65 @@ class SettingsWindow(QDialog):
 
     @staticmethod
     def _prepare_embedded_page(page: QWidget) -> None:
-        page.hide()
-        page.setParent(None)
-        page.setWindowFlags(Qt.WindowType.Widget)
         page.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _finish_activation(self, generation: int, preferred_size: QSize) -> None:
+        """Reconcile the native frame after Qt's deferred first layout pass."""
+
+        if generation != self._activation_generation or not self.isVisible():
+            return
+        self._fit_to_available_screen(preferred_size)
+        current_widget = self.stack.currentWidget()
+        if current_widget is not None:
+            current_widget.show()
+            current_widget.update()
+        self.stack.show()
+        self.stack.update()
+        self.update()
+        self.raise_()
+        self.activateWindow()
+
+    def _fit_to_available_screen(self, preferred_size: QSize | None = None) -> None:
+        """Keep the complete native frame reachable on the active work area."""
+
+        screen = QApplication.screenAt(QCursor.pos()) or self.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        if available.isEmpty():
+            return
+
+        target_size = QSize(preferred_size or self.size())
+        frame = self.frameGeometry()
+        frame_extra_width = max(0, frame.width() - self.width())
+        frame_extra_height = max(0, frame.height() - self.height())
+        maximum_client_width = max(1, available.width() - frame_extra_width)
+        maximum_client_height = max(1, available.height() - frame_extra_height)
+        self.resize(
+            min(target_size.width(), maximum_client_width),
+            min(target_size.height(), maximum_client_height),
+        )
+        frame = self.frameGeometry()
+        if not frame.intersects(available):
+            target_x = available.x() + max(0, (available.width() - frame.width()) // 2)
+            target_y = available.y() + max(0, (available.height() - frame.height()) // 2)
+        else:
+            target_x = min(
+                max(frame.x(), available.x()),
+                available.x() + max(0, available.width() - frame.width()),
+            )
+            target_y = min(
+                max(frame.y(), available.y()),
+                available.y() + max(0, available.height() - frame.height()),
+            )
+        self.move(
+            self.x() + target_x - frame.x(),
+            self.y() + target_y - frame.y(),
+        )
 
 
 def _call_shutdown(callback: Callable[..., object], wait_ms: int) -> bool:

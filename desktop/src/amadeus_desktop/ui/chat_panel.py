@@ -6,7 +6,7 @@ import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from PySide6.QtCore import QEvent, QRect, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QCloseEvent,
     QHideEvent,
@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QTextOption,
 )
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -191,6 +192,9 @@ class ChatPanel(QWidget):
     retry_requested = Signal(str)
     hide_requested = Signal()
     configure_requested = Signal()
+    conversation_switch_requested = Signal(str)
+    new_conversation_requested = Signal()
+    history_requested = Signal()
     load_older_requested = Signal()
     visibility_changed = Signal(bool)
 
@@ -210,6 +214,10 @@ class ChatPanel(QWidget):
         self._provider_mode = "mock"
         self._has_older_messages = False
         self._loading_older_messages = False
+        self._history_ready = False
+        self._current_conversation_id: str | None = None
+        self._conversation_switch_pending = False
+        self._conversation_drafts: dict[str, str] = {}
 
         self.setObjectName("chatPanel")
         self.setWindowTitle("Amadeus 对话")
@@ -245,6 +253,34 @@ class ChatPanel(QWidget):
         self.provider_banner.setWordWrap(True)
         # Kept as a compatibility alias for the P3 UI checks.
         self.mock_banner = self.provider_banner
+
+        conversation_label = QLabel("会话")
+        conversation_label.setObjectName("conversationLabel")
+        self.conversation_combo = QComboBox()
+        self.conversation_combo.setObjectName("conversationSelector")
+        self.conversation_combo.setAccessibleName("切换当前会话")
+        self.conversation_combo.setToolTip("选择要继续的聊天记录")
+        self.conversation_combo.setMaxVisibleItems(12)
+        self.conversation_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.conversation_combo.setMinimumContentsLength(12)
+        self.new_conversation_button = QPushButton("新会话")
+        self.new_conversation_button.setObjectName("newConversationButton")
+        self.new_conversation_button.setAccessibleName("新建会话")
+        self.new_conversation_button.setAutoDefault(False)
+        self.manage_history_button = QPushButton("管理")
+        self.manage_history_button.setObjectName("manageHistoryButton")
+        self.manage_history_button.setAccessibleName("管理全部聊天历史")
+        self.manage_history_button.setAutoDefault(False)
+
+        conversation_bar = QHBoxLayout()
+        conversation_bar.setContentsMargins(0, 0, 0, 0)
+        conversation_bar.setSpacing(6)
+        conversation_bar.addWidget(conversation_label)
+        conversation_bar.addWidget(self.conversation_combo, 1)
+        conversation_bar.addWidget(self.new_conversation_button)
+        conversation_bar.addWidget(self.manage_history_button)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("messageScroll")
@@ -298,6 +334,7 @@ class ChatPanel(QWidget):
         layout.setSpacing(9)
         layout.addLayout(header)
         layout.addWidget(self.provider_banner)
+        layout.addLayout(conversation_bar)
         layout.addWidget(self.scroll_area, 1)
         layout.addWidget(self.status_label)
         layout.addLayout(composer)
@@ -305,6 +342,10 @@ class ChatPanel(QWidget):
         self._escape_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self._escape_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._escape_shortcut.activated.connect(self._request_hide)
+        self.conversation_combo.activated.connect(self._request_conversation_switch)
+        self.new_conversation_button.clicked.connect(self._request_new_conversation)
+        self.manage_history_button.clicked.connect(self.history_requested.emit)
+        self._sync_conversation_controls()
         self._sync_action_enabled()
 
     @property
@@ -372,7 +413,11 @@ class ChatPanel(QWidget):
         self.provider_banner.style().polish(self.provider_banner)
         self.empty_state.setText(empty)
         self.input.setPlaceholderText(placeholder)
-        self.input.setEnabled(self._chat_enabled and self._storage_ready)
+        self.input.setEnabled(
+            self._chat_enabled
+            and self._storage_ready
+            and not self._conversation_switch_pending
+        )
         self._sync_retry_enabled()
         self._sync_action_enabled()
 
@@ -380,12 +425,67 @@ class ChatPanel(QWidget):
         """Allow queued startup input, but disable writes after fail-closed opening."""
 
         self._storage_ready = not read_only
-        self.input.setEnabled(self._chat_enabled and self._storage_ready)
+        self.input.setEnabled(
+            self._chat_enabled
+            and self._storage_ready
+            and not self._conversation_switch_pending
+        )
         if read_only:
             self.set_status("本地数据库处于只读保护状态，无法发送新消息。", kind="error")
         elif not ready:
             self.set_status("正在初始化本地聊天数据…", kind="working")
         self._sync_retry_enabled()
+        self._sync_conversation_controls()
+        self._sync_action_enabled()
+
+    def set_conversations(
+        self,
+        conversations: Iterable[object],
+        selected_id: str | None = None,
+    ) -> None:
+        """Refresh the compact switcher without initiating a conversation change."""
+
+        previous_id = self._current_conversation_id
+        rows = [_conversation_spec(conversation) for conversation in conversations]
+        valid_ids = {conversation_id for conversation_id, _label, _tooltip in rows}
+        self._conversation_drafts = {
+            conversation_id: draft
+            for conversation_id, draft in self._conversation_drafts.items()
+            if conversation_id in valid_ids
+        }
+        with QSignalBlocker(self.conversation_combo):
+            self.conversation_combo.clear()
+            selected_index = -1
+            for index, (conversation_id, label, tooltip) in enumerate(rows):
+                self.conversation_combo.addItem(label, conversation_id)
+                self.conversation_combo.setItemData(index, tooltip, Qt.ItemDataRole.ToolTipRole)
+                if conversation_id == selected_id:
+                    selected_index = index
+            if selected_index >= 0:
+                self.conversation_combo.setCurrentIndex(selected_index)
+            elif self.conversation_combo.count():
+                self.conversation_combo.setCurrentIndex(0)
+
+        current_data = self.conversation_combo.currentData()
+        self._current_conversation_id = None if current_data is None else str(current_data)
+        if previous_id is not None and previous_id != self._current_conversation_id:
+            self.input.setPlainText(
+                self._conversation_drafts.get(self._current_conversation_id or "", "")
+            )
+        self._history_ready = True
+        self._sync_conversation_controls()
+
+    def set_conversation_switch_pending(self, pending: bool) -> None:
+        if pending and not self._conversation_switch_pending:
+            self._remember_current_draft()
+        self._conversation_switch_pending = bool(pending)
+        self.input.setEnabled(
+            self._chat_enabled
+            and self._storage_ready
+            and not self._conversation_switch_pending
+        )
+        self._sync_retry_enabled()
+        self._sync_conversation_controls()
         self._sync_action_enabled()
 
     def show_and_focus(self) -> None:
@@ -419,6 +519,7 @@ class ChatPanel(QWidget):
         self.action_button.style().unpolish(self.action_button)
         self.action_button.style().polish(self.action_button)
         self._sync_retry_enabled()
+        self._sync_conversation_controls()
         self._sync_action_enabled()
 
     def set_foreground_preparing(self, preparing: bool) -> None:
@@ -431,6 +532,7 @@ class ChatPanel(QWidget):
             self._send_pending = False
             self._pending_send_text = None
         self._sync_retry_enabled()
+        self._sync_conversation_controls()
         self._sync_action_enabled()
 
     def set_status(self, text: str, *, kind: str = "neutral") -> None:
@@ -636,6 +738,26 @@ class ChatPanel(QWidget):
         self.hide_requested.emit()
         self.hide()
 
+    @Slot(int)
+    def _request_conversation_switch(self, index: int) -> None:
+        value = self.conversation_combo.itemData(index)
+        if value is None:
+            return
+        conversation_id = str(value)
+        if conversation_id == self._current_conversation_id:
+            return
+        current_index = self.conversation_combo.findData(self._current_conversation_id)
+        with QSignalBlocker(self.conversation_combo):
+            self.conversation_combo.setCurrentIndex(current_index)
+        self.set_conversation_switch_pending(True)
+        self.conversation_switch_requested.emit(conversation_id)
+
+    def _request_new_conversation(self) -> None:
+        if not self.new_conversation_button.isEnabled():
+            return
+        self.set_conversation_switch_pending(True)
+        self.new_conversation_requested.emit()
+
     def _request_send(self) -> None:
         if (
             not self._chat_enabled
@@ -672,7 +794,11 @@ class ChatPanel(QWidget):
             self._request_send()
 
     def _sync_action_enabled(self) -> None:
-        if not self._chat_enabled or not self._storage_ready:
+        if (
+            not self._chat_enabled
+            or not self._storage_ready
+            or self._conversation_switch_pending
+        ):
             self.action_button.setEnabled(False)
             return
         if self._conversation_active:
@@ -687,8 +813,30 @@ class ChatPanel(QWidget):
     def _sync_retry_enabled(self) -> None:
         for bubble in self._messages.values():
             bubble.set_retry_enabled(
-                self._chat_enabled and self._storage_ready and not self._turn_locked
+                self._chat_enabled
+                and self._storage_ready
+                and not self._turn_locked
+                and not self._conversation_switch_pending
             )
+
+    def _sync_conversation_controls(self) -> None:
+        changing = self._conversation_switch_pending or self._turn_locked
+        self.conversation_combo.setEnabled(
+            self._history_ready and self.conversation_combo.count() > 1 and not changing
+        )
+        self.new_conversation_button.setEnabled(
+            self._history_ready and self._storage_ready and not changing
+        )
+
+    def _remember_current_draft(self) -> None:
+        conversation_id = self._current_conversation_id
+        if conversation_id is None:
+            return
+        draft = self.input.toPlainText()
+        if draft:
+            self._conversation_drafts[conversation_id] = draft
+        else:
+            self._conversation_drafts.pop(conversation_id, None)
 
     def _create_bubble(
         self,
@@ -813,6 +961,28 @@ def _message_spec(message: object) -> tuple[str, str, str, object | None, bool, 
     return message_id, role, text, status, retryable, None if retry_id is None else str(retry_id)
 
 
+def _conversation_spec(conversation: object) -> tuple[str, str, str]:
+    conversation_id = str(_member(conversation, "conversation_id", "id"))
+    title = (
+        str(_member(conversation, "title", "name", default="新对话")).strip()
+        or "新对话"
+    )
+    timestamp = _member(
+        conversation,
+        "last_activity_at",
+        "updated_at",
+        "created_at",
+        default="",
+    )
+    formatter = getattr(timestamp, "strftime", None)
+    updated = (
+        str(formatter("%m-%d %H:%M")) if callable(formatter) else str(timestamp).strip()
+    )
+    label = title if not updated else f"{title} · {updated}"
+    tooltip = title if not updated else f"{title}\n最后活动：{updated}"
+    return conversation_id, label, tooltip
+
+
 def _normalise_role(role: object) -> str:
     value = _enum_text(role).lower()
     return "user" if value == "user" else "assistant"
@@ -863,6 +1033,36 @@ QPushButton#configureButton {
     padding: 4px 8px;
 }
 QPushButton#configureButton:hover { color: #f8fafc; border-color: #22d3ee; }
+QLabel#conversationLabel { color: #94a3b8; }
+QComboBox#conversationSelector {
+    background: #0f172a;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #e2e8f0;
+    min-height: 26px;
+    padding: 2px 8px;
+}
+QComboBox#conversationSelector:hover { border-color: #22d3ee; }
+QComboBox#conversationSelector:disabled { color: #64748b; border-color: #334155; }
+QComboBox#conversationSelector QAbstractItemView {
+    background: #0f172a;
+    border: 1px solid #475569;
+    color: #e2e8f0;
+    selection-background-color: #164e63;
+}
+QPushButton#newConversationButton, QPushButton#manageHistoryButton {
+    background: transparent;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #cbd5e1;
+    min-height: 26px;
+    padding: 2px 7px;
+}
+QPushButton#newConversationButton:hover, QPushButton#manageHistoryButton:hover {
+    color: #f8fafc;
+    border-color: #22d3ee;
+}
+QPushButton#newConversationButton:disabled { color: #64748b; border-color: #334155; }
 QLabel#providerBanner {
     background: #172554;
     border: 1px solid #1d4ed8;

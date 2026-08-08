@@ -35,6 +35,9 @@ APPROVED_MEDIA_SHA256 = {
     "amadeus_desktop/resources/app_icon/spritesheet.png": (
         "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
     ),
+    "amadeus_desktop/resources/app_icon/amadeus-kurisu.png": (
+        "ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5"
+    ),
 }
 SECRET_PATTERNS = (
     re.compile(rb"(?:sk|tp)-[A-Za-z0-9_-]{24,}"),

@@ -1,4 +1,4 @@
-"""Generate the public Windows icon from the verified CC0 icon source."""
+"""Generate the Windows icon from the pinned Kurisu application portrait."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 
 from PIL import Image
 
-ICON_SOURCE_SHA256 = "2d9795265224b99619d34320e57b070a081ebc1c55df0152fd3041242dbd953e"
-FRAME_SIZE = (96, 112)
+ICON_SOURCE_SHA256 = "ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5"
+ICON_SOURCE_SIZE = (1254, 1254)
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 
@@ -32,14 +32,11 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source) as sheet:
         sheet.load()
-        if sheet.size != (768, 1008):
-            raise SystemExit("application icon source dimensions do not match the public asset")
-        frame = sheet.convert("RGBA").crop((0, 0, *FRAME_SIZE))
+        if sheet.format != "PNG" or sheet.size != ICON_SOURCE_SIZE:
+            raise SystemExit("application icon source metadata does not match the pinned asset")
+        icon = sheet.convert("RGBA").resize((256, 256), Image.Resampling.LANCZOS)
 
-    canvas = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
-    scaled = frame.resize((192, 224), Image.Resampling.LANCZOS)
-    canvas.alpha_composite(scaled, ((256 - 192) // 2, (256 - 224) // 2))
-    canvas.save(output, format="ICO", sizes=[(size, size) for size in ICON_SIZES])
+    icon.save(output, format="ICO", sizes=[(size, size) for size in ICON_SIZES])
     return 0
 
 

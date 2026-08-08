@@ -1,11 +1,30 @@
+Amadeus application icon asset notices
+=======================================
+
+amadeus-kurisu.png
+-------------------
+
+License status: NOASSERTION
+
+This Kurisu portrait application icon was generated for Amadeus on 2026-08-07
+from a project-local character reference at the repository owner's explicit
+direction. It is pinned by SHA-256:
+
+ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5
+
+Third-party character and redistribution rights were not independently
+verified. The asset is not covered by the project MIT license or CC0-1.0.
+See resources/licenses/KURISU-ICON-NOTICE.txt for the distribution-risk notice.
+
+spritesheet.png
+---------------
+
 SPDX-License-Identifier: CC0-1.0
 
-The Amadeus generic application-icon source spritesheet and the Windows icon
-derived from its first frame are dedicated to the public domain under Creative
-Commons CC0 1.0 Universal.
-
-To the extent possible under law, the Amadeus project contributors have waived
-all copyright and related or neighboring rights to this artwork. The work is
-provided without warranty.
+The generic robot spritesheet is retained only as an emergency fallback and
+test fixture. To the extent possible under law, the Amadeus project
+contributors have waived all copyright and related or neighboring rights to
+that generic artwork under Creative Commons CC0 1.0 Universal. It is provided
+without warranty.
 
 License text and details: https://creativecommons.org/publicdomain/zero/1.0/

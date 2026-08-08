@@ -42,7 +42,9 @@ Local persona knowledge is imported from `%LOCALAPPDATA%\Amadeus\personas\kurisu
 
 Wheels, source distributions, and the Degraded onedir contain neither the embedding model nor local persona/user data. They do include the P7B built-in Kurisu 4x high-resolution lossless WebP at its pinned SHA-256; source frames are 768x832 and render as 192x208 logical pixels at 100% application scale. The P7 installer is built only from the Bundled PyInstaller onedir after the fixed public model, privacy scan, archive tags, and release-notice closure pass verification.
 
-The built-in Kurisu source manifest declared no author, source, or license. Its packaged status is `NOASSERTION`: the repository owner explicitly approved the exact 4x derivative for inclusion on 2026-08-07, but third-party redistribution rights were not independently verified. See `desktop/src/amadeus_desktop/resources/licenses/KURISU-ASSET-NOTICE.txt`. The project MIT license and the CC0 application-icon notice do not cover that spritesheet.
+The built-in Kurisu source manifest declared no author, source, or license. Its packaged status is `NOASSERTION`: the repository owner explicitly approved the exact 4x derivative for inclusion on 2026-08-07, but third-party redistribution rights were not independently verified. See `desktop/src/amadeus_desktop/resources/licenses/KURISU-ASSET-NOTICE.txt`.
+
+The Kurisu portrait application icon is separately pinned at SHA-256 `ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5`. It is an AI-generated character derivative with `NOASSERTION` status; third-party character and redistribution rights were not independently verified. See `desktop/src/amadeus_desktop/resources/licenses/KURISU-ICON-NOTICE.txt`. The project MIT license and the CC0 generic fallback/test notice do not cover either Kurisu asset.
 
 ## P7 packaging and clean-machine acceptance
 

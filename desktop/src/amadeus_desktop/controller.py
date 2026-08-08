@@ -161,6 +161,9 @@ class ApplicationController:
         self._data_writable = False
         self._pending_initial_message: str | None = None
         self._conversation_switch_pending = False
+        self._pending_conversation_change_kind: str | None = None
+        self._pending_conversation_change_target: str | None = None
+        self._pending_conversation_previous_id: str | None = None
         self._pending_foreground_action: tuple[str, str] | None = None
         self._provider_switch_pending = False
         self._pending_provider_configuration: ProviderConfig | None = None
@@ -344,7 +347,7 @@ class ApplicationController:
         self.chat_panel.stop_requested.connect(self.conversation.stop)
         self.chat_panel.retry_requested.connect(self._retry_chat_turn)
         self.chat_panel.hide_requested.connect(self.hide_chat)
-        self.chat_panel.configure_requested.connect(self.show_model_settings)
+        self.chat_panel.configure_requested.connect(self._show_model_settings_from_chat)
         self.conversation.turn_added.connect(self.chat_panel.add_turn)
         self.conversation.turn_updated.connect(self.chat_panel.update_turn)
         self.conversation.state_changed.connect(self._on_conversation_state_changed)
@@ -1379,6 +1382,10 @@ class ApplicationController:
         ):
             return False
         self._conversation_switch_pending = True
+        self._pending_conversation_change_kind = None
+        self._pending_conversation_change_target = None
+        self._pending_conversation_previous_id = self.data_service.current_conversation_id
+        self.chat_panel.set_conversation_switch_pending(True)
         self.chat_panel.set_storage_availability(False, read_only=True)
         self.memory_maintenance_timer.stop()
         proactive_clean = self.proactive_interactions.stop(wait_ms=2_000)
@@ -1389,7 +1396,7 @@ class ApplicationController:
         return True
 
     def _resume_after_aborted_data_change(self) -> None:
-        self._conversation_switch_pending = False
+        self._finish_conversation_change()
         self.chat_panel.set_storage_availability(
             self._data_writable,
             read_only=not self._data_writable,
@@ -1530,11 +1537,33 @@ class ApplicationController:
     def show_model_settings(self) -> None:
         """Deep-link to the model page in the reusable P5 settings shell."""
 
+        if self._exiting:
+            return
+        # The chat panel may be always-on-top and otherwise cover the model form
+        # and its save action while the settings window has focus.
+        self.hide_chat()
         self.settings_window.show_and_activate("model")
 
+    def _show_model_settings_from_chat(self) -> None:
+        if self._exiting:
+            return
+        self.hide_chat()
+        QTimer.singleShot(0, self.application, self.show_model_settings)
+
     def show_history_settings(self) -> None:
+        if self._exiting:
+            return
+        self.hide_chat()
+        already_current = self.settings_window.current_page == "history"
         self.settings_window.show_and_activate("history")
-        self.data_service.refresh_history()
+        if already_current:
+            self.data_service.refresh_history()
+
+    def _show_history_settings_from_chat(self) -> None:
+        if self._exiting:
+            return
+        self.hide_chat()
+        QTimer.singleShot(0, self.application, self.show_history_settings)
 
     def show_memory_settings(self) -> None:
         self.settings_window.show_and_activate("memory")
@@ -1548,7 +1577,7 @@ class ApplicationController:
         )
         self.data_service.conversation_loaded.connect(self._on_persisted_conversation_loaded)
         self.data_service.older_messages_loaded.connect(self._on_older_messages_loaded)
-        self.data_service.history_loaded.connect(self.history_page.set_conversations)
+        self.data_service.history_loaded.connect(self._on_history_loaded)
         self.data_service.memories_loaded.connect(self._on_memories_loaded)
         self.data_service.memories_cleared.connect(self._on_memories_cleared)
         self.data_service.memory_sources_loaded.connect(self.memory_page.set_sources)
@@ -1560,6 +1589,9 @@ class ApplicationController:
         self.vector_index.status_changed.connect(self._on_vector_status_for_p6)
 
         self.chat_panel.load_older_requested.connect(self.data_service.load_older_messages)
+        self.chat_panel.conversation_switch_requested.connect(self._request_conversation_switch)
+        self.chat_panel.new_conversation_requested.connect(self._request_new_conversation)
+        self.chat_panel.history_requested.connect(self._show_history_settings_from_chat)
         self.history_page.refresh_requested.connect(self.data_service.refresh_history)
         self.history_page.conversation_selected.connect(self._request_conversation_switch)
         self.history_page.new_conversation_requested.connect(self._request_new_conversation)
@@ -1652,6 +1684,7 @@ class ApplicationController:
             None if snapshot.conversation is None else snapshot.conversation.conversation_id
         )
         self.history_page.set_conversations(snapshot.conversations, selected_id)
+        self.chat_panel.set_conversations(snapshot.conversations, selected_id)
         if selected_id is not None:
             self.history_page.set_messages(
                 selected_id,
@@ -1661,11 +1694,20 @@ class ApplicationController:
         return True
 
     def _on_persisted_conversation_loaded(self, snapshot_object: object) -> None:
-        self._conversation_switch_pending = False
         if not isinstance(snapshot_object, ConversationSnapshot):
             self._on_data_operation_failed("conversation", "InvalidConversationSnapshot")
             return
-        self._apply_conversation_snapshot(snapshot_object)
+        change_completed = self._pending_conversation_change_matches(snapshot_object)
+        if change_completed:
+            self._finish_conversation_change()
+        if self._apply_conversation_snapshot(snapshot_object) and change_completed:
+            self.chat_panel.set_status("会话已更新。", kind="success")
+
+    def _on_history_loaded(self, conversations: object, selected_id: str) -> None:
+        current_id = self.data_service.current_conversation_id
+        effective_selected_id = selected_id if current_id is None else current_id
+        self.history_page.set_conversations(conversations, effective_selected_id)
+        self.chat_panel.set_conversations(conversations, effective_selected_id)
 
     def _on_older_messages_loaded(self, snapshot_object: object) -> None:
         if not isinstance(snapshot_object, OlderMessagesSnapshot):
@@ -1685,42 +1727,100 @@ class ApplicationController:
         )
 
     def _request_conversation_switch(self, conversation_id: str) -> None:
+        if conversation_id == self.data_service.current_conversation_id:
+            self.chat_panel.set_conversation_switch_pending(False)
+            return
         if not self._can_change_conversation():
+            self.chat_panel.set_conversation_switch_pending(self._conversation_switch_pending)
             self.data_service.refresh_history()
             return
-        self._conversation_switch_pending = True
+        self._start_conversation_change("switch", conversation_id)
+        self.chat_panel.set_status("正在切换会话…", kind="working")
         self.data_service.switch_conversation(conversation_id)
 
     def _request_new_conversation(self) -> None:
         if not self._can_change_conversation():
+            self.chat_panel.set_conversation_switch_pending(self._conversation_switch_pending)
             return
-        self._conversation_switch_pending = True
+        self._start_conversation_change("create")
+        self.chat_panel.set_status("正在新建会话…", kind="working")
         self.data_service.create_conversation()
 
     def _request_delete_conversation(self, conversation_id: str) -> None:
         if not self._can_change_conversation():
             return
-        self._conversation_switch_pending = True
+        self._start_conversation_change("delete", conversation_id)
         self.data_service.delete_conversation(conversation_id)
 
     def _request_clear_history(self) -> None:
         if not self._can_change_conversation():
             return
-        self._conversation_switch_pending = True
+        self._start_conversation_change("clear")
         self.data_service.clear_conversations()
 
     def _request_older_history_messages(self, conversation_id: str) -> None:
         if conversation_id == self.data_service.current_conversation_id:
             self.data_service.load_older_messages()
 
+    def _start_conversation_change(self, kind: str, target: str | None = None) -> None:
+        self._conversation_switch_pending = True
+        self._pending_conversation_change_kind = kind
+        self._pending_conversation_change_target = target
+        self._pending_conversation_previous_id = self.data_service.current_conversation_id
+        self.chat_panel.set_conversation_switch_pending(True)
+
+    def _finish_conversation_change(self) -> None:
+        self._conversation_switch_pending = False
+        self._pending_conversation_change_kind = None
+        self._pending_conversation_change_target = None
+        self._pending_conversation_previous_id = None
+        self.chat_panel.set_conversation_switch_pending(False)
+
+    def _pending_conversation_change_matches(self, snapshot: ConversationSnapshot) -> bool:
+        if not self._conversation_switch_pending:
+            return False
+        kind = self._pending_conversation_change_kind
+        if kind is None:
+            return False
+        current_id = (
+            None if snapshot.conversation is None else snapshot.conversation.conversation_id
+        )
+        conversation_ids = {
+            conversation.conversation_id for conversation in snapshot.conversations
+        }
+        if kind == "switch":
+            return current_id == self._pending_conversation_change_target
+        if kind == "create":
+            return current_id is not None and current_id != self._pending_conversation_previous_id
+        if kind == "delete":
+            return self._pending_conversation_change_target not in conversation_ids
+        if kind == "clear":
+            return (
+                len(conversation_ids) == 1
+                and current_id is not None
+                and current_id != self._pending_conversation_previous_id
+            )
+        return False
+
     def _can_change_conversation(self) -> bool:
         if (
             self._conversation_switch_pending
+            or self._provider_switch_pending
             or self._pending_foreground_action is not None
             or self.conversation.state is not ConversationState.IDLE
             or self.conversation.is_active
         ):
-            self.history_page.set_status("请等当前回复结束后再管理会话。", error=True)
+            if self._conversation_switch_pending:
+                history_message = "会话正在更新，请稍候。"
+                chat_message = "会话正在更新，请稍候。"
+            elif self._provider_switch_pending:
+                history_message = "模型配置正在更新，请稍候。"
+                chat_message = "模型配置正在更新，请稍候再切换会话。"
+            else:
+                history_message = "请等当前回复结束后再管理会话。"
+                chat_message = "请等当前回复结束后再切换会话。"
+            self.history_page.set_status(history_message, error=True)
+            self.chat_panel.set_status(chat_message, kind="error")
             return False
         return True
 
@@ -1885,7 +1985,6 @@ class ApplicationController:
             operation,
             category,
         )
-        self._conversation_switch_pending = False
         self._last_safe_error_category = "storage_error"
         self.proactive_interactions.persistence_failed(operation)
         if operation == "clear_memories":
@@ -1893,8 +1992,27 @@ class ApplicationController:
             if self._data_change_state == "clear_memories":
                 self._finish_data_operation()
         message = "本地数据操作失败，请稍后重试。"
-        if operation in {"finalize", "checkpoint"}:
+        conversation_operations = {
+            "conversation",
+            "create_conversation",
+            "delete_conversation",
+            "clear_history",
+        }
+        expected_operation = {
+            "switch": "conversation",
+            "create": "create_conversation",
+            "delete": "delete_conversation",
+            "clear": "clear_history",
+        }.get(self._pending_conversation_change_kind or "")
+        failed_pending_change = (
+            self._conversation_switch_pending and operation == expected_operation
+        )
+        if failed_pending_change:
+            self._finish_conversation_change()
+        if operation in {"finalize", "checkpoint", *conversation_operations}:
             self.chat_panel.set_status(message, kind="error")
+        if failed_pending_change:
+            self.data_service.refresh_history()
         if operation.startswith("memory") or operation in {
             "edit_memory",
             "pin_memory",
@@ -1978,6 +2096,12 @@ class ApplicationController:
             self.model_settings_window.apply_save_result(
                 success=False,
                 message="已有模型配置正在安全保存，请稍候。",
+            )
+            return
+        if self._conversation_switch_pending:
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="会话正在更新，请稍候再保存模型配置。",
             )
             return
         if self._pending_foreground_action is not None:

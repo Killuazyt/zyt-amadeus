@@ -1,4 +1,4 @@
-"""Generate the deterministic CC0 application-icon source spritesheet."""
+"""Generate the deterministic CC0 generic fallback/test spritesheet."""
 
 from __future__ import annotations
 

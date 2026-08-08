@@ -27,6 +27,7 @@ from amadeus_desktop.maintenance import (
 from amadeus_desktop.paths import AppPaths
 from amadeus_desktop.settings import DEFAULT_SETTINGS, SettingsError, SettingsRepository
 from amadeus_desktop.single_instance import DEFAULT_SERVER_NAME, SingleInstance
+from amadeus_desktop.ui.tray import create_app_icon
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -78,6 +79,7 @@ def _run_application(arguments: list[str], build_info: BuildInfo) -> int:
     application.setApplicationDisplayName("Amadeus")
     application.setApplicationVersion(build_info.version)
     application.setOrganizationName("Amadeus")
+    application.setWindowIcon(create_app_icon())
     application.setQuitOnLastWindowClosed(False)
 
     instance_guard = SingleInstance(acceptance_instance_name or DEFAULT_SERVER_NAME)

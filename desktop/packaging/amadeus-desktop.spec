@@ -58,6 +58,10 @@ RUNTIME_DISTRIBUTIONS = (
 
 datas = [
     (
+        str(source_root / "amadeus_desktop" / "resources" / "app_icon"),
+        "amadeus_desktop/resources/app_icon",
+    ),
+    (
         str(source_root / "amadeus_desktop" / "resources" / "builtin_pet"),
         "amadeus_desktop/resources/builtin_pet",
     ),

@@ -1,0 +1,22 @@
+Amadeus Kurisu portrait application icon notice
+================================================
+
+License status: NOASSERTION
+
+At the repository owner's explicit direction on 2026-08-07, Amadeus generated
+and selected a new application icon whose main subject is a portrait of Makise
+Kurisu. The approved PNG is 1,710,681 bytes, 1254 x 1254 pixels, and is pinned
+by SHA-256:
+
+ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5
+
+The image was created with OpenAI image generation using a project-local
+Kurisu character reference. It does not contain the official STEINS;GATE word
+mark, but third-party character and redistribution rights were not
+independently verified. This notice records the user's distribution decision
+and known risk; it does not grant rights beyond those held by the repository
+owner.
+
+The icon is not covered by the project's MIT license or by CC0-1.0.txt. The
+CC0 notice applies only to the independently generated generic robot fallback
+and test fixture in resources/app_icon/spritesheet.png.

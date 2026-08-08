@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from importlib import resources
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
@@ -10,7 +11,25 @@ from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 
 def create_app_icon() -> QIcon:
-    """Create a generic redistributable icon without private character assets."""
+    """Load the pinned Kurisu application icon, with a safe generic fallback."""
+
+    try:
+        payload = (
+            resources.files("amadeus_desktop.resources")
+            .joinpath("app_icon", "amadeus-kurisu.png")
+            .read_bytes()
+        )
+    except OSError:
+        return _create_fallback_icon()
+
+    pixmap = QPixmap()
+    if pixmap.loadFromData(payload):
+        return QIcon(pixmap)
+    return _create_fallback_icon()
+
+
+def _create_fallback_icon() -> QIcon:
+    """Keep lifecycle controls usable if the packaged icon is unavailable."""
 
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.GlobalColor.transparent)

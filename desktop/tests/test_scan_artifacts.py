@@ -83,6 +83,10 @@ def test_scanner_only_allows_exact_pinned_pet_and_icon_media(tmp_path) -> None:
     copied_pet = bundled_pet / "spritesheet.webp"
     shutil.copy2(resource_root / "builtin_pet" / "spritesheet.webp", copied_pet)
     shutil.copy2(resource_root / "app_icon" / "spritesheet.png", app_icon / "spritesheet.png")
+    shutil.copy2(
+        resource_root / "app_icon" / "amadeus-kurisu.png",
+        app_icon / "amadeus-kurisu.png",
+    )
 
     exit_code, result = _scan(tmp_path)
 
