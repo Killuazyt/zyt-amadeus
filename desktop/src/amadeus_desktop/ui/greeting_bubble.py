@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPaintEvent, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QPen
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from amadeus_desktop.proactive import GREETING_BUBBLE_TIMEOUT_MS

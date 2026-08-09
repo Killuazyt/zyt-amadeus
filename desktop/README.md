@@ -149,5 +149,7 @@ The installer is current-user, x64, and does not download runtime resources. Log
 only on a first install and is unchecked by default. Normal uninstall preserves local data and WinCred;
 the explicit `/DELETEUSERDATA=1` acceptance switch exercises the seven-region fail-closed cleanup.
 Legacy Chromium `localStorage`, legacy `.env` credentials, Token Plan configuration, and old character
-prompts are intentionally not migrated. P7 is an unsigned test package; P8 retains signing decisions,
-physical mixed-DPI/multi-monitor regression, three-day daily use, and eight-hour stability acceptance.
+prompts are intentionally not migrated. P7 is an unsigned test package. P8 is reserved as the one-time
+final acceptance after all remaining user-directed feature and task adjustments are complete; it retains
+signing decisions, physical mixed-DPI/multi-monitor regression, three-day daily use, and eight-hour
+stability acceptance instead of repeating those full checks during intermediate iterations.
