@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -11,6 +12,7 @@ from uuid import uuid4
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from amadeus_desktop.background_generation import BackgroundGenerationRunner
+from amadeus_desktop.chat_models import ChatRequest
 from amadeus_desktop.greetings import GreetingCatalog, GreetingCatalogError, load_greeting_catalog
 from amadeus_desktop.presence import PresenceProbe, PresenceSnapshot
 from amadeus_desktop.proactive import (
@@ -62,6 +64,17 @@ class ProactiveDataGateway(Protocol):
 Clock = Callable[[], datetime]
 
 
+@dataclass(frozen=True, slots=True)
+class ProactiveVisualPlan:
+    """A volatile visual request, or a fail-closed claimed opportunity."""
+
+    request: ChatRequest | None
+    provider_metadata: tuple[str | None, str | None] = (None, None)
+
+
+VisualPlanBuilder = Callable[[datetime, ProactiveTrigger], ProactiveVisualPlan | None]
+
+
 class ProactiveInteractionController(QObject):
     """Own timers and one greeting at a time without ever taking focus."""
 
@@ -92,6 +105,8 @@ class ProactiveInteractionController(QObject):
         release_ai_lane: Callable[[], None],
         cancel_ai_lane: Callable[[int], bool],
         open_chat: Callable[[], None],
+        visual_generation_runner: BackgroundGenerationRunner | None = None,
+        visual_plan_builder: VisualPlanBuilder | None = None,
         greeting_catalog_path: Path | None = None,
         startup_delay_ms: int = STARTUP_DELAY_MS,
         poll_interval_ms: int = POLL_INTERVAL_MS,
@@ -119,6 +134,8 @@ class ProactiveInteractionController(QObject):
         self._release_ai_lane = release_ai_lane
         self._cancel_ai_lane = cancel_ai_lane
         self._open_chat = open_chat
+        self._visual_generation_runner = visual_generation_runner
+        self._visual_plan_builder = visual_plan_builder
         self._tracker = ProactiveOpportunityTracker()
         self._pending_trigger: ProactiveTrigger | None = None
         self._pending_date: date | None = None
@@ -129,6 +146,9 @@ class ProactiveInteractionController(QObject):
         self._click_pending = False
         self._dismiss_pending = False
         self._ai_lane_owned = False
+        self._active_generation_runner: BackgroundGenerationRunner | None = None
+        self._active_generation_is_visual = False
+        self._active_generation_metadata: tuple[str | None, str | None] = (None, None)
         self._running = False
         self._observed_local_date = self._clock().date()
         self._using_local_catalog = False
@@ -181,7 +201,7 @@ class ProactiveInteractionController(QObject):
         self._clear_active()
         if not self._ai_lane_owned:
             return True
-        stopped = self._cancel_ai_lane(wait_ms)
+        stopped = self._cancel_active_generation(wait_ms)
         self._release_ai()
         return stopped
 
@@ -196,7 +216,7 @@ class ProactiveInteractionController(QObject):
         self._clear_pending_opportunity()
         if not self._ai_lane_owned:
             return True
-        stopped = self._cancel_ai_lane(wait_ms)
+        stopped = self._cancel_active_generation(wait_ms)
         self._release_ai()
         return stopped
 
@@ -294,6 +314,24 @@ class ProactiveInteractionController(QObject):
             self._clear_pending_opportunity()
             self.status_changed.emit(reason.value)
             return
+        visual_plan = self._build_visual_plan(now, trigger)
+        if visual_plan is not None:
+            if visual_plan.request is None or self._visual_generation_runner is None:
+                self._clear_pending_opportunity()
+                self.status_changed.emit("visual_unavailable")
+                return
+            if self._start_ai_generation(
+                trigger,
+                now,
+                request=visual_plan.request,
+                runner=self._visual_generation_runner,
+                visual=True,
+                provider_metadata=visual_plan.provider_metadata,
+            ):
+                return
+            self._clear_pending_opportunity()
+            self.status_changed.emit("visual_busy")
+            return
         if (
             bool(settings["ai_greetings_enabled"])
             and self._provider_configured()
@@ -302,13 +340,28 @@ class ProactiveInteractionController(QObject):
             return
         self._display_local(trigger, now)
 
-    def _start_ai_generation(self, trigger: ProactiveTrigger, now: datetime) -> bool:
+    def _start_ai_generation(
+        self,
+        trigger: ProactiveTrigger,
+        now: datetime,
+        *,
+        request: ChatRequest | None = None,
+        runner: BackgroundGenerationRunner | None = None,
+        visual: bool = False,
+        provider_metadata: tuple[str | None, str | None] = (None, None),
+    ) -> bool:
         if not self._acquire_ai_lane():
             return False
         self._ai_lane_owned = True
-        request = build_proactive_request(now, trigger)
-        started = self._generation_runner.start(
-            request,
+        selected_runner = runner or self._generation_runner
+        selected_request = request or build_proactive_request(now, trigger)
+        self._active_generation_runner = selected_runner
+        self._active_generation_is_visual = visual
+        self._active_generation_metadata = provider_metadata
+        if selected_runner is not self._generation_runner:
+            selected_runner.resume()
+        started = selected_runner.start(
+            selected_request,
             on_success=lambda content: self._on_ai_success(trigger, now, content),
             on_failure=lambda _category: self._on_ai_failure(trigger, now),
         )
@@ -317,25 +370,41 @@ class ProactiveInteractionController(QObject):
         return started
 
     def _on_ai_success(self, trigger: ProactiveTrigger, now: datetime, content: str) -> None:
+        was_visual = self._active_generation_is_visual
+        provider_metadata = (
+            self._active_generation_metadata if was_visual else self._provider_metadata()
+        )
         self._release_ai()
         if (
             not self._running
             or self._exiting()
             or self._pending_trigger is not trigger
             or self._pending_date != now.date()
-            or not bool(self._settings_reader()["proactive"]["ai_greetings_enabled"])
+            or (
+                not was_visual
+                and not bool(self._settings_reader()["proactive"]["ai_greetings_enabled"])
+            )
         ):
             self._clear_pending_opportunity()
             return
         try:
             greeting = validate_generated_greeting(content)
         except ValueError:
+            if was_visual:
+                self._clear_pending_opportunity()
+                self.status_changed.emit("visual_generation_failed")
+                return
             self._display_local(trigger, now)
             return
-        self._display(trigger, now, greeting, provider_metadata=self._provider_metadata())
+        self._display(trigger, now, greeting, provider_metadata=provider_metadata)
 
     def _on_ai_failure(self, trigger: ProactiveTrigger, now: datetime) -> None:
+        was_visual = self._active_generation_is_visual
         self._release_ai()
+        if was_visual:
+            self._clear_pending_opportunity()
+            self.status_changed.emit("visual_generation_failed")
+            return
         if (
             self._running
             and not self._exiting()
@@ -504,7 +573,29 @@ class ProactiveInteractionController(QObject):
         if not self._ai_lane_owned:
             return
         self._ai_lane_owned = False
+        self._active_generation_runner = None
+        self._active_generation_is_visual = False
+        self._active_generation_metadata = (None, None)
         self._release_ai_lane()
+
+    def _cancel_active_generation(self, wait_ms: int) -> bool:
+        runner = self._active_generation_runner
+        if runner is None or runner is self._generation_runner:
+            return self._cancel_ai_lane(wait_ms)
+        return runner.pause(wait_ms)
+
+    def _build_visual_plan(
+        self,
+        now: datetime,
+        trigger: ProactiveTrigger,
+    ) -> ProactiveVisualPlan | None:
+        builder = self._visual_plan_builder
+        if builder is None:
+            return None
+        try:
+            return builder(now, trigger)
+        except Exception:  # noqa: BLE001 - no captured content enters diagnostics
+            return ProactiveVisualPlan(None)
 
     def _emit_local_date_change_if_needed(self) -> None:
         current = self._clock().date()

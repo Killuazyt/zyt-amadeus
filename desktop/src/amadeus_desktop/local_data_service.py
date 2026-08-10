@@ -11,14 +11,20 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
+from amadeus_desktop.attachments import AttachmentStore
 from amadeus_desktop.chat_models import (
+    AttachmentKind,
+    AttachmentSnapshot,
+    AttachmentSource,
     ChatMessage,
     ConversationTurn,
+    InputModality,
     MessageRole,
     MessageStatus,
     PreparedPrompt,
     PromptMessage,
     PromptRole,
+    ProviderRoute,
     TurnTerminalReason,
 )
 from amadeus_desktop.conversation_store import (
@@ -52,6 +58,10 @@ from amadeus_desktop.storage_models import (
     MessagePage,
     ProactiveTrigger,
     StorageNotFoundError,
+    StoredAttachment,
+    StoredAttachmentKind,
+    StoredAttachmentSource,
+    StoredInputModality,
     StoredMessage,
     StoredMessageOrigin,
     StoredMessageRole,
@@ -77,6 +87,7 @@ class LocalDataStores:
     vectors: VectorStore
     jobs: BackgroundJobStore
     proactive: ProactiveInteractionStore
+    attachments: AttachmentStore
 
     def close(self) -> None:
         self.database.close()
@@ -165,7 +176,11 @@ def _without_user_memory(prepared: PreparedPrompt) -> PreparedPrompt:
     )
 
 
-def create_local_data_stores(database_path: Path, backup_directory: Path) -> LocalDataStores:
+def create_local_data_stores(
+    database_path: Path,
+    backup_directory: Path,
+    attachment_directory: Path | AttachmentStore | None = None,
+) -> LocalDataStores:
     """Open and construct all synchronous repositories on the caller's thread."""
 
     # Imported lazily so the pure database lifecycle remains independently testable.
@@ -180,6 +195,11 @@ def create_local_data_stores(database_path: Path, backup_directory: Path) -> Loc
         vectors=VectorStore(database),
         jobs=BackgroundJobStore(database),
         proactive=ProactiveInteractionStore(database),
+        attachments=(
+            attachment_directory
+            if isinstance(attachment_directory, AttachmentStore)
+            else AttachmentStore(attachment_directory or database_path.parent / "attachments")
+        ),
     )
 
 
@@ -232,6 +252,10 @@ class LocalDataService(QObject):
         self._writable = False
         self._provider_name: str | None = None
         self._model_name: str | None = None
+        self._multimodal_provider_name: str | None = None
+        self._multimodal_model_name: str | None = None
+        self._turn_provider_metadata: dict[str, tuple[str | None, str | None]] = {}
+        self._finalized_provider_metadata: dict[str, tuple[str | None, str | None]] = {}
         self._started = False
         runtime.ready_changed.connect(self._on_runtime_ready)
         runtime.initialization_failed.connect(self.startup_failed.emit)
@@ -269,6 +293,20 @@ class LocalDataService(QObject):
     def set_provider_metadata(self, provider_name: str | None, model_name: str | None) -> None:
         self._provider_name = provider_name
         self._model_name = model_name
+
+    def set_multimodal_provider_metadata(
+        self,
+        provider_name: str | None,
+        model_name: str | None,
+    ) -> None:
+        self._multimodal_provider_name = provider_name
+        self._multimodal_model_name = model_name
+
+    def pop_finalized_provider_metadata(
+        self,
+        turn_id: str,
+    ) -> tuple[str | None, str | None] | None:
+        return self._finalized_provider_metadata.pop(str(turn_id), None)
 
     @Slot(bool)
     def _on_runtime_ready(self, ready: bool) -> None:
@@ -312,6 +350,9 @@ class LocalDataService(QObject):
         memory_disable_epoch = self._memory_disable_epoch
 
         def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
+            stored_attachments = tuple(
+                _stored_attachment(attachment) for attachment in turn.user_message.attachments
+            )
             stores.conversations.save_turn(
                 conversation_id,
                 turn.turn_id,
@@ -319,12 +360,14 @@ class LocalDataService(QObject):
                 turn.user_message.content,
                 turn.assistant_message.message_id,
                 attempt=turn.attempt,
-                participates_in_memory=memory_enabled,
+                participates_in_memory=memory_enabled and bool(turn.user_message.content.strip()),
+                input_modality=StoredInputModality(turn.user_message.input_modality.value),
+                attachments=stored_attachments,
             )
             return collect_prompt_retrieval_seed(
                 stores,
                 conversation_id,
-                turn.user_message.content,
+                _effective_user_text(turn.user_message.content),
                 memory_enabled=memory_enabled,
             )
 
@@ -365,7 +408,13 @@ class LocalDataService(QObject):
                     turn.turn_id,
                     turn.user_message.message_id,
                     turn.user_message.content,
-                    participates_in_memory=memory_enabled,
+                    participates_in_memory=memory_enabled
+                    and bool(turn.user_message.content.strip()),
+                    input_modality=StoredInputModality(turn.user_message.input_modality.value),
+                    attachments=tuple(
+                        _stored_attachment(attachment)
+                        for attachment in turn.user_message.attachments
+                    ),
                 )
             try:
                 stores.conversations.begin_assistant_attempt(
@@ -382,7 +431,7 @@ class LocalDataService(QObject):
             return collect_prompt_retrieval_seed(
                 stores,
                 conversation_id,
-                turn.user_message.content,
+                _effective_user_text(turn.user_message.content),
                 memory_enabled=memory_enabled,
             )
 
@@ -512,6 +561,14 @@ class LocalDataService(QObject):
             # memory was disabled while final revalidation was queued in SQLite.
             if not self._user_memory_allowed(pending):
                 prepared = _without_user_memory(prepared)
+            self._turn_provider_metadata[pending.turn.turn_id] = (
+                (
+                    self._multimodal_provider_name,
+                    self._multimodal_model_name,
+                )
+                if prepared.provider_route is ProviderRoute.MULTIMODAL
+                else (self._provider_name, self._model_name)
+            )
             pending.on_success(prepared)
 
         request_id = self.runtime.submit(
@@ -545,8 +602,10 @@ class LocalDataService(QObject):
         if conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
-        provider_name = self._provider_name
-        model_name = self._model_name
+        provider_name, model_name = self._turn_provider_metadata.pop(
+            turn.turn_id,
+            (self._provider_name, self._model_name),
+        )
 
         def operation(stores: LocalDataStores) -> bool:
             stores.conversations.finalize_assistant(
@@ -609,6 +668,10 @@ class LocalDataService(QObject):
             return enqueued
 
         def completed(enqueued: bool) -> None:
+            self._finalized_provider_metadata[turn.turn_id] = (
+                provider_name,
+                model_name,
+            )
             if enqueued:
                 self.jobs_enqueued.emit()
             self.refresh_history()
@@ -856,9 +919,7 @@ class LocalDataService(QObject):
                 value,
                 failure_operation="create_conversation",
             ),
-            on_failure=lambda category: self.operation_failed.emit(
-                "create_conversation", category
-            ),
+            on_failure=lambda category: self.operation_failed.emit("create_conversation", category),
         )
         if request_id is None:
             self._on_persistence_submission_failed("create_conversation")
@@ -881,7 +942,12 @@ class LocalDataService(QObject):
         if request_id is None:
             self._on_persistence_submission_failed("rename_conversation")
 
-    def delete_conversation(self, conversation_id: str) -> None:
+    def delete_conversation(
+        self,
+        conversation_id: str,
+        *,
+        protected_attachment_paths: tuple[str, ...] = (),
+    ) -> None:
         if not self._writable:
             self.operation_failed.emit("delete_conversation", "DatabaseReadOnlyError")
             return
@@ -890,6 +956,10 @@ class LocalDataService(QObject):
 
         def operation(stores: LocalDataStores) -> ConversationSnapshot:
             stores.conversations.delete_conversation(conversation_id)
+            _cleanup_attachment_orphans(
+                stores,
+                protected_paths=protected_attachment_paths,
+            )
             if current_conversation_id is not None and current_conversation_id != conversation_id:
                 conversation = stores.conversations.get_conversation(current_conversation_id)
             else:
@@ -903,9 +973,7 @@ class LocalDataService(QObject):
                 value,
                 failure_operation="delete_conversation",
             ),
-            on_failure=lambda category: self.operation_failed.emit(
-                "delete_conversation", category
-            ),
+            on_failure=lambda category: self.operation_failed.emit("delete_conversation", category),
         )
         if request_id is None:
             self._on_persistence_submission_failed("delete_conversation")
@@ -917,6 +985,7 @@ class LocalDataService(QObject):
 
         def operation(stores: LocalDataStores) -> ConversationSnapshot:
             stores.conversations.clear_conversations()
+            _cleanup_attachment_orphans(stores)
             conversation = stores.conversations.create_conversation()
             return _conversation_snapshot(stores, conversation)
 
@@ -1230,6 +1299,8 @@ class LocalDataService(QObject):
 
     def shutdown(self, wait_ms: int = 5_000) -> bool:
         self.stop_prompt_preparations()
+        self._turn_provider_metadata.clear()
+        self._finalized_provider_metadata.clear()
         return self.runtime.shutdown(wait_ms)
 
 
@@ -1239,6 +1310,7 @@ def _initialize_stores(stores: LocalDataStores) -> ConversationSnapshot:
         stores.conversations.ensure_default_profile()
         stores.conversations.recover_interrupted_messages()
         stores.jobs.recover_interrupted()
+        _cleanup_attachment_orphans(stores)
         conversation = stores.conversations.get_or_create_active_conversation()
     else:
         conversations = stores.conversations.list_conversations()
@@ -1466,7 +1538,57 @@ def _chat_message(message: StoredMessage, *, error: str | None = None) -> ChatMe
         content=message.content,
         status=MessageStatus(message.status.value),
         error=error,
+        attachments=tuple(_attachment_snapshot(item) for item in message.attachments),
+        input_modality=InputModality(message.input_modality.value),
     )
+
+
+def _stored_attachment(attachment: AttachmentSnapshot) -> StoredAttachment:
+    return StoredAttachment(
+        attachment_id=attachment.attachment_id,
+        kind=StoredAttachmentKind(attachment.kind.value),
+        source=StoredAttachmentSource(attachment.source.value),
+        display_name=attachment.display_name,
+        mime_type=attachment.mime_type,
+        size_bytes=attachment.size_bytes,
+        sha256=attachment.sha256,
+        relative_path=attachment.relative_path,
+        status="ready",
+        extracted_text=attachment.extracted_text,
+        text_truncated=attachment.text_truncated,
+        created_at=datetime.now().astimezone(),
+    )
+
+
+def _attachment_snapshot(attachment: StoredAttachment) -> AttachmentSnapshot:
+    return AttachmentSnapshot(
+        attachment_id=attachment.attachment_id,
+        kind=AttachmentKind(attachment.kind.value),
+        source=AttachmentSource(attachment.source.value),
+        display_name=attachment.display_name,
+        mime_type=attachment.mime_type,
+        size_bytes=attachment.size_bytes,
+        sha256=attachment.sha256,
+        relative_path=attachment.relative_path,
+        extracted_text=attachment.extracted_text,
+        text_truncated=attachment.text_truncated,
+    )
+
+
+def _cleanup_attachment_orphans(
+    stores: LocalDataStores,
+    *,
+    protected_paths: tuple[str, ...] = (),
+) -> None:
+    stores.conversations.pop_orphan_attachment_paths()
+    referenced = tuple(
+        dict.fromkeys((*stores.conversations.referenced_attachment_paths(), *protected_paths))
+    )
+    stores.attachments.cleanup_unreferenced(referenced)
+
+
+def _effective_user_text(value: str) -> str:
+    return value if value.strip() else "请查看我附上的资料。"
 
 
 def _terminal_reason(value: str | None) -> TurnTerminalReason | None:

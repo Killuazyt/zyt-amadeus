@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TypeAlias
 
 
 class ConversationState(StrEnum):
@@ -32,6 +33,46 @@ class PromptRole(StrEnum):
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
+
+
+class InputModality(StrEnum):
+    """How the user supplied the text stored for one turn."""
+
+    TEXT = "text"
+    VOICE = "voice"
+
+
+class AttachmentKind(StrEnum):
+    """Attachment families with different provider and retention behavior."""
+
+    IMAGE = "image"
+    DOCUMENT = "document"
+
+
+class AttachmentSource(StrEnum):
+    """User-visible provenance for one managed attachment."""
+
+    FILE_PICKER = "file_picker"
+    DROP = "drop"
+    CLIPBOARD = "clipboard"
+    SCREENSHOT = "screenshot"
+    SCREEN = "screen"
+    WINDOW = "window"
+    CAMERA = "camera"
+
+
+class ProviderCapability(StrEnum):
+    """Provider feature sets used by the local router."""
+
+    TEXT = "text"
+    MULTIMODAL = "multimodal"
+
+
+class ProviderRoute(StrEnum):
+    """Immutable routing decision captured before a worker starts."""
+
+    TEXT = "text"
+    MULTIMODAL = "multimodal"
 
 
 class GenerationPurpose(StrEnum):
@@ -104,6 +145,8 @@ class ChatMessage:
     content: str
     status: MessageStatus
     error: str | None = None
+    attachments: tuple[AttachmentSnapshot, ...] = ()
+    input_modality: InputModality = InputModality.TEXT
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,11 +164,47 @@ class ConversationTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class AttachmentSnapshot:
+    """Immutable metadata for a byte-identical managed attachment."""
+
+    attachment_id: str
+    kind: AttachmentKind
+    source: AttachmentSource
+    display_name: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    relative_path: str
+    extracted_text: str = ""
+    text_truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TextPart:
+    """One OpenAI-compatible text content part."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePart:
+    """One sanitized image data URL associated with a managed attachment."""
+
+    attachment_id: str
+    data_url: str
+    detail: str = "auto"
+
+
+PromptContentPart: TypeAlias = TextPart | ImagePart
+PromptContent: TypeAlias = str | tuple[PromptContentPart, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PromptMessage:
     """Minimal immutable message passed to a background provider worker."""
 
     role: PromptRole
-    content: str
+    content: PromptContent
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +216,8 @@ class ChatRequest:
     attempt: int
     messages: tuple[PromptMessage, ...]
     options: GenerationOptions = field(default_factory=GenerationOptions)
+    attachments: tuple[AttachmentSnapshot, ...] = ()
+    provider_route: ProviderRoute = ProviderRoute.TEXT
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,3 +229,5 @@ class PreparedPrompt:
     persona_knowledge_ids: tuple[str, ...] = ()
     retrieval_ticket_id: str = ""
     attempt: int = 1
+    attachments: tuple[AttachmentSnapshot, ...] = ()
+    provider_route: ProviderRoute = ProviderRoute.TEXT

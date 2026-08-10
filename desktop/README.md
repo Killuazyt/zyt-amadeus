@@ -3,7 +3,9 @@
 P7 adds reproducible Windows packaging, legacy-architecture auditing, and a clean-machine installer
 acceptance workflow on top of the complete P6 settings, tray, proactive-interaction, and local-data-management
 closure and the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
-text-model integration, and P5 auditable hybrid memory. The application includes safe local pet
+text-model integration, and P5 auditable hybrid memory. P7C-P7E extend that same conversation state
+machine with managed image/document attachments, sentence-level low-latency voice, and opt-in screen,
+window, camera, and manual-region visual input. The application includes safe local pet
 import/switch/removal, fixed-clock animation, transparent hit testing, manual drag placement,
 multi-screen recovery, the pinned P7B high-resolution built-in Kurisu spritesheet, cancellable chat states, and an exact
 eight-item system tray.
@@ -11,11 +13,12 @@ eight-item system tray.
 P4 provides DeepSeek pay-as-you-go, MiMo pay-as-you-go, and a strict custom HTTPS provider. API
 credentials are stored only in Windows Credential Manager. P5 stores conversations, summaries,
 immutable memory versions, provenance, jobs, independent user/persona vector generations, recall
-events, decay, and safe FTS fallback. P6 upgrades to SQLite schema v3 and settings schema v5, adds
+events, decay, and safe FTS fallback. P7C-P7E upgrade to SQLite schema v5 and settings schema v8, add
 proactive message origin and a body-free interaction ledger, and exposes an eight-page single
 settings window, verified HKCU startup control, restrained greetings, diagnostics, versioned JSON
-exports, consistent backup/restore, and fail-closed factory reset. Speech, screen observation, tool
-execution, and automation remain outside the MVP.
+exports, attachment-inclusive backup/restore, and fail-closed factory reset. Capture is always opt-in
+and off at application startup; privacy mode stops and releases active media sources. Tool execution,
+autonomous desktop actions, WebRTC, and continuous background listening remain outside scope.
 
 ## Development commands
 
@@ -66,9 +69,10 @@ The deterministic local provider is development-only and must be requested expli
 ```
 
 Runtime data is stored under `%LOCALAPPDATA%\Amadeus`. Imported pets are copied into its `pets`
-directory; the source package is never modified. SQLite is stored at `data\amadeus.sqlite3`.
-Provider settings contain only a fixed credential reference; API credentials are stored by Windows
-Credential Manager and are never written to JSON, SQLite, exports, or backups.
+directory; the source package is never modified. SQLite is stored at `data\amadeus.sqlite3`, and
+managed attachment originals are stored under `data\attachments`. Provider settings contain only
+credential references; API credentials are stored by Windows Credential Manager and are never
+written to JSON, SQLite, exports, or backups.
 
 The application never downloads an embedding model during startup or chat. Prepare and verify the
 pinned model only through an explicit command:

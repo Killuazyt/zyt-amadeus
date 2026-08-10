@@ -10,6 +10,11 @@ from typing import Any, Self
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 PROVIDER_CREDENTIAL_REF = "windows-credential-manager:amadeus-chat-provider"
+MULTIMODAL_CREDENTIAL_REF = "windows-credential-manager:amadeus-multimodal-provider"
+MIMO_SPEECH_CREDENTIAL_REF = "windows-credential-manager:amadeus-mimo-speech"
+_ALLOWED_CREDENTIAL_REFS = frozenset(
+    {PROVIDER_CREDENTIAL_REF, MULTIMODAL_CREDENTIAL_REF, MIMO_SPEECH_CREDENTIAL_REF}
+)
 
 _DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _MIMO_BASE_URL = "https://api.xiaomimimo.com/v1"
@@ -199,8 +204,8 @@ class ProviderConfig:
             raise ProviderConfigError("Base URL must already be normalized.")
         _validate_text(self.display_name, "Display name", maximum=64)
         _validate_text(self.model, "Model name", maximum=128)
-        if self.credential_ref != PROVIDER_CREDENTIAL_REF:
-            raise ProviderConfigError("Credential reference is fixed by the application.")
+        if self.credential_ref not in _ALLOWED_CREDENTIAL_REFS:
+            raise ProviderConfigError("Credential reference is not owned by the application.")
         _validate_number(
             self.connect_timeout_seconds,
             "Connect timeout",

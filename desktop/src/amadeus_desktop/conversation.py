@@ -12,10 +12,12 @@ from uuid import uuid4
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 
 from amadeus_desktop.chat_models import (
+    AttachmentSnapshot,
     ChatMessage,
     ChatRequest,
     ConversationState,
     ConversationTurn,
+    InputModality,
     MessageRole,
     MessageStatus,
     PreparedPrompt,
@@ -258,6 +260,8 @@ class ConversationCoordinator(QObject):
         text: str,
         *,
         first_chunk_timeout_ms: int | None = None,
+        attachments: tuple[AttachmentSnapshot, ...] = (),
+        input_modality: InputModality = InputModality.TEXT,
     ) -> ConversationTurn | None:
         """Append a new in-memory turn and start exactly one provider attempt."""
 
@@ -270,8 +274,14 @@ class ConversationCoordinator(QObject):
             or self._active_request_id is not None
             or self._pending_preparation_turn_id is not None
             or self._pending_finalization is not None
-            or not text.strip()
+            or (not text.strip() and not attachments)
         ):
+            return None
+        try:
+            input_modality = InputModality(input_modality)
+        except (TypeError, ValueError):
+            return None
+        if len(attachments) > 5:
             return None
         turn = ConversationTurn(
             turn_id=uuid4().hex,
@@ -280,6 +290,8 @@ class ConversationCoordinator(QObject):
                 role=MessageRole.USER,
                 content=text,
                 status=MessageStatus.COMPLETED,
+                attachments=tuple(attachments),
+                input_modality=input_modality,
             ),
             assistant_message=ChatMessage(
                 message_id=uuid4().hex,
@@ -569,6 +581,8 @@ class ConversationCoordinator(QObject):
             turn_id=turn.turn_id,
             attempt=turn.attempt,
             messages=prepared_prompt.messages,
+            attachments=prepared_prompt.attachments,
+            provider_route=prepared_prompt.provider_route,
         )
         cancellation = CancellationToken()
         thread = QThread(self)

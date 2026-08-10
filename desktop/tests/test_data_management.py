@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -10,9 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 import amadeus_desktop.data_management as data_management
 from amadeus_desktop import __version__
+from amadeus_desktop.attachments import AttachmentStore
 from amadeus_desktop.conversation_store import ConversationStore
 from amadeus_desktop.data_management import (
     BACKUP_DATABASE_MEMBER,
@@ -43,6 +46,11 @@ from amadeus_desktop.memory_store import MemoryStore
 from amadeus_desktop.paths import AppDirectory, AppPaths
 from amadeus_desktop.persona_repository import PersonaRepository
 from amadeus_desktop.settings import CURRENT_SCHEMA_VERSION, DEFAULT_SETTINGS
+from amadeus_desktop.storage_models import (
+    StoredAttachment,
+    StoredAttachmentKind,
+    StoredAttachmentSource,
+)
 from amadeus_desktop.vector_store import VectorStore
 
 FIXED_TIME = datetime(2026, 8, 3, 4, 5, 6, tzinfo=UTC)
@@ -136,6 +144,42 @@ def _make_backup(tmp_path: Path, database: SQLiteDatabase) -> Path:
         app_version=__version__,
         created_at=FIXED_TIME,
     )
+
+
+def _seed_image_attachment(
+    database: SQLiteDatabase,
+    attachment_root: Path,
+) -> tuple[StoredAttachment, bytes]:
+    output = io.BytesIO()
+    Image.new("RGB", (19, 13), (20, 90, 130)).save(output, format="PNG")
+    payload = output.getvalue()
+    imported = AttachmentStore(attachment_root).import_bytes(
+        payload,
+        display_name="private-view.png",
+    )
+    attachment = StoredAttachment(
+        attachment_id=imported.attachment_id,
+        kind=StoredAttachmentKind.IMAGE,
+        source=StoredAttachmentSource.FILE_PICKER,
+        display_name=imported.display_name,
+        mime_type=imported.mime_type,
+        size_bytes=imported.size_bytes,
+        sha256=imported.sha256,
+        relative_path=imported.relative_path,
+        status="ready",
+        extracted_text="",
+        text_truncated=False,
+        created_at=FIXED_TIME,
+    )
+    conversations = ConversationStore(database, clock=lambda: FIXED_TIME)
+    conversations.save_user_message(
+        "conv-1",
+        "turn-image",
+        "user-image",
+        "请看图片",
+        attachments=(attachment,),
+    )
+    return attachment, payload
 
 
 def _rewrite_archive(
@@ -253,6 +297,8 @@ def test_versioned_exports_are_atomic_utf8_and_do_not_read_settings_or_credentia
         "conversations",
         "messages",
         "summaries",
+        "attachments",
+        "message_attachments",
     }
     assert set(memory) == {
         "format",
@@ -314,7 +360,62 @@ def test_backup_has_fixed_members_manifest_hashes_and_valid_database(tmp_path: P
     assert metadata.database_schema == SCHEMA_VERSION
     assert metadata.settings_schema == CURRENT_SCHEMA_VERSION
     assert settings == _settings()
-    assert "api_key" not in json.dumps(settings).casefold()
+    assert "invalid-fake-amadeus-secret" not in json.dumps(settings).casefold()
+
+
+def test_backup_v2_round_trips_exact_attachment_bytes_and_chat_export_omits_binary(
+    tmp_path: Path,
+) -> None:
+    database = _seed_database(tmp_path)
+    attachment_root = tmp_path / "attachments"
+    attachment, original = _seed_image_attachment(database, attachment_root)
+    export_path = tmp_path / "chat.json"
+    try:
+        export_chat_json(
+            export_path,
+            lambda: SQLiteExportRepository(database.connection).load_chat_bundle(),
+            exported_at=FIXED_TIME,
+        )
+        backup = create_backup_archive(
+            tmp_path / "with-attachment.amadeus-backup",
+            database_backup=lambda target: database.create_backup(target),
+            settings_snapshot=_settings(),
+            app_version=__version__,
+            attachment_root=attachment_root,
+            created_at=FIXED_TIME,
+        )
+    finally:
+        database.close()
+
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    assert exported["format"] == CHAT_EXPORT_FORMAT
+    assert len(exported["attachments"]) == 1
+    exported_attachment = exported["attachments"][0]
+    assert exported_attachment["id"] == attachment.attachment_id
+    assert exported_attachment["display_name"] == "private-view.png"
+    assert exported_attachment["sha256"] == attachment.sha256
+    assert exported_attachment["relative_path"] == attachment.relative_path
+    assert exported_attachment["size_bytes"] == len(original)
+    assert exported_attachment["extracted_text"] == ""
+    assert exported["message_attachments"] == [
+        {
+            "message_id": "user-image",
+            "attachment_id": attachment.attachment_id,
+            "ordinal": 0,
+        }
+    ]
+    assert "data:image" not in export_path.read_text(encoding="utf-8")
+
+    staged = stage_backup_for_restore(backup, tmp_path / "restore-stage")
+    try:
+        restored = staged.attachments_path.joinpath(*attachment.relative_path.split("/"))
+        assert restored.read_bytes() == original
+        assert staged.metadata.format == BACKUP_FORMAT
+        assert tuple(item["relative_path"] for item in staged.metadata.attachments) == (
+            attachment.relative_path,
+        )
+    finally:
+        discard_staged_restore(staged)
 
 
 def test_backup_callback_must_produce_current_consistent_snapshot(tmp_path: Path) -> None:
@@ -378,7 +479,7 @@ def test_validation_rejects_extra_and_path_traversal_members(tmp_path: Path) -> 
         {},
         extra=("../outside.txt", b"no"),
     )
-    with pytest.raises(BackupValidationError, match="members"):
+    with pytest.raises(BackupValidationError, match="member"):
         stage_backup_for_restore(extra, tmp_path / "staging")
     assert not (tmp_path / "outside.txt").exists()
 

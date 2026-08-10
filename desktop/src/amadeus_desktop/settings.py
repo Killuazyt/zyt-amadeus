@@ -14,9 +14,16 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from amadeus_desktop.provider_config import ProviderConfig, ProviderConfigError
+from amadeus_desktop.provider_config import (
+    MIMO_SPEECH_CREDENTIAL_REF,
+    MULTIMODAL_CREDENTIAL_REF,
+    PROVIDER_CREDENTIAL_REF,
+    ProviderConfig,
+    ProviderConfigError,
+    ProviderPreset,
+)
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 8
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -37,6 +44,37 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "provider_enabled": False,
     "provider": ProviderConfig.default().to_mapping(),
+    "multimodal": {
+        "enabled": False,
+        "reuse_mimo_credential": False,
+        "provider": ProviderConfig.for_preset(
+            ProviderPreset.MIMO_PAYG,
+            credential_ref=MULTIMODAL_CREDENTIAL_REF,
+        ).to_mapping(),
+    },
+    "voice": {
+        "enabled": False,
+        "input_device_id": "",
+        "output_device_id": "",
+        "hands_free_enabled": False,
+        "base_url": "https://api.xiaomimimo.com/v1",
+        "asr_model": "mimo-v2.5-asr",
+        "tts_model": "mimo-v2.5-tts",
+        "tts_voice": "mimo_default",
+        "tts_format": "wav",
+        "connect_timeout_seconds": 15,
+        "request_timeout_seconds": 90,
+        "credential_ref": MIMO_SPEECH_CREDENTIAL_REF,
+        "credential_source": "independent",
+    },
+    "visual": {
+        "active_vision_enabled": False,
+        "latest_frame_fps": 1,
+        "preferred_source": "screen",
+        "screen_id": "",
+        "window_id": "",
+        "camera_id": "",
+    },
     "memory": {
         "enabled": True,
     },
@@ -60,6 +98,9 @@ _PET_FIELDS = frozenset(DEFAULT_SETTINGS["pet"])
 _MEMORY_FIELDS = frozenset(DEFAULT_SETTINGS["memory"])
 _PERSONA_FIELDS = frozenset(DEFAULT_SETTINGS["persona"])
 _PROACTIVE_FIELDS = frozenset(DEFAULT_SETTINGS["proactive"])
+_MULTIMODAL_FIELDS = frozenset(DEFAULT_SETTINGS["multimodal"])
+_VOICE_FIELDS = frozenset(DEFAULT_SETTINGS["voice"])
+_VISUAL_FIELDS = frozenset(DEFAULT_SETTINGS["visual"])
 _PROACTIVE_MODES = frozenset({"restrained", "startup_only", "off"})
 
 _FORBIDDEN_SETTING_KEYS = {
@@ -156,12 +197,36 @@ def _migrate_v4_to_v5(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v5_to_v6(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 6
+    migrated.setdefault("multimodal", deepcopy(DEFAULT_SETTINGS["multimodal"]))
+    return migrated
+
+
+def _migrate_v6_to_v7(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 7
+    migrated.setdefault("voice", deepcopy(DEFAULT_SETTINGS["voice"]))
+    return migrated
+
+
+def _migrate_v7_to_v8(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 8
+    migrated.setdefault("visual", deepcopy(DEFAULT_SETTINGS["visual"]))
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
     2: _migrate_v2_to_v3,
     3: _migrate_v3_to_v4,
     4: _migrate_v4_to_v5,
+    5: _migrate_v5_to_v6,
+    6: _migrate_v6_to_v7,
+    7: _migrate_v7_to_v8,
 }
 
 
@@ -345,11 +410,95 @@ class SettingsRepository:
             cls._validate_pet_position(position)
 
         try:
-            ProviderConfig.from_mapping(settings.get("provider"))
+            provider_config = ProviderConfig.from_mapping(settings.get("provider"))
         except ProviderConfigError as exc:
             raise InvalidSettingsError("The provider settings section is invalid.") from exc
+        if provider_config.credential_ref != PROVIDER_CREDENTIAL_REF:
+            raise InvalidSettingsError("The provider credential reference is invalid.")
         if not isinstance(settings.get("provider_enabled"), bool):
             raise InvalidSettingsError("provider_enabled must be a boolean.")
+
+        multimodal = settings.get("multimodal")
+        if not isinstance(multimodal, Mapping):
+            raise InvalidSettingsError("The multimodal settings section must be an object.")
+        cls._require_exact_fields(
+            multimodal,
+            _MULTIMODAL_FIELDS,
+            "The multimodal settings section",
+        )
+        if not isinstance(multimodal.get("enabled"), bool) or not isinstance(
+            multimodal.get("reuse_mimo_credential"), bool
+        ):
+            raise InvalidSettingsError("multimodal flags must be booleans.")
+        try:
+            multimodal_provider = ProviderConfig.from_mapping(multimodal.get("provider"))
+        except ProviderConfigError as exc:
+            raise InvalidSettingsError("The multimodal provider settings are invalid.") from exc
+        if multimodal_provider.credential_ref != MULTIMODAL_CREDENTIAL_REF:
+            raise InvalidSettingsError("The multimodal credential reference is invalid.")
+        if multimodal.get("reuse_mimo_credential") is True and not (
+            _is_mimo_payg(provider_config)
+            and _is_mimo_payg(multimodal_provider)
+            and provider_config.credential_scope == multimodal_provider.credential_scope
+        ):
+            raise InvalidSettingsError("The multimodal credential reuse scope is invalid.")
+
+        voice = settings.get("voice")
+        if not isinstance(voice, Mapping):
+            raise InvalidSettingsError("The voice settings section must be an object.")
+        cls._require_exact_fields(voice, _VOICE_FIELDS, "The voice settings section")
+        for key in ("input_device_id", "output_device_id"):
+            value = voice.get(key)
+            if not isinstance(value, str) or len(value) > 512 or "\x00" in value:
+                raise InvalidSettingsError(f"voice.{key} is invalid.")
+        if not isinstance(voice.get("enabled"), bool) or not isinstance(
+            voice.get("hands_free_enabled"), bool
+        ):
+            raise InvalidSettingsError("voice flags must be booleans.")
+        required_voice_values = {
+            "asr_model": "mimo-v2.5-asr",
+            "tts_model": "mimo-v2.5-tts",
+            "tts_voice": "mimo_default",
+            "tts_format": "wav",
+            "base_url": "https://api.xiaomimimo.com/v1",
+            "credential_ref": MIMO_SPEECH_CREDENTIAL_REF,
+        }
+        if any(voice.get(key) != value for key, value in required_voice_values.items()):
+            raise InvalidSettingsError("The MiMo voice contract is invalid.")
+        if voice.get("credential_source") not in {
+            "independent",
+            PROVIDER_CREDENTIAL_REF,
+            MULTIMODAL_CREDENTIAL_REF,
+        }:
+            raise InvalidSettingsError("voice.credential_source is invalid.")
+        if voice.get("enabled") is True:
+            source = voice.get("credential_source")
+            if source == PROVIDER_CREDENTIAL_REF and not _is_mimo_payg(provider_config):
+                raise InvalidSettingsError("Voice cannot reuse the text provider credential.")
+            if source == MULTIMODAL_CREDENTIAL_REF and not _is_mimo_payg(multimodal_provider):
+                raise InvalidSettingsError("Voice cannot reuse the multimodal credential.")
+        for key in ("connect_timeout_seconds", "request_timeout_seconds"):
+            value = voice.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 300:
+                raise InvalidSettingsError(f"voice.{key} is invalid.")
+
+        visual = settings.get("visual")
+        if not isinstance(visual, Mapping):
+            raise InvalidSettingsError("The visual settings section must be an object.")
+        cls._require_exact_fields(visual, _VISUAL_FIELDS, "The visual settings section")
+        if not isinstance(visual.get("active_vision_enabled"), bool):
+            raise InvalidSettingsError("visual.active_vision_enabled must be a boolean.")
+        if visual.get("latest_frame_fps") != 1:
+            raise InvalidSettingsError("visual.latest_frame_fps must remain 1.")
+        if visual.get("preferred_source") not in {"screen", "window", "camera"}:
+            raise InvalidSettingsError("visual.preferred_source is invalid.")
+        for key in ("screen_id", "window_id", "camera_id"):
+            value = visual.get(key)
+            if not isinstance(value, str) or len(value) > 512 or "\x00" in value:
+                raise InvalidSettingsError(f"visual.{key} is invalid.")
+        window_id = visual.get("window_id")
+        if window_id and (not str(window_id).isdigit() or len(str(window_id)) > 32):
+            raise InvalidSettingsError("visual.window_id is invalid.")
 
         memory = settings.get("memory")
         if not isinstance(memory, Mapping):
@@ -447,3 +596,11 @@ def validate_settings_document(settings: Mapping[str, Any]) -> None:
     if not isinstance(settings, Mapping):
         raise InvalidSettingsError("Settings must be a JSON object.")
     SettingsRepository._validate(settings)
+
+
+def _is_mimo_payg(config: ProviderConfig) -> bool:
+    return bool(
+        config.preset is ProviderPreset.MIMO_PAYG
+        and config.base_url == "https://api.xiaomimimo.com/v1"
+        and config.auth_mode.value == "api_key"
+    )

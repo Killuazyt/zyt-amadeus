@@ -404,10 +404,10 @@ def test_user_send_waits_for_slow_proactive_cancel_without_provider_overlap(
         assert controller.chat_panel.action_button.isEnabled()
         controller.chat_panel.action_button.click()
 
-        assert controller._pending_foreground_action == (
-            "send",
-            "前台消息必须等待主动问候退出",
-        )
+        pending = controller._pending_foreground_action
+        assert pending is not None
+        assert pending[0] == "send"
+        assert getattr(pending[1], "text", None) == "前台消息必须等待主动问候退出"
         assert controller.chat_panel.action_button.isEnabled() is False
         qtbot.waitUntil(provider.conversation_started.is_set, timeout=2_000)
         qtbot.waitUntil(lambda: bool(controller.conversation.turns), timeout=2_000)

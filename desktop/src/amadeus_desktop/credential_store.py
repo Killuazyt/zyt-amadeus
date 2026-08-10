@@ -11,7 +11,15 @@ from pathlib import Path
 from types import ModuleType
 from typing import Protocol, runtime_checkable
 
+from amadeus_desktop.provider_config import (
+    MIMO_SPEECH_CREDENTIAL_REF,
+    MULTIMODAL_CREDENTIAL_REF,
+    PROVIDER_CREDENTIAL_REF,
+)
+
 WINCRED_TARGET_NAME = "Amadeus/DesktopPet/ChatProviderApiKey"
+WINCRED_MULTIMODAL_TARGET_NAME = "Amadeus/DesktopPet/MultimodalProviderApiKey"
+WINCRED_MIMO_SPEECH_TARGET_NAME = "Amadeus/DesktopPet/MiMoSpeechApiKey"
 _CREDENTIAL_USER_NAME = "Amadeus Desktop Pet"
 _ERROR_NOT_FOUND = 1168
 _MAX_CREDENTIAL_BLOB_BYTES = 5 * 512
@@ -78,17 +86,27 @@ class WinCredentialStore:
 
     target_name = WINCRED_TARGET_NAME
 
+    def __init__(self, credential_ref: str = PROVIDER_CREDENTIAL_REF) -> None:
+        if credential_ref == PROVIDER_CREDENTIAL_REF:
+            self.target_name = WINCRED_TARGET_NAME
+        elif credential_ref == MULTIMODAL_CREDENTIAL_REF:
+            self.target_name = WINCRED_MULTIMODAL_TARGET_NAME
+        elif credential_ref == MIMO_SPEECH_CREDENTIAL_REF:
+            self.target_name = WINCRED_MIMO_SPEECH_TARGET_NAME
+        else:
+            raise ValueError("credential reference is not owned by Amadeus") from None
+
     def has_secret(self) -> bool:
         return self.read_secret() is not None
 
     def read_secret(self) -> str | None:
-        return _read_secret(WINCRED_TARGET_NAME)
+        return _read_secret(self.target_name)
 
     def write_secret(self, secret: str) -> None:
-        _write_secret(WINCRED_TARGET_NAME, secret)
+        _write_secret(self.target_name, secret)
 
     def delete_secret(self) -> None:
-        _delete_secret(WINCRED_TARGET_NAME)
+        _delete_secret(self.target_name)
 
 
 def run_wincred_acceptance_probe(probe_id: str) -> bool:

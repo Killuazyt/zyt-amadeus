@@ -19,33 +19,42 @@ def make_window(qtbot) -> SettingsWindow:
     return window
 
 
-def test_settings_shell_has_exact_p6_left_navigation_and_embeds_model_dialog(qtbot) -> None:
+def test_settings_shell_has_p7e_navigation_and_embeds_model_dialog(qtbot) -> None:
     window = make_window(qtbot)
 
     assert window.page_names == (
         "general",
         "pet",
         "model",
+        "multimodal",
+        "voice",
+        "visual",
         "persona",
         "history",
         "memory",
         "proactive",
         "diagnostics",
     )
-    assert [window.navigation.item(index).text() for index in range(8)] == [
+    assert [window.navigation.item(index).text() for index in range(11)] == [
         "常规",
         "桌宠",
         "对话模型",
+        "图片与视觉模型",
+        "语音",
+        "屏幕与相机",
         "角色",
         "聊天历史",
         "长期记忆",
         "主动互动",
         "诊断",
     ]
-    assert window.stack.count() == 8
+    assert window.stack.count() == 11
     assert window.stack.widget(2) is window.model_page
-    assert window.stack.widget(4) is window.history_page
-    assert window.stack.widget(5) is window.memory_page
+    assert window.stack.widget(3) is window.multimodal_page
+    assert window.stack.widget(4) is window.voice_page
+    assert window.stack.widget(5) is window.visual_page
+    assert window.stack.widget(7) is window.history_page
+    assert window.stack.widget(8) is window.memory_page
     assert window.model_page.windowType() == Qt.WindowType.Widget
     assert window.model_page.close_button.isHidden()
     assert not window.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -107,10 +116,10 @@ def test_invalid_deep_link_is_rejected_without_changing_page(qtbot) -> None:
     window.show_page("persona")
 
     try:
-        window.show_page("voice")
+        window.show_page("tools")
     except ValueError as exc:
-        assert "voice" in str(exc)
+        assert "tools" in str(exc)
     else:
-        raise AssertionError("unsupported P6 settings page must fail closed")
+        raise AssertionError("unsupported settings page must fail closed")
 
     assert window.current_page == "persona"

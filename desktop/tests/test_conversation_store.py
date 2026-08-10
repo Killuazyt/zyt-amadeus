@@ -10,6 +10,9 @@ from amadeus_desktop.storage_models import (
     BackgroundJobStatus,
     StorageConflictError,
     StorageNotFoundError,
+    StoredAttachment,
+    StoredAttachmentKind,
+    StoredAttachmentSource,
     StoredMessageOrigin,
     StoredMessageStatus,
 )
@@ -131,6 +134,62 @@ def test_user_commit_checkpoint_terminal_and_retry_reuse_stable_ids(stores) -> N
     assert completed.content == "重试完成"
     assert completed.attempt == 2
     assert len(store.load_recent_messages(conversation.conversation_id)) == 2
+
+
+def test_attachment_survives_retry_and_shared_reference_then_becomes_orphan(stores) -> None:
+    _database, store, _jobs = stores
+    created_at = datetime.now(UTC)
+    attachment = StoredAttachment(
+        attachment_id="attachment-1",
+        kind=StoredAttachmentKind.IMAGE,
+        source=StoredAttachmentSource.FILE_PICKER,
+        display_name="view.png",
+        mime_type="image/png",
+        size_bytes=123,
+        sha256="a" * 64,
+        relative_path="objects/aa/asset.png",
+        status="ready",
+        extracted_text="",
+        text_truncated=False,
+        created_at=created_at,
+    )
+    first = store.create_conversation()
+    second = store.create_conversation()
+    store.save_turn(
+        first.conversation_id,
+        "turn-1",
+        "user-1",
+        "看这里",
+        "assistant-1",
+        attachments=(attachment,),
+    )
+    store.finalize_assistant(
+        "assistant-1",
+        "第一次失败",
+        status="failed",
+        terminal_reason="provider_error",
+        attempt=1,
+    )
+    store.begin_assistant_attempt("assistant-1", 2)
+    persisted = store.get_message("user-1").attachments
+    assert len(persisted) == 1
+    assert persisted[0].attachment_id == attachment.attachment_id
+    assert persisted[0].relative_path == attachment.relative_path
+    store.save_user_message(
+        second.conversation_id,
+        "turn-2",
+        "user-2",
+        "同一原件",
+        attachments=(attachment,),
+    )
+
+    assert store.delete_conversation(first.conversation_id)
+    assert store.pop_orphan_attachment_paths() == ()
+    assert store.referenced_attachment_paths() == (attachment.relative_path,)
+
+    assert store.delete_conversation(second.conversation_id)
+    assert store.pop_orphan_attachment_paths() == (attachment.relative_path,)
+    assert store.referenced_attachment_paths() == ()
 
 
 def test_save_turn_is_atomic_if_placeholder_insert_conflicts(stores) -> None:

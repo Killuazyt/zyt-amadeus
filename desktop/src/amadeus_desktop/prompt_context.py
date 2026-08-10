@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Protocol, runtime_checkable
 
-from amadeus_desktop.chat_models import PromptMessage, PromptRole
+from amadeus_desktop.chat_models import (
+    ImagePart,
+    PromptContent,
+    PromptMessage,
+    PromptRole,
+    TextPart,
+)
 from amadeus_desktop.memory_models import MemoryKind, PromptMemory, PromptPersonaKnowledge
 
 DEFAULT_CHARACTER_BUDGET = 24_000
@@ -90,18 +96,22 @@ class DefaultPromptContextService:
             context.memories,
             min(int(context.character_budget * MEMORY_BUDGET_RATIO), remaining),
         )
-        memory_character_count = len(memory_message.content) if memory_message else 0
+        memory_character_count = (
+            _content_characters(memory_message.content) if memory_message else 0
+        )
         remaining -= memory_character_count
 
         persona_message, selected_persona_knowledge_ids = _select_persona_knowledge(
             context.persona_knowledge,
             remaining,
         )
-        persona_knowledge_character_count = len(persona_message.content) if persona_message else 0
+        persona_knowledge_character_count = (
+            _content_characters(persona_message.content) if persona_message else 0
+        )
         remaining -= persona_knowledge_character_count
 
         summary_message = _fit_summary(context.summary, remaining)
-        summary_characters = len(summary_message.content) if summary_message else 0
+        summary_characters = _content_characters(summary_message.content) if summary_message else 0
         remaining -= summary_characters
 
         recent_candidates = _recent_candidates(context)
@@ -233,7 +243,7 @@ def _recent_candidates(context: PromptContextInput) -> tuple[PromptMessage, ...]
     if (
         recent
         and recent[-1].role is PromptRole.USER
-        and recent[-1].content == context.current_user_message
+        and _content_plain_text(recent[-1].content) == context.current_user_message
     ):
         recent = recent[:-1]
     return recent[-MAX_RECENT_MESSAGES:]
@@ -250,11 +260,12 @@ def _select_recent(
     remaining = budget
     for message in reversed(messages):
         content = message.content
-        if len(content) <= remaining:
+        characters = _content_characters(content)
+        if characters <= remaining:
             selected_reversed.append(message)
-            remaining -= len(content)
+            remaining -= characters
             continue
-        if not selected_reversed and remaining >= 2:
+        if not selected_reversed and remaining >= 2 and isinstance(content, str):
             selected_reversed.append(
                 PromptMessage(message.role, _truncate_with_ellipsis(content, remaining))
             )
@@ -283,4 +294,24 @@ def _truncate_with_ellipsis(text: str, maximum: int) -> str:
 
 
 def _message_characters(messages: tuple[PromptMessage, ...] | list[PromptMessage]) -> int:
-    return sum(len(message.content) for message in messages)
+    return sum(_content_characters(message.content) for message in messages)
+
+
+def _content_characters(content: PromptContent) -> int:
+    if isinstance(content, str):
+        return len(content)
+    total = 0
+    for part in content:
+        if isinstance(part, TextPart):
+            total += len(part.text)
+        elif isinstance(part, ImagePart):
+            # A conservative local budget proxy; providers account image tokens
+            # independently and the data URL itself must never dominate text budgets.
+            total += 4_096
+    return total
+
+
+def _content_plain_text(content: PromptContent) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(part.text for part in content if isinstance(part, TextPart))

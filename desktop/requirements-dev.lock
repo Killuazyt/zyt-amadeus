@@ -86,7 +86,9 @@ packaging==26.2
 pefile==2024.8.26
     # via pyinstaller
 pillow==12.3.0
-    # via fastembed
+    # via
+    #   amadeus-desktop (pyproject.toml)
+    #   fastembed
 pip-tools==7.6.0
     # via amadeus-desktop (pyproject.toml)
 pluggy==1.6.0
@@ -105,6 +107,8 @@ pyinstaller-hooks-contrib==2026.6
     # via
     #   amadeus-desktop (pyproject.toml)
     #   pyinstaller
+pypdf==6.15.0
+    # via amadeus-desktop (pyproject.toml)
 pyproject-hooks==1.2.0
     # via
     #   build

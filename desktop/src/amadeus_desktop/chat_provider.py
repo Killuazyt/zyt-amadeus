@@ -15,7 +15,14 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
-from amadeus_desktop.chat_models import ChatRequest, PromptMessage, PromptRole
+from amadeus_desktop.chat_models import (
+    ChatRequest,
+    ImagePart,
+    PromptContent,
+    PromptMessage,
+    PromptRole,
+    TextPart,
+)
 from amadeus_desktop.credential_store import CredentialStore
 from amadeus_desktop.provider_config import (
     AuthMode,
@@ -271,6 +278,40 @@ class ScriptedChatProvider:
 ClientFactory = Callable[..., httpx.AsyncClient]
 
 
+def _serialize_prompt_content(content: PromptContent) -> object:
+    """Serialize structured content without changing legacy text payloads."""
+
+    if isinstance(content, str):
+        return content
+    serialized: list[dict[str, object]] = []
+    for part in content:
+        if isinstance(part, TextPart):
+            if not isinstance(part.text, str) or not part.text:
+                raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+            serialized.append({"type": "text", "text": part.text})
+            continue
+        if isinstance(part, ImagePart):
+            if (
+                not part.data_url.startswith(
+                    ("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,")
+                )
+                or len(part.data_url) > 36 * 1024 * 1024
+                or part.detail not in {"auto", "low", "high"}
+            ):
+                raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+            serialized.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": part.data_url, "detail": part.detail},
+                }
+            )
+            continue
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    if not serialized:
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    return serialized
+
+
 class OpenAICompatibleChatProvider:
     """Strict OpenAI-compatible Chat Completions implementation."""
 
@@ -400,7 +441,7 @@ class OpenAICompatibleChatProvider:
         payload: dict[str, object] = {
             "model": self.config.model,
             "messages": [
-                {"role": message.role.value, "content": message.content}
+                {"role": message.role.value, "content": _serialize_prompt_content(message.content)}
                 for message in request.messages
             ],
             "temperature": temperature,

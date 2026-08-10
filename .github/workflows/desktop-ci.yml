@@ -5,6 +5,12 @@ permissions:
 
 on:
   workflow_dispatch:
+    inputs:
+      test_only:
+        description: Run lint, pytest, and source scanning without package, onedir, or installer builds
+        required: false
+        type: boolean
+        default: false
   pull_request:
     branches: [main]
     paths:
@@ -25,6 +31,8 @@ on:
 jobs:
   test:
     runs-on: windows-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}\desktop\src
     defaults:
       run:
         working-directory: desktop
@@ -42,8 +50,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'pip bootstrap failed' }
           python -m pip install -r requirements-dev.lock
           if ($LASTEXITCODE -ne 0) { throw 'locked dependency install failed' }
+      - name: Install project package
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}
+        run: |
           python -m pip install --no-deps .
           if ($LASTEXITCODE -ne 0) { throw 'project install failed' }
+      - name: Check dependency environment
+        run: |
           python -m pip check
           if ($LASTEXITCODE -ne 0) { throw 'pip check failed' }
       - name: Lint
@@ -60,10 +73,13 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -vv --durations=30 -o faulthandler_timeout=300
       - name: Build Python package
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}
         run: python -m build --no-isolation
       - name: Verify Python package assets
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}
         run: python scripts/check_python_package_assets.py --dist dist
       - name: Verify isolated wheel install
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}
         shell: powershell
         run: |
           $isolated = Join-Path $env:RUNNER_TEMP 'amadeus-p5b-wheel-install'
@@ -80,11 +96,13 @@ jobs:
           & $python -c "import amadeus_desktop; assert amadeus_desktop.__version__ == '0.7.0.dev7'"
           if ($LASTEXITCODE -ne 0) { throw 'isolated version import failed' }
       - name: Build FTS-degraded onedir
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}
         shell: powershell
         run: |
           $pythonPath = (Get-Command python -ErrorAction Stop).Source
           .\scripts\build-onedir.ps1 -Mode Degraded -PythonPath $pythonPath
       - name: Smoke FTS-degraded onedir
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}
         shell: powershell
         run: |
           $exe = Join-Path $PWD 'build\onedir-dist\Amadeus\Amadeus.exe'
@@ -101,7 +119,9 @@ jobs:
         run: python scripts/scan_artifacts.py --path ..
 
   package-installer:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'workflow_dispatch' || inputs.test_only != true)
     needs: test
     runs-on: windows-latest
     defaults:

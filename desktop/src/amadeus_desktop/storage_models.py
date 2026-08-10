@@ -58,6 +58,26 @@ class StoredMessageOrigin(StrEnum):
     PROACTIVE = "proactive"
 
 
+class StoredInputModality(StrEnum):
+    TEXT = "text"
+    VOICE = "voice"
+
+
+class StoredAttachmentKind(StrEnum):
+    IMAGE = "image"
+    DOCUMENT = "document"
+
+
+class StoredAttachmentSource(StrEnum):
+    FILE_PICKER = "file_picker"
+    DROP = "drop"
+    CLIPBOARD = "clipboard"
+    SCREENSHOT = "screenshot"
+    SCREEN = "screen"
+    WINDOW = "window"
+    CAMERA = "camera"
+
+
 class ProactiveTrigger(StrEnum):
     STARTUP = "startup"
     IDLE = "idle"
@@ -131,6 +151,22 @@ class Conversation:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredAttachment:
+    attachment_id: str
+    kind: StoredAttachmentKind
+    source: StoredAttachmentSource
+    display_name: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    relative_path: str
+    status: str
+    extracted_text: str
+    text_truncated: bool
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class StoredMessage:
     sequence: int
     message_id: str
@@ -149,6 +185,8 @@ class StoredMessage:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    input_modality: StoredInputModality = StoredInputModality.TEXT
+    attachments: tuple[StoredAttachment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

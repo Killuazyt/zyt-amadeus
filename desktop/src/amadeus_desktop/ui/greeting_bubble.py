@@ -10,7 +10,6 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from amadeus_desktop.proactive import GREETING_BUBBLE_TIMEOUT_MS
 
-
 _TAIL_WIDTH = 11
 _HORIZONTAL_PADDING = 14
 _VERTICAL_PADDING = 10

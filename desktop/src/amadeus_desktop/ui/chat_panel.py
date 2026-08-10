@@ -4,16 +4,31 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QEvent,
+    QRect,
+    QSignalBlocker,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QCloseEvent,
+    QDragEnterEvent,
+    QDropEvent,
     QHideEvent,
+    QImage,
+    QImageReader,
     QKeyEvent,
     QKeySequence,
     QPainter,
     QPaintEvent,
+    QPixmap,
     QResizeEvent,
     QShortcut,
     QShowEvent,
@@ -21,6 +36,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -36,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from amadeus_desktop.chat_geometry import compact_panel_size
+from amadeus_desktop.chat_models import AttachmentKind, AttachmentSnapshot, AttachmentSource
 from amadeus_desktop.focus_mode import FOCUS_STATUS_TOOLTIP
 
 _ACTIVE_STATES = {"sending", "waiting_first_chunk", "streaming"}
@@ -66,6 +83,8 @@ class ChatInput(QPlainTextEdit):
     """Multiline editor whose unmodified Enter key requests a send."""
 
     send_key_pressed = Signal()
+    image_paste_requested = Signal(object)
+    files_paste_requested = Signal(object)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt API name
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -76,6 +95,19 @@ class ChatInput(QPlainTextEdit):
                 event.accept()
             return
         super().keyPressEvent(event)
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802 - Qt API name
+        if source.hasImage():
+            image = source.imageData()
+            if isinstance(image, QImage) and not image.isNull():
+                self.image_paste_requested.emit(image)
+                return
+        if source.hasUrls():
+            paths = tuple(url.toLocalFile() for url in source.urls() if url.isLocalFile())
+            if paths:
+                self.files_paste_requested.emit(paths)
+                return
+        super().insertFromMimeData(source)
 
 
 class MessageBubble(QFrame):
@@ -92,6 +124,9 @@ class MessageBubble(QFrame):
         status: str | None = None,
         retryable: bool = False,
         retry_id: str | None = None,
+        attachments: tuple[AttachmentSnapshot, ...] = (),
+        attachment_root: Path | None = None,
+        input_modality: object = "text",
     ) -> None:
         super().__init__()
         self.message_id = message_id
@@ -99,11 +134,16 @@ class MessageBubble(QFrame):
         self.retry_id = retry_id or message_id
         self._text = text
         self._retryable = retryable
+        self._attachments = tuple(attachments)
+        self._attachment_root = attachment_root
 
         self.setObjectName("userBubble" if role == "user" else "assistantBubble")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
 
-        role_label = QLabel("你" if role == "user" else "Amadeus")
+        modality = _enum_text(input_modality).lower()
+        role_label = QLabel(
+            ("你 · 语音转写" if modality == "voice" else "你") if role == "user" else "Amadeus"
+        )
         role_label.setObjectName("messageRole")
 
         self.text_view = QTextEdit()
@@ -124,6 +164,12 @@ class MessageBubble(QFrame):
         self.status_label.setObjectName("messageStatus")
         self.status_label.setWordWrap(True)
 
+        self.attachment_container = QWidget()
+        self.attachment_container.setObjectName("messageAttachments")
+        self.attachment_layout = QVBoxLayout(self.attachment_container)
+        self.attachment_layout.setContentsMargins(0, 0, 0, 0)
+        self.attachment_layout.setSpacing(4)
+
         self.retry_button = QPushButton("重试")
         self.retry_button.setObjectName("retryButton")
         self.retry_button.setAutoDefault(False)
@@ -138,9 +184,11 @@ class MessageBubble(QFrame):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(5)
         layout.addWidget(role_label)
+        layout.addWidget(self.attachment_container)
         layout.addWidget(self.text_view)
         layout.addLayout(footer)
 
+        self.set_attachments(self._attachments)
         self.set_message(text, status=status, retryable=retryable)
 
     @property
@@ -169,6 +217,73 @@ class MessageBubble(QFrame):
     def set_retry_enabled(self, enabled: bool) -> None:
         self.retry_button.setEnabled(self._retryable and enabled)
 
+    def set_attachments(self, attachments: tuple[AttachmentSnapshot, ...]) -> None:
+        self._attachments = tuple(attachments)
+        while self.attachment_layout.count():
+            item = self.attachment_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for attachment in self._attachments:
+            row = QWidget()
+            row.setObjectName("messageAttachmentRow")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            if attachment.kind is AttachmentKind.IMAGE:
+                preview = QLabel()
+                preview.setObjectName("attachmentThumbnail")
+                preview.setFixedSize(72, 54)
+                preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pixmap = self._attachment_pixmap(attachment)
+                if pixmap is None:
+                    preview.setText("图片")
+                else:
+                    preview.setPixmap(
+                        pixmap.scaled(
+                            preview.size(),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                row_layout.addWidget(preview)
+            label = QLabel(
+                f"{attachment.display_name}\n"
+                f"{_format_bytes(attachment.size_bytes)} · "
+                f"{_attachment_source_text(attachment.source)}"
+                " · 已就绪"
+                f"{' · 已截断' if attachment.text_truncated else ''}"
+            )
+            label.setObjectName("attachmentMetadata")
+            label.setWordWrap(True)
+            row_layout.addWidget(label, 1)
+            self.attachment_layout.addWidget(row)
+        self.attachment_container.setVisible(bool(self._attachments))
+        self._update_text_height()
+
+    def _attachment_pixmap(self, attachment: AttachmentSnapshot) -> QPixmap | None:
+        if self._attachment_root is None:
+            return None
+        parts = attachment.relative_path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            return None
+        try:
+            root = self._attachment_root.resolve(strict=False)
+            target = root.joinpath(*parts).resolve(strict=True)
+            target.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        reader = QImageReader(str(target))
+        reader.setAutoTransform(True)
+        source_size = reader.size()
+        if source_size.isValid():
+            source_size.scale(QSize(144, 108), Qt.AspectRatioMode.KeepAspectRatio)
+            reader.setScaledSize(source_size)
+        image = reader.read()
+        if image.isNull():
+            return None
+        return QPixmap.fromImage(image)
+
     def set_bubble_width(self, width: int) -> None:
         self.setFixedWidth(max(120, width))
         self._update_text_height()
@@ -189,6 +304,17 @@ class ChatPanel(QWidget):
     """Compact independent tool window driven only by application-layer events."""
 
     send_requested = Signal(str)
+    send_with_attachments_requested = Signal(str, object)
+    attachment_paths_requested = Signal(object, object)
+    attachment_image_requested = Signal(object, str, object)
+    push_to_talk_pressed = Signal()
+    push_to_talk_released = Signal()
+    hands_free_requested = Signal(bool)
+    voice_stop_requested = Signal()
+    region_screenshot_requested = Signal()
+    visual_source_requested = Signal(str)
+    visual_stop_requested = Signal()
+    privacy_mode_requested = Signal(bool)
     stop_requested = Signal()
     retry_requested = Signal(str)
     hide_requested = Signal()
@@ -207,6 +333,15 @@ class ChatPanel(QWidget):
         self._stop_pending = False
         self._send_pending = False
         self._pending_send_text: str | None = None
+        self._pending_send_attachments: tuple[AttachmentSnapshot, ...] = ()
+        self._draft_attachments: list[AttachmentSnapshot] = []
+        self._attachment_busy = False
+        self._attachment_root: Path | None = None
+        self._voice_available = False
+        self._hands_free_available = False
+        self._voice_state = "off"
+        self._visual_active = False
+        self._privacy_mode = False
         self._messages: dict[str, MessageBubble] = {}
         self._message_order: list[str] = []
         self._bubble_resize_scheduled = False
@@ -219,12 +354,14 @@ class ChatPanel(QWidget):
         self._current_conversation_id: str | None = None
         self._conversation_switch_pending = False
         self._conversation_drafts: dict[str, str] = {}
+        self._conversation_attachment_drafts: dict[str, tuple[AttachmentSnapshot, ...]] = {}
 
         self.setObjectName("chatPanel")
         self.setWindowTitle("Amadeus 对话")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
         self.resize(380, 560)
         self.setStyleSheet(_PANEL_STYLESHEET)
 
@@ -319,6 +456,97 @@ class ChatPanel(QWidget):
         self.input.setMaximumHeight(110)
         self.input.send_key_pressed.connect(self._request_send)
         self.input.textChanged.connect(self._sync_action_enabled)
+        self.input.image_paste_requested.connect(self._request_pasted_image)
+        self.input.files_paste_requested.connect(
+            lambda paths: self._request_attachment_paths(paths, AttachmentSource.CLIPBOARD)
+        )
+
+        self.attach_button = QPushButton("＋附件")
+        self.attach_button.setObjectName("attachButton")
+        self.attach_button.setAccessibleName("添加图片或文档附件")
+        self.attach_button.setAutoDefault(False)
+        self.attach_button.clicked.connect(self._choose_attachments)
+        self.attachment_status = QLabel()
+        self.attachment_status.setObjectName("attachmentStatus")
+        self.attachment_status.setWordWrap(True)
+        self.attachment_list = QWidget()
+        self.attachment_list.setObjectName("draftAttachments")
+        self.attachment_list_layout = QVBoxLayout(self.attachment_list)
+        self.attachment_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.attachment_list_layout.setSpacing(4)
+
+        attachment_toolbar = QHBoxLayout()
+        attachment_toolbar.setContentsMargins(0, 0, 0, 0)
+        attachment_toolbar.addWidget(self.attach_button)
+        attachment_toolbar.addWidget(self.attachment_status, 1)
+
+        attachment_composer = QVBoxLayout()
+        attachment_composer.setContentsMargins(0, 0, 0, 0)
+        attachment_composer.setSpacing(4)
+        attachment_composer.addLayout(attachment_toolbar)
+        attachment_composer.addWidget(self.attachment_list)
+
+        self.push_to_talk_button = QPushButton("按住说话")
+        self.push_to_talk_button.setObjectName("pushToTalkButton")
+        self.push_to_talk_button.setAccessibleName("按住说话，松开发送")
+        self.push_to_talk_button.setAutoDefault(False)
+        self.push_to_talk_button.pressed.connect(self.push_to_talk_pressed.emit)
+        self.push_to_talk_button.released.connect(self.push_to_talk_released.emit)
+        self.hands_free_button = QPushButton("免提")
+        self.hands_free_button.setObjectName("handsFreeButton")
+        self.hands_free_button.setCheckable(True)
+        self.hands_free_button.setAutoDefault(False)
+        self.hands_free_button.toggled.connect(self.hands_free_requested.emit)
+        self.voice_stop_button = QPushButton("停止语音")
+        self.voice_stop_button.setObjectName("voiceStopButton")
+        self.voice_stop_button.setAutoDefault(False)
+        self.voice_stop_button.clicked.connect(self.voice_stop_requested.emit)
+        self.voice_status = QLabel("语音未配置")
+        self.voice_status.setObjectName("voiceStatus")
+        self.voice_status.setWordWrap(True)
+        voice_toolbar = QHBoxLayout()
+        voice_toolbar.setContentsMargins(0, 0, 0, 0)
+        voice_toolbar.setSpacing(5)
+        voice_toolbar.addWidget(self.push_to_talk_button)
+        voice_toolbar.addWidget(self.hands_free_button)
+        voice_toolbar.addWidget(self.voice_stop_button)
+        voice_toolbar.addWidget(self.voice_status, 1)
+
+        self.screenshot_button = QPushButton("截图")
+        self.screenshot_button.setObjectName("screenshotButton")
+        self.screenshot_button.setAutoDefault(False)
+        self.screenshot_button.clicked.connect(self.region_screenshot_requested.emit)
+        self.visual_source_combo = QComboBox()
+        self.visual_source_combo.setObjectName("visualSourceCombo")
+        self.visual_source_combo.addItem("共享屏幕", "screen")
+        self.visual_source_combo.addItem("共享窗口", "window")
+        self.visual_source_combo.addItem("共享相机", "camera")
+        self.visual_start_button = QPushButton("开始")
+        self.visual_start_button.setObjectName("visualStartButton")
+        self.visual_start_button.setAutoDefault(False)
+        self.visual_start_button.clicked.connect(
+            lambda: self.visual_source_requested.emit(str(self.visual_source_combo.currentData()))
+        )
+        self.visual_stop_button = QPushButton("停止")
+        self.visual_stop_button.setObjectName("visualStopButton")
+        self.visual_stop_button.setAutoDefault(False)
+        self.visual_stop_button.clicked.connect(self.visual_stop_requested.emit)
+        self.privacy_button = QPushButton("隐私")
+        self.privacy_button.setObjectName("privacyButton")
+        self.privacy_button.setCheckable(True)
+        self.privacy_button.setAutoDefault(False)
+        self.privacy_button.toggled.connect(self.privacy_mode_requested.emit)
+        self.visual_status = QLabel("视觉已关闭")
+        self.visual_status.setObjectName("visualStatus")
+        self.visual_status.setWordWrap(True)
+        visual_toolbar = QHBoxLayout()
+        visual_toolbar.setContentsMargins(0, 0, 0, 0)
+        visual_toolbar.setSpacing(5)
+        visual_toolbar.addWidget(self.screenshot_button)
+        visual_toolbar.addWidget(self.visual_source_combo)
+        visual_toolbar.addWidget(self.visual_start_button)
+        visual_toolbar.addWidget(self.visual_stop_button)
+        visual_toolbar.addWidget(self.privacy_button)
 
         self.action_button = QPushButton("发送")
         self.action_button.setObjectName("actionButton")
@@ -339,6 +567,10 @@ class ChatPanel(QWidget):
         layout.addLayout(conversation_bar)
         layout.addWidget(self.scroll_area, 1)
         layout.addWidget(self.status_label)
+        layout.addLayout(voice_toolbar)
+        layout.addLayout(visual_toolbar)
+        layout.addWidget(self.visual_status)
+        layout.addLayout(attachment_composer)
         layout.addLayout(composer)
 
         self._escape_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
@@ -349,6 +581,8 @@ class ChatPanel(QWidget):
         self.manage_history_button.clicked.connect(self.history_requested.emit)
         self._sync_conversation_controls()
         self._sync_action_enabled()
+        self.set_voice_available(False)
+        self.set_visual_state(False, "", "")
 
     @property
     def conversation_active(self) -> bool:
@@ -387,6 +621,162 @@ class ChatPanel(QWidget):
         return self._messages.get(message_id)
 
     @property
+    def draft_attachments(self) -> tuple[AttachmentSnapshot, ...]:
+        return tuple(self._draft_attachments)
+
+    def draft_attachment_paths(
+        self,
+        *,
+        excluding_conversation_ids: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        excluded = set(excluding_conversation_ids)
+        grouped = dict(self._conversation_attachment_drafts)
+        if self._current_conversation_id is not None:
+            grouped[self._current_conversation_id] = tuple(self._draft_attachments)
+        return tuple(
+            dict.fromkeys(
+                attachment.relative_path
+                for conversation_id, attachments in grouped.items()
+                if conversation_id not in excluded
+                for attachment in attachments
+            )
+        )
+
+    def set_attachment_root(self, root: str | Path) -> None:
+        self._attachment_root = Path(root)
+
+    def set_attachment_processing(self, busy: bool) -> None:
+        self._attachment_busy = bool(busy)
+        self.attachment_status.setText("正在后台处理附件…" if busy else "")
+        self._sync_action_enabled()
+        self._sync_conversation_controls()
+
+    def set_voice_available(
+        self,
+        available: bool,
+        *,
+        hands_free_available: bool = True,
+    ) -> None:
+        self._voice_available = bool(available)
+        self._hands_free_available = bool(available and hands_free_available)
+        self.push_to_talk_button.setEnabled(self._voice_available and not self._privacy_mode)
+        self.hands_free_button.setEnabled(self._hands_free_available and not self._privacy_mode)
+        self.voice_stop_button.setEnabled(self._voice_available and self._voice_state != "off")
+        if not self._voice_available:
+            self.voice_status.setText("语音未配置")
+
+    def set_voice_state(self, state_object: object) -> None:
+        state = str(getattr(state_object, "value", state_object))
+        labels = {
+            "off": "语音已关闭",
+            "listening": "正在聆听",
+            "capturing": "正在收音",
+            "transcribing": "正在转写",
+            "thinking": "正在思考",
+            "speaking": "正在播音",
+        }
+        if state not in labels:
+            return
+        self._voice_state = state
+        self.voice_status.setText(labels[state])
+        self.voice_status.setProperty("state", state)
+        self.voice_status.style().unpolish(self.voice_status)
+        self.voice_status.style().polish(self.voice_status)
+        self.voice_stop_button.setEnabled(self._voice_available and state != "off")
+        self.push_to_talk_button.setText("松开发送" if state == "capturing" else "按住说话")
+
+    def set_voice_status(self, message: str, error: bool = False) -> None:
+        self.voice_status.setText(str(message))
+        self.voice_status.setProperty("error", bool(error))
+        self.voice_status.style().unpolish(self.voice_status)
+        self.voice_status.style().polish(self.voice_status)
+
+    def set_hands_free_checked(self, enabled: bool) -> None:
+        blocked = self.hands_free_button.blockSignals(True)
+        self.hands_free_button.setChecked(bool(enabled))
+        self.hands_free_button.blockSignals(blocked)
+
+    def set_visual_state(self, active: bool, _kind: str, source_name: str) -> None:
+        self._visual_active = bool(active)
+        self.visual_status.setText(f"正在共享 · {source_name}" if active else "视觉已关闭")
+        self.visual_status.setProperty("active", bool(active))
+        self.visual_status.style().unpolish(self.visual_status)
+        self.visual_status.style().polish(self.visual_status)
+        self.visual_start_button.setEnabled(not active and not self._privacy_mode)
+        self.visual_source_combo.setEnabled(not active and not self._privacy_mode)
+        self.visual_stop_button.setEnabled(active)
+
+    def set_privacy_mode(self, enabled: bool) -> None:
+        self._privacy_mode = bool(enabled)
+        blocked = self.privacy_button.blockSignals(True)
+        self.privacy_button.setChecked(self._privacy_mode)
+        self.privacy_button.blockSignals(blocked)
+        self.visual_start_button.setEnabled(not self._visual_active and not self._privacy_mode)
+        self.visual_source_combo.setEnabled(not self._visual_active and not self._privacy_mode)
+        self.screenshot_button.setEnabled(not self._privacy_mode)
+        self.push_to_talk_button.setEnabled(self._voice_available and not self._privacy_mode)
+        self.hands_free_button.setEnabled(self._hands_free_available and not self._privacy_mode)
+        if self._privacy_mode:
+            self.visual_status.setText("隐私模式：实时采集已停止")
+
+    def add_draft_attachment(self, attachment: AttachmentSnapshot) -> bool:
+        if attachment.attachment_id in {
+            existing.attachment_id for existing in self._draft_attachments
+        }:
+            return False
+        candidates = (*self._draft_attachments, attachment)
+        if len(candidates) > 5 or sum(item.size_bytes for item in candidates) > 50 * 1024**2:
+            self.set_status("附件总数或总大小超过限制。", kind="error")
+            return False
+        self._draft_attachments.append(attachment)
+        self._render_draft_attachments()
+        self._sync_action_enabled()
+        return True
+
+    def clear_draft_attachments(self) -> None:
+        self._draft_attachments.clear()
+        self._render_draft_attachments()
+        self._sync_action_enabled()
+
+    def _remove_draft_attachment(self, attachment_id: str) -> None:
+        self._draft_attachments = [
+            attachment
+            for attachment in self._draft_attachments
+            if attachment.attachment_id != attachment_id
+        ]
+        self._render_draft_attachments()
+        self._sync_action_enabled()
+
+    def _render_draft_attachments(self) -> None:
+        while self.attachment_list_layout.count():
+            item = self.attachment_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for attachment in self._draft_attachments:
+            row = QWidget()
+            row.setObjectName("draftAttachmentRow")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(6, 3, 6, 3)
+            label = QLabel(
+                f"{attachment.display_name} · {_format_bytes(attachment.size_bytes)}"
+                f"{' · 文本已截断' if attachment.text_truncated else ''}"
+            )
+            label.setWordWrap(True)
+            remove = QPushButton("移除")
+            remove.setAutoDefault(False)
+            remove.setAccessibleName(f"移除附件 {attachment.display_name}")
+            remove.clicked.connect(
+                lambda _checked=False, identifier=attachment.attachment_id: (
+                    self._remove_draft_attachment(identifier)
+                )
+            )
+            row_layout.addWidget(label, 1)
+            row_layout.addWidget(remove)
+            self.attachment_list_layout.addWidget(row)
+        self.attachment_list.setVisible(bool(self._draft_attachments))
+
+    @property
     def provider_mode(self) -> str:
         return self._provider_mode
 
@@ -416,9 +806,7 @@ class ChatPanel(QWidget):
         self.empty_state.setText(empty)
         self.input.setPlaceholderText(placeholder)
         self.input.setEnabled(
-            self._chat_enabled
-            and self._storage_ready
-            and not self._conversation_switch_pending
+            self._chat_enabled and self._storage_ready and not self._conversation_switch_pending
         )
         self._sync_retry_enabled()
         self._sync_action_enabled()
@@ -428,9 +816,7 @@ class ChatPanel(QWidget):
 
         self._storage_ready = not read_only
         self.input.setEnabled(
-            self._chat_enabled
-            and self._storage_ready
-            and not self._conversation_switch_pending
+            self._chat_enabled and self._storage_ready and not self._conversation_switch_pending
         )
         if read_only:
             self.set_status("本地数据库处于只读保护状态，无法发送新消息。", kind="error")
@@ -455,6 +841,11 @@ class ChatPanel(QWidget):
             for conversation_id, draft in self._conversation_drafts.items()
             if conversation_id in valid_ids
         }
+        self._conversation_attachment_drafts = {
+            conversation_id: attachments
+            for conversation_id, attachments in self._conversation_attachment_drafts.items()
+            if conversation_id in valid_ids
+        }
         with QSignalBlocker(self.conversation_combo):
             self.conversation_combo.clear()
             selected_index = -1
@@ -474,6 +865,13 @@ class ChatPanel(QWidget):
             self.input.setPlainText(
                 self._conversation_drafts.get(self._current_conversation_id or "", "")
             )
+            self._draft_attachments = list(
+                self._conversation_attachment_drafts.get(
+                    self._current_conversation_id or "",
+                    (),
+                )
+            )
+            self._render_draft_attachments()
         self._history_ready = True
         self._sync_conversation_controls()
 
@@ -482,9 +880,7 @@ class ChatPanel(QWidget):
             self._remember_current_draft()
         self._conversation_switch_pending = bool(pending)
         self.input.setEnabled(
-            self._chat_enabled
-            and self._storage_ready
-            and not self._conversation_switch_pending
+            self._chat_enabled and self._storage_ready and not self._conversation_switch_pending
         )
         self._sync_retry_enabled()
         self._sync_conversation_controls()
@@ -518,8 +914,16 @@ class ChatPanel(QWidget):
             and self.input.toPlainText() == self._pending_send_text
         ):
             self.input.clear()
+            self.clear_draft_attachments()
+            if self._current_conversation_id is not None:
+                self._conversation_drafts.pop(self._current_conversation_id, None)
+                self._conversation_attachment_drafts.pop(
+                    self._current_conversation_id,
+                    None,
+                )
         self._send_pending = False
         self._pending_send_text = None
+        self._pending_send_attachments = ()
         status, kind = _STATE_PRESENTATION.get(state_name, (state_name, "neutral"))
         focus_active = focus_mode and state_name in {"sending", "waiting_first_chunk"}
         if focus_active:
@@ -547,6 +951,7 @@ class ChatPanel(QWidget):
             self._turn_locked = False
             self._send_pending = False
             self._pending_send_text = None
+            self._pending_send_attachments = ()
         self._sync_retry_enabled()
         self._sync_conversation_controls()
         self._sync_action_enabled()
@@ -585,6 +990,8 @@ class ChatPanel(QWidget):
         status: object | None = None,
         retryable: bool = False,
         retry_id: str | None = None,
+        attachments: tuple[AttachmentSnapshot, ...] = (),
+        input_modality: object = "text",
     ) -> MessageBubble:
         if message_id in self._messages:
             raise ValueError(f"A chat message with id {message_id!r} already exists.")
@@ -596,6 +1003,8 @@ class ChatPanel(QWidget):
             status=status,
             retryable=retryable,
             retry_id=retry_id,
+            attachments=attachments,
+            input_modality=input_modality,
         )
         self._message_order.append(message_id)
         self.message_layout.addWidget(bubble, 0, _bubble_alignment(bubble.role))
@@ -612,6 +1021,7 @@ class ChatPanel(QWidget):
         status: object | None = None,
         retryable: bool | None = None,
         retry_id: str | None = None,
+        attachments: tuple[AttachmentSnapshot, ...] | None = None,
     ) -> MessageBubble:
         bubble = self._messages[message_id]
         follow_tail = self._is_near_bottom()
@@ -622,6 +1032,8 @@ class ChatPanel(QWidget):
             retry_id=retry_id,
         )
         bubble.set_retry_enabled(not self._turn_locked)
+        if attachments is not None:
+            bubble.set_attachments(attachments)
         if follow_tail:
             self._scroll_to_bottom_later()
         return bubble
@@ -635,7 +1047,16 @@ class ChatPanel(QWidget):
         scroll_bar = self.scroll_area.verticalScrollBar()
         old_value = scroll_bar.value()
         old_maximum = scroll_bar.maximum()
-        for index, (message_id, role, text, status, retryable, retry_id) in enumerate(specs):
+        for index, (
+            message_id,
+            role,
+            text,
+            status,
+            retryable,
+            retry_id,
+            attachments,
+            input_modality,
+        ) in enumerate(specs):
             bubble = self._create_bubble(
                 message_id,
                 role,
@@ -643,6 +1064,8 @@ class ChatPanel(QWidget):
                 status=status,
                 retryable=retryable,
                 retry_id=retry_id,
+                attachments=attachments,
+                input_modality=input_modality,
             )
             self._message_order.insert(index, message_id)
             self.message_layout.insertWidget(index + 1, bubble, 0, _bubble_alignment(role))
@@ -708,6 +1131,7 @@ class ChatPanel(QWidget):
                         "status": _member(message, "status", default=None),
                         "retryable": False,
                         "retry_id": turn_id,
+                        "attachments": tuple(_member(message, "attachments", default=())),
                     }
                 )
         self.prepend_messages(specs)
@@ -737,6 +1161,20 @@ class ChatPanel(QWidget):
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt API name
         super().resizeEvent(event)
         self._schedule_bubble_resize()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt API name
+        if event.mimeData().hasUrls() and any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt API name
+        paths = tuple(url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile())
+        if not paths:
+            event.ignore()
+            return
+        self._request_attachment_paths(paths, AttachmentSource.DROP)
+        event.acceptProposedAction()
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802 - Qt API name
         if watched is self.scroll_area.viewport() and event.type() is QEvent.Type.Resize:
@@ -774,26 +1212,62 @@ class ChatPanel(QWidget):
         self.set_conversation_switch_pending(True)
         self.new_conversation_requested.emit()
 
+    def _choose_attachments(self) -> None:
+        paths, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "选择图片或文档",
+            "",
+            "支持的附件 (*.png *.jpg *.jpeg *.webp *.pdf *.txt *.md *.docx);;"
+            "图片 (*.png *.jpg *.jpeg *.webp);;文档 (*.pdf *.txt *.md *.docx)",
+        )
+        if paths:
+            self._request_attachment_paths(tuple(paths), AttachmentSource.FILE_PICKER)
+
+    def _request_attachment_paths(
+        self,
+        paths: tuple[str, ...],
+        source: AttachmentSource,
+    ) -> None:
+        if self._attachment_busy or self._turn_locked:
+            return
+        self.attachment_paths_requested.emit(paths, source)
+
+    def _request_pasted_image(self, image: QImage) -> None:
+        if self._attachment_busy or self._turn_locked or image.isNull():
+            return
+        self.attachment_image_requested.emit(
+            image.copy(),
+            "clipboard-image.png",
+            AttachmentSource.CLIPBOARD,
+        )
+
     def _request_send(self) -> None:
         if (
             not self._chat_enabled
             or not self._storage_ready
             or self._turn_locked
             or self._send_pending
+            or self._attachment_busy
         ):
             return
         text = self.input.toPlainText()
-        if not text.strip():
+        attachments = tuple(self._draft_attachments)
+        if not text.strip() and not attachments:
             return
         self._send_pending = True
         self._pending_send_text = text
+        self._pending_send_attachments = attachments
         self._sync_action_enabled()
-        self.send_requested.emit(text)
+        if attachments:
+            self.send_with_attachments_requested.emit(text, attachments)
+        else:
+            self.send_requested.emit(text)
 
         def release_unaccepted_send() -> None:
             if not self._turn_locked:
                 self._send_pending = False
                 self._pending_send_text = None
+                self._pending_send_attachments = ()
                 self._sync_action_enabled()
 
         QTimer.singleShot(0, self, release_unaccepted_send)
@@ -810,11 +1284,16 @@ class ChatPanel(QWidget):
             self._request_send()
 
     def _sync_action_enabled(self) -> None:
-        if (
-            not self._chat_enabled
-            or not self._storage_ready
-            or self._conversation_switch_pending
-        ):
+        if hasattr(self, "attach_button"):
+            self.attach_button.setEnabled(
+                self._chat_enabled
+                and self._storage_ready
+                and not self._conversation_switch_pending
+                and not self._turn_locked
+                and not self._attachment_busy
+                and len(self._draft_attachments) < 5
+            )
+        if not self._chat_enabled or not self._storage_ready or self._conversation_switch_pending:
             self.action_button.setEnabled(False)
             return
         if self._conversation_active:
@@ -823,7 +1302,9 @@ class ChatPanel(QWidget):
             self.action_button.setEnabled(False)
         else:
             self.action_button.setEnabled(
-                not self._send_pending and bool(self.input.toPlainText().strip())
+                not self._send_pending
+                and not self._attachment_busy
+                and bool(self.input.toPlainText().strip() or self._draft_attachments)
             )
 
     def _sync_retry_enabled(self) -> None:
@@ -836,7 +1317,7 @@ class ChatPanel(QWidget):
             )
 
     def _sync_conversation_controls(self) -> None:
-        changing = self._conversation_switch_pending or self._turn_locked
+        changing = self._conversation_switch_pending or self._turn_locked or self._attachment_busy
         self.conversation_combo.setEnabled(
             self._history_ready and self.conversation_combo.count() > 1 and not changing
         )
@@ -853,6 +1334,10 @@ class ChatPanel(QWidget):
             self._conversation_drafts[conversation_id] = draft
         else:
             self._conversation_drafts.pop(conversation_id, None)
+        if self._draft_attachments:
+            self._conversation_attachment_drafts[conversation_id] = tuple(self._draft_attachments)
+        else:
+            self._conversation_attachment_drafts.pop(conversation_id, None)
 
     def _create_bubble(
         self,
@@ -863,6 +1348,8 @@ class ChatPanel(QWidget):
         status: object | None,
         retryable: bool,
         retry_id: str | None,
+        attachments: tuple[AttachmentSnapshot, ...] = (),
+        input_modality: object = "text",
     ) -> MessageBubble:
         bubble = MessageBubble(
             message_id,
@@ -871,6 +1358,9 @@ class ChatPanel(QWidget):
             status=_enum_text(status) if status is not None else None,
             retryable=retryable,
             retry_id=retry_id,
+            attachments=attachments,
+            attachment_root=self._attachment_root,
+            input_modality=input_modality,
         )
         bubble.retry_clicked.connect(self.retry_requested.emit)
         bubble.set_bubble_width(self._bubble_width())
@@ -889,6 +1379,8 @@ class ChatPanel(QWidget):
         role = _member(message, "role", default="assistant")
         message_id = str(_member(message, "message_id", "id", default=f"{turn_id}:{role}"))
         text = str(_member(message, "content", "text", default=""))
+        attachments = tuple(_member(message, "attachments", default=()))
+        input_modality = _member(message, "input_modality", default="text")
         if status is None:
             status = _member(message, "status", default=None)
         if message_id in self._messages:
@@ -898,6 +1390,7 @@ class ChatPanel(QWidget):
                 status=status,
                 retryable=retryable,
                 retry_id=turn_id,
+                attachments=attachments,
             )
         else:
             self.append_message(
@@ -907,6 +1400,8 @@ class ChatPanel(QWidget):
                 status=status,
                 retryable=retryable,
                 retry_id=turn_id,
+                attachments=attachments,
+                input_modality=input_modality,
             )
 
     def _after_message_change(self) -> None:
@@ -967,22 +1462,41 @@ def _member(value: object, *names: str, default: Any = ...) -> Any:
     raise ValueError(f"Chat view data is missing one of these fields: {joined}")
 
 
-def _message_spec(message: object) -> tuple[str, str, str, object | None, bool, str | None]:
+def _message_spec(
+    message: object,
+) -> tuple[
+    str,
+    str,
+    str,
+    object | None,
+    bool,
+    str | None,
+    tuple[AttachmentSnapshot, ...],
+    object,
+]:
     message_id = str(_member(message, "message_id", "id"))
     role = _normalise_role(_member(message, "role"))
     text = str(_member(message, "content", "text", default=""))
     status = _member(message, "status", default=None)
     retryable = bool(_member(message, "retryable", default=False))
     retry_id = _member(message, "retry_id", "turn_id", default=None)
-    return message_id, role, text, status, retryable, None if retry_id is None else str(retry_id)
+    attachments = tuple(_member(message, "attachments", default=()))
+    input_modality = _member(message, "input_modality", default="text")
+    return (
+        message_id,
+        role,
+        text,
+        status,
+        retryable,
+        None if retry_id is None else str(retry_id),
+        attachments,
+        input_modality,
+    )
 
 
 def _conversation_spec(conversation: object) -> tuple[str, str, str]:
     conversation_id = str(_member(conversation, "conversation_id", "id"))
-    title = (
-        str(_member(conversation, "title", "name", default="新对话")).strip()
-        or "新对话"
-    )
+    title = str(_member(conversation, "title", "name", default="新对话")).strip() or "新对话"
     timestamp = _member(
         conversation,
         "last_activity_at",
@@ -991,9 +1505,7 @@ def _conversation_spec(conversation: object) -> tuple[str, str, str]:
         default="",
     )
     formatter = getattr(timestamp, "strftime", None)
-    updated = (
-        str(formatter("%m-%d %H:%M")) if callable(formatter) else str(timestamp).strip()
-    )
+    updated = str(formatter("%m-%d %H:%M")) if callable(formatter) else str(timestamp).strip()
     label = title if not updated else f"{title} · {updated}"
     tooltip = title if not updated else f"{title}\n最后活动：{updated}"
     return conversation_id, label, tooltip
@@ -1018,6 +1530,26 @@ def _status_text(status: object | None) -> str:
 
 def _bubble_alignment(role: str) -> Qt.AlignmentFlag:
     return Qt.AlignmentFlag.AlignRight if role == "user" else Qt.AlignmentFlag.AlignLeft
+
+
+def _format_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024**2:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / 1024**2:.1f} MiB"
+
+
+def _attachment_source_text(source: AttachmentSource) -> str:
+    return {
+        AttachmentSource.FILE_PICKER: "文件选择",
+        AttachmentSource.DROP: "拖放",
+        AttachmentSource.CLIPBOARD: "剪贴板",
+        AttachmentSource.SCREENSHOT: "截图",
+        AttachmentSource.SCREEN: "屏幕",
+        AttachmentSource.WINDOW: "窗口",
+        AttachmentSource.CAMERA: "相机",
+    }[AttachmentSource(source)]
 
 
 _PANEL_STYLESHEET = """
@@ -1111,6 +1643,69 @@ QFrame#assistantBubble {
 QLabel#messageRole { color: #a5f3fc; font-size: 11px; font-weight: 600; }
 QTextEdit#messageText { background: transparent; color: #f1f5f9; padding: 0; }
 QLabel#messageStatus { color: #94a3b8; font-size: 11px; }
+QWidget#messageAttachments, QWidget#draftAttachments { background: transparent; }
+QWidget#draftAttachmentRow {
+    background: #1e293b;
+    border: 1px solid #475569;
+    border-radius: 7px;
+    color: #e2e8f0;
+}
+QLabel#attachmentMetadata { color: #cbd5e1; font-size: 11px; }
+QLabel#attachmentThumbnail {
+    background: #0f172a;
+    border: 1px solid #475569;
+    border-radius: 5px;
+}
+QLabel#attachmentStatus { color: #67e8f9; font-size: 11px; }
+QLabel#voiceStatus { color: #94a3b8; font-size: 11px; }
+QLabel#voiceStatus[state="listening"] { color: #67e8f9; }
+QLabel#voiceStatus[state="capturing"] { color: #fbbf24; font-weight: 600; }
+QLabel#voiceStatus[state="transcribing"], QLabel#voiceStatus[state="thinking"] {
+    color: #c4b5fd;
+}
+QLabel#voiceStatus[state="speaking"] { color: #86efac; }
+QLabel#voiceStatus[error="true"] { color: #fca5a5; }
+QLabel#visualStatus { color: #94a3b8; font-size: 11px; }
+QLabel#visualStatus[active="true"] { color: #fbbf24; font-weight: 600; }
+QComboBox#visualSourceCombo {
+    background: #0f172a;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #e2e8f0;
+    min-height: 26px;
+}
+QPushButton#screenshotButton, QPushButton#visualStartButton,
+QPushButton#visualStopButton, QPushButton#privacyButton {
+    background: transparent;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #cbd5e1;
+    min-height: 26px;
+    padding: 2px 7px;
+}
+QPushButton#privacyButton:checked { background: #7f1d1d; border-color: #f87171; }
+QPushButton#pushToTalkButton, QPushButton#handsFreeButton, QPushButton#voiceStopButton {
+    background: transparent;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #cbd5e1;
+    min-height: 26px;
+    padding: 2px 7px;
+}
+QPushButton#handsFreeButton:checked { background: #164e63; border-color: #22d3ee; }
+QPushButton#pushToTalkButton:pressed { background: #78350f; border-color: #f59e0b; }
+QPushButton#pushToTalkButton:disabled, QPushButton#handsFreeButton:disabled,
+QPushButton#voiceStopButton:disabled { color: #64748b; border-color: #334155; }
+QPushButton#attachButton {
+    background: transparent;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #cbd5e1;
+    min-height: 26px;
+    padding: 2px 8px;
+}
+QPushButton#attachButton:hover { border-color: #22d3ee; color: #f8fafc; }
+QPushButton#attachButton:disabled { border-color: #334155; color: #64748b; }
 QPushButton#retryButton {
     background: transparent;
     border: 1px solid #64748b;

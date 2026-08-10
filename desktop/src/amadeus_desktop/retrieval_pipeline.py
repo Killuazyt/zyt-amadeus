@@ -11,7 +11,17 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Protocol
 
-from amadeus_desktop.chat_models import PreparedPrompt, PromptMessage, PromptRole
+from amadeus_desktop.chat_models import (
+    AttachmentKind,
+    AttachmentSnapshot,
+    AttachmentSource,
+    ImagePart,
+    PreparedPrompt,
+    PromptContent,
+    PromptMessage,
+    PromptRole,
+    ProviderRoute,
+)
 from amadeus_desktop.hybrid_retrieval import (
     MAX_SOURCE_HITS,
     RankedRetrievalHit,
@@ -70,10 +80,15 @@ class _PersonaRepository(Protocol):
     def recall_stats(self, persona_id: str, knowledge_ids=None): ...
 
 
+class _AttachmentRepository(Protocol):
+    def prompt_parts(self, user_text: str, attachments: tuple[AttachmentSnapshot, ...]): ...
+
+
 class RetrievalStores(Protocol):
     conversations: _ConversationRepository
     memories: _MemoryRepository
     personas: _PersonaRepository
+    attachments: _AttachmentRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +100,9 @@ class PromptRetrievalSeed:
     retrieval_query: str
     recent_messages: tuple[PromptMessage, ...]
     summary: str | None
+    current_prompt_content: PromptContent
+    attachments: tuple[AttachmentSnapshot, ...] = ()
+    provider_route: ProviderRoute = ProviderRoute.TEXT
     user_fts_hits: tuple[RankedRetrievalHit, ...] = ()
     persona_fts_hits: tuple[RankedRetrievalHit, ...] = ()
 
@@ -115,6 +133,15 @@ def collect_prompt_retrieval_seed(
     )
     recent: list[PromptMessage] = []
     retrieval_context: list[str] = []
+    prompt_attachments: list[AttachmentSnapshot] = []
+    user_positions = [
+        position
+        for position, message in enumerate(recent_stored)
+        if message.role is StoredMessageRole.USER
+    ]
+    attachment_positions = set(user_positions[-3:])
+    current_position = user_positions[-1] if user_positions else None
+    current_prompt_content: PromptContent = current_user_message
     for position, message in enumerate(recent_stored):
         if message.role is StoredMessageRole.USER:
             role = PromptRole.USER
@@ -129,13 +156,23 @@ def collect_prompt_retrieval_seed(
             role = PromptRole.ASSISTANT
         else:
             continue
-        recent.append(PromptMessage(role, message.content))
-        if not (
-            position == len(recent_stored) - 1
-            and role is PromptRole.USER
-            and message.content == current_user_message
-        ):
-            retrieval_context.append(message.content)
+        content: PromptContent = message.content
+        if role is PromptRole.USER:
+            user_text = message.content if message.content.strip() else "请查看我附上的资料。"
+            content = user_text
+            if position in attachment_positions and message.attachments:
+                snapshots = tuple(_attachment_snapshot(item) for item in message.attachments)
+                parts = tuple(stores.attachments.prompt_parts(user_text, snapshots))
+                if any(isinstance(part, ImagePart) for part in parts):
+                    content = parts
+                elif parts:
+                    content = parts[0].text
+                prompt_attachments.extend(snapshots)
+            if position == current_position:
+                current_prompt_content = content
+                continue
+        recent.append(PromptMessage(role, content))
+        retrieval_context.append(message.content)
 
     retrieval_query = build_retrieval_query(current_user_message, retrieval_context)
     user_fts: tuple[RankedRetrievalHit, ...] = ()
@@ -177,6 +214,19 @@ def collect_prompt_retrieval_seed(
         retrieval_query=retrieval_query,
         recent_messages=tuple(recent),
         summary=None if summary is None else summary.content,
+        current_prompt_content=current_prompt_content,
+        attachments=tuple(
+            {attachment.attachment_id: attachment for attachment in prompt_attachments}.values()
+        ),
+        provider_route=(
+            ProviderRoute.MULTIMODAL
+            if any(
+                isinstance(message.content, tuple)
+                and any(isinstance(part, ImagePart) for part in message.content)
+                for message in (*recent, PromptMessage(PromptRole.USER, current_prompt_content))
+            )
+            else ProviderRoute.TEXT
+        ),
         user_fts_hits=user_fts,
         persona_fts_hits=persona_fts,
     )
@@ -266,12 +316,30 @@ def finalize_prepared_prompt(
             recent_messages=seed.recent_messages,
         )
     )
+    messages = (*context.messages[:-1], PromptMessage(PromptRole.USER, seed.current_prompt_content))
     return PreparedPrompt(
-        messages=context.messages,
+        messages=messages,
         user_memory_version_ids=context.selected_memory_version_ids,
         persona_knowledge_ids=context.selected_persona_knowledge_ids,
         retrieval_ticket_id=f"{turn_id}:{attempt}",
         attempt=attempt,
+        attachments=seed.attachments,
+        provider_route=seed.provider_route,
+    )
+
+
+def _attachment_snapshot(value) -> AttachmentSnapshot:
+    return AttachmentSnapshot(
+        attachment_id=value.attachment_id,
+        kind=AttachmentKind(value.kind.value),
+        source=AttachmentSource(value.source.value),
+        display_name=value.display_name,
+        mime_type=value.mime_type,
+        size_bytes=value.size_bytes,
+        sha256=value.sha256,
+        relative_path=value.relative_path,
+        extracted_text=value.extracted_text,
+        text_truncated=value.text_truncated,
     )
 
 

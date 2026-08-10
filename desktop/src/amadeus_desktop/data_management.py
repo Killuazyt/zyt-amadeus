@@ -40,14 +40,16 @@ from amadeus_desktop.settings import (
     validate_settings_document,
 )
 
-CHAT_EXPORT_FORMAT = "amadeus-chat-export/v1"
+CHAT_EXPORT_FORMAT = "amadeus-chat-export/v2"
 MEMORY_EXPORT_FORMAT = "amadeus-memory-export/v1"
-BACKUP_FORMAT = "amadeus-backup/v1"
+BACKUP_FORMAT = "amadeus-backup/v2"
+LEGACY_BACKUP_FORMAT = "amadeus-backup/v1"
 
 BACKUP_MANIFEST_MEMBER = "manifest.json"
 BACKUP_DATABASE_MEMBER = "data/amadeus.sqlite3"
 BACKUP_SETTINGS_MEMBER = "config/settings.json"
 BACKUP_MEMBERS = frozenset({BACKUP_MANIFEST_MEMBER, BACKUP_DATABASE_MEMBER, BACKUP_SETTINGS_MEMBER})
+BACKUP_ATTACHMENTS_PREFIX = "data/attachments/"
 RESTORE_TRANSACTION_FORMAT = "amadeus-restore-transaction/v1"
 
 _RESTORE_MARKER_NAME = ".restore-transaction.json"
@@ -102,6 +104,7 @@ _V2_TABLES = {
     "persona_recall_events",
 }
 _V3_TABLES = {"proactive_events"}
+_V4_TABLES = {"attachments", "message_attachments"}
 
 
 class DataManagementError(RuntimeError):
@@ -144,6 +147,8 @@ class ChatExportBundle:
     conversations: tuple[Mapping[str, object], ...]
     messages: tuple[Mapping[str, object], ...]
     summaries: tuple[Mapping[str, object], ...]
+    attachments: tuple[Mapping[str, object], ...] = ()
+    message_attachments: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +168,10 @@ class BackupLimits:
     archive_bytes: int = 8 * 1024**3
     database_bytes: int = 8 * 1024**3
     settings_bytes: int = 4 * 1024**2
-    manifest_bytes: int = 128 * 1024
+    manifest_bytes: int = 32 * 1024**2
+    attachment_bytes: int = 8 * 1024**3
+    attachment_file_bytes: int = 25 * 1024**2
+    attachment_count: int = 100_000
 
     def __post_init__(self) -> None:
         if (
@@ -172,6 +180,9 @@ class BackupLimits:
                 self.database_bytes,
                 self.settings_bytes,
                 self.manifest_bytes,
+                self.attachment_bytes,
+                self.attachment_file_bytes,
+                self.attachment_count,
             )
             <= 0
         ):
@@ -183,7 +194,7 @@ DEFAULT_BACKUP_LIMITS = BackupLimits()
 
 @dataclass(frozen=True, slots=True)
 class BackupMetadata:
-    """Validated, non-content metadata from an ``amadeus-backup/v1`` archive."""
+    """Validated, non-content metadata from a supported Amadeus backup."""
 
     created_at: str
     app_version: str
@@ -193,6 +204,8 @@ class BackupMetadata:
     database_sha256: str
     settings_size: int
     settings_sha256: str
+    format: str = LEGACY_BACKUP_FORMAT
+    attachments: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +219,7 @@ class ValidatedRestorePayload:
     metadata: BackupMetadata
     staged_database_sha256: str
     staged_settings_sha256: str
+    attachments_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +259,9 @@ class SQLiteExportRepository:
         schema = self._schema_version()
         message_columns = self._table_columns("messages")
         origin_expression = "origin" if "origin" in message_columns else "'conversation' AS origin"
+        modality_expression = (
+            "input_modality" if "input_modality" in message_columns else "'text' AS input_modality"
+        )
         conversations = self._rows(
             """
             SELECT id, profile_id, title, status, created_at, updated_at, last_activity_at
@@ -255,6 +272,7 @@ class SQLiteExportRepository:
         messages = self._rows(
             f"""
             SELECT sequence, id, conversation_id, turn_id, role, {origin_expression},
+                   {modality_expression},
                    content, status, attempt, terminal_reason, provider_name, model_name,
                    failure_code, participates_in_memory, created_at, updated_at, completed_at
             FROM messages
@@ -269,7 +287,38 @@ class SQLiteExportRepository:
             ORDER BY conversation_id, covers_through_sequence, id
             """
         )
-        return ChatExportBundle(schema, conversations, messages, summaries)
+        table_names = {
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        attachments: tuple[Mapping[str, object], ...] = ()
+        message_attachments: tuple[Mapping[str, object], ...] = ()
+        if {"attachments", "message_attachments"}.issubset(table_names):
+            attachments = self._rows(
+                """
+                SELECT id, kind, source, display_name, mime_type, size_bytes, sha256,
+                       relative_path, status, extracted_text, text_truncated, created_at
+                FROM attachments
+                ORDER BY created_at, id
+                """
+            )
+            message_attachments = self._rows(
+                """
+                SELECT message_id, attachment_id, ordinal
+                FROM message_attachments
+                ORDER BY message_id, ordinal, attachment_id
+                """
+            )
+        return ChatExportBundle(
+            schema,
+            conversations,
+            messages,
+            summaries,
+            attachments,
+            message_attachments,
+        )
 
     def load_memory_bundle(self) -> MemoryExportBundle:
         schema = self._schema_version()
@@ -322,7 +371,7 @@ def export_chat_json(
     *,
     exported_at: datetime | None = None,
 ) -> Path:
-    """Load one chat snapshot and atomically write ``amadeus-chat-export/v1``."""
+    """Atomically export chat plus attachment metadata, never attachment bytes."""
 
     bundle = load_bundle()
     if not isinstance(bundle, ChatExportBundle):
@@ -334,6 +383,8 @@ def export_chat_json(
         "conversations": list(bundle.conversations),
         "messages": list(bundle.messages),
         "summaries": list(bundle.summaries),
+        "attachments": list(bundle.attachments),
+        "message_attachments": list(bundle.message_attachments),
     }
     return _atomic_write_json(Path(destination), payload, error_type=ExportError)
 
@@ -366,10 +417,11 @@ def create_backup_archive(
     database_backup: ConsistentBackupSource,
     settings_snapshot: Mapping[str, Any],
     app_version: str,
+    attachment_root: str | Path | None = None,
     created_at: datetime | None = None,
     limits: BackupLimits = DEFAULT_BACKUP_LIMITS,
 ) -> Path:
-    """Create and self-validate one atomic ``amadeus-backup/v1`` ZIP.
+    """Create and self-validate one atomic ``amadeus-backup/v2`` ZIP.
 
     ``database_backup`` must be either an already consistent SQLite backup or
     a callback compatible with ``SQLiteDatabase.create_backup(target)``.  A
@@ -410,7 +462,24 @@ def create_backup_archive(
             database_size, database_hash = _file_size_and_sha256(
                 database_path, maximum_bytes=limits.database_bytes, error_type=BackupError
             )
+            attachment_sources = _load_backup_attachment_sources(
+                database_path,
+                Path(attachment_root) if attachment_root is not None else None,
+                limits,
+            )
             settings_hash = hashlib.sha256(settings_bytes).hexdigest()
+            file_manifest: dict[str, dict[str, object]] = {
+                BACKUP_DATABASE_MEMBER: {
+                    "size": database_size,
+                    "sha256": database_hash,
+                },
+                BACKUP_SETTINGS_MEMBER: {
+                    "size": len(settings_bytes),
+                    "sha256": settings_hash,
+                },
+            }
+            for member, _source, size, digest in attachment_sources:
+                file_manifest[member] = {"size": size, "sha256": digest}
             manifest = {
                 "format": BACKUP_FORMAT,
                 "created_at": _timestamp(created_at),
@@ -419,16 +488,7 @@ def create_backup_archive(
                     "database": database_schema,
                     "settings": settings_schema,
                 },
-                "files": {
-                    BACKUP_DATABASE_MEMBER: {
-                        "size": database_size,
-                        "sha256": database_hash,
-                    },
-                    BACKUP_SETTINGS_MEMBER: {
-                        "size": len(settings_bytes),
-                        "sha256": settings_hash,
-                    },
-                },
+                "files": file_manifest,
             }
             manifest_bytes = _json_bytes(manifest)
             if len(manifest_bytes) > limits.manifest_bytes:
@@ -451,6 +511,8 @@ def create_backup_archive(
                 archive.writestr(BACKUP_MANIFEST_MEMBER, manifest_bytes)
                 archive.write(database_path, BACKUP_DATABASE_MEMBER)
                 archive.writestr(BACKUP_SETTINGS_MEMBER, settings_bytes)
+                for member, source, _size, _digest in attachment_sources:
+                    archive.write(source, member)
             with temporary_archive.open("r+b") as handle:
                 os.fsync(handle.fileno())
             if temporary_archive.stat().st_size > limits.archive_bytes:
@@ -516,6 +578,7 @@ def stage_backup_for_restore(
         staging_root.mkdir()
         database_path = staging_root / BACKUP_DATABASE_MEMBER
         settings_path = staging_root / BACKUP_SETTINGS_MEMBER
+        attachments_path = staging_root / BACKUP_ATTACHMENTS_PREFIX.removesuffix("/")
         with zipfile.ZipFile(archive_path, mode="r") as archive:
             infos = archive.infolist()
             _validate_zip_members(infos, limits)
@@ -527,6 +590,7 @@ def stage_backup_for_restore(
             )
             manifest = _decode_json_object(manifest_bytes, "backup manifest")
             metadata = _parse_manifest(manifest, limits)
+            _validate_archive_manifest_members(infos, metadata)
 
             database_size, database_hash = _extract_member(
                 archive,
@@ -540,6 +604,21 @@ def stage_backup_for_restore(
                 settings_path,
                 limits.settings_bytes,
             )
+            for attachment in metadata.attachments:
+                member = str(attachment["member"])
+                relative = str(attachment["relative_path"])
+                target = attachments_path.joinpath(*PurePosixPath(relative).parts)
+                size, digest = _extract_member(
+                    archive,
+                    info_by_name[member],
+                    target,
+                    limits.attachment_file_bytes,
+                )
+                if (size, digest) != (
+                    int(attachment["size"]),
+                    str(attachment["sha256"]),
+                ):
+                    raise BackupValidationError("attachment backup checksum does not match")
         if (database_size, database_hash) != (
             metadata.database_size,
             metadata.database_sha256,
@@ -558,6 +637,12 @@ def stage_backup_for_restore(
         )
         if database_schema != metadata.database_schema:
             raise BackupValidationError("database schema does not match the manifest")
+        _validate_staged_attachment_database(
+            database_path,
+            attachments_path,
+            metadata,
+            limits,
+        )
 
         settings_document = _decode_json_object(settings_path.read_bytes(), "settings backup")
         settings_schema = _settings_schema(settings_document, error_type=BackupValidationError)
@@ -595,6 +680,7 @@ def stage_backup_for_restore(
             metadata=metadata,
             staged_database_sha256=staged_database_hash,
             staged_settings_sha256=staged_settings_hash,
+            attachments_path=attachments_path,
         )
     except BackupValidationError:
         if staging_root is not None:
@@ -644,6 +730,7 @@ def apply_validated_restore(
         raise RestoreError("staged database changed after validation")
     if settings_hash != payload.staged_settings_sha256 or settings_size <= 0:
         raise RestoreError("staged settings changed after validation")
+    _recheck_staged_attachments(payload)
     _validate_database_file(
         payload.database_path,
         current_schema=SCHEMA_VERSION,
@@ -672,8 +759,12 @@ def apply_validated_restore(
             raise RestoreError("database restore target is outside the Amadeus data directory")
         if settings_target.parent != root / AppDirectory.CONFIG.value:
             raise RestoreError("settings restore target is outside the Amadeus config directory")
+        attachments_target = _absolute(paths.attachments_directory)
+        if attachments_target.parent != root / AppDirectory.DATA.value:
+            raise RestoreError("attachment restore target is outside the Amadeus data directory")
         _reject_file_symlink(database_target)
         _reject_file_symlink(settings_target)
+        _install_staged_attachments(payload, attachments_target)
 
         transaction_id = uuid4().hex
         database_target.parent.mkdir(parents=True, exist_ok=True)
@@ -737,6 +828,10 @@ def apply_validated_restore(
         committed = True
         _run_restore_checkpoint(checkpoint, "commit_persisted")
         _finish_restore_transaction(marker_path, marker, files)
+        _cleanup_live_attachment_objects(
+            attachments_target,
+            tuple(str(item["relative_path"]) for item in payload.metadata.attachments),
+        )
     except Exception as install_error:  # noqa: BLE001 - rollback all filesystem failures
         try:
             recover_interrupted_restore(paths)
@@ -1272,10 +1367,210 @@ def _materialize_consistent_database(
     return candidate
 
 
+def _load_backup_attachment_sources(
+    database_path: Path,
+    attachment_root: Path | None,
+    limits: BackupLimits,
+) -> tuple[tuple[str, Path, int, str], ...]:
+    """Resolve the exact content-addressed objects referenced by the DB snapshot."""
+
+    try:
+        uri = database_path.resolve(strict=True).as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+        try:
+            available = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if "attachments" not in available:
+                return ()
+            rows = connection.execute(
+                """
+                SELECT relative_path, size_bytes, sha256
+                FROM attachments
+                WHERE status = 'ready'
+                ORDER BY relative_path, id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise BackupError("attachment metadata could not be read from the backup") from exc
+    if not rows:
+        return ()
+    if attachment_root is None:
+        raise BackupError("attachment storage is required for this database backup")
+    try:
+        root = attachment_root.resolve(strict=True)
+        if not root.is_dir() or _is_reparse_point(root):
+            raise BackupError("attachment storage root is unsafe")
+    except OSError as exc:
+        raise BackupError("attachment storage root is unavailable") from exc
+
+    resolved: dict[str, tuple[str, Path, int, str]] = {}
+    total = 0
+    for relative_value, size_value, digest_value in rows:
+        relative = _validate_attachment_relative_path(
+            relative_value,
+            error_type=BackupError,
+        )
+        size = _plain_positive_int(
+            size_value,
+            "attachment size",
+            maximum=limits.attachment_file_bytes,
+            error_type=BackupError,
+        )
+        digest = str(digest_value)
+        if _SHA256_PATTERN.fullmatch(digest) is None:
+            raise BackupError("attachment checksum metadata is invalid")
+        member = f"{BACKUP_ATTACHMENTS_PREFIX}{relative}"
+        previous = resolved.get(member)
+        if previous is not None:
+            if previous[2:] != (size, digest):
+                raise BackupError("duplicate attachment metadata is inconsistent")
+            continue
+        try:
+            source = root.joinpath(*PurePosixPath(relative).parts)
+            source.resolve(strict=True).relative_to(root)
+            if source.is_symlink() or _is_reparse_point(source) or not source.is_file():
+                raise BackupError("attachment object is unsafe or unavailable")
+        except (OSError, ValueError) as exc:
+            raise BackupError("attachment object is unsafe or unavailable") from exc
+        actual_size, actual_digest = _file_size_and_sha256(
+            source,
+            maximum_bytes=limits.attachment_file_bytes,
+            error_type=BackupError,
+        )
+        if (actual_size, actual_digest) != (size, digest):
+            raise BackupError("attachment object does not match database metadata")
+        total += actual_size
+        if total > limits.attachment_bytes:
+            raise BackupError("attachment bytes exceed the backup limit")
+        resolved[member] = (member, source, actual_size, actual_digest)
+        if len(resolved) > limits.attachment_count:
+            raise BackupError("attachment count exceeds the backup limit")
+    return tuple(resolved[name] for name in sorted(resolved))
+
+
+def _validate_staged_attachment_database(
+    database_path: Path,
+    attachments_path: Path,
+    metadata: BackupMetadata,
+    limits: BackupLimits,
+) -> None:
+    """Require an exact one-to-one match between DB objects and archive members."""
+
+    try:
+        uri = database_path.resolve(strict=True).as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+        try:
+            available = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            rows = (
+                connection.execute(
+                    """
+                    SELECT relative_path, size_bytes, sha256
+                    FROM attachments
+                    WHERE status = 'ready'
+                    ORDER BY relative_path, id
+                    """
+                ).fetchall()
+                if "attachments" in available
+                else ()
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise BackupValidationError("attachment metadata could not be validated") from exc
+
+    expected: dict[str, tuple[int, str]] = {}
+    for relative_value, size_value, digest_value in rows:
+        relative = _validate_attachment_relative_path(relative_value)
+        size = _plain_positive_int(
+            size_value,
+            "attachment size",
+            maximum=limits.attachment_file_bytes,
+        )
+        digest = str(digest_value)
+        if _SHA256_PATTERN.fullmatch(digest) is None:
+            raise BackupValidationError("attachment checksum metadata is invalid")
+        previous = expected.setdefault(relative, (size, digest))
+        if previous != (size, digest):
+            raise BackupValidationError("duplicate attachment metadata is inconsistent")
+    archived = {
+        str(item["relative_path"]): (int(item["size"]), str(item["sha256"]))
+        for item in metadata.attachments
+    }
+    if expected != archived:
+        raise BackupValidationError("attachment archive does not match database metadata")
+    if metadata.format == LEGACY_BACKUP_FORMAT and expected:
+        raise BackupValidationError("legacy backup cannot contain attachment data")
+    for relative, expected_metadata in archived.items():
+        path = attachments_path.joinpath(*PurePosixPath(relative).parts)
+        if path.is_symlink() or not path.is_file():
+            raise BackupValidationError("staged attachment is unavailable")
+        actual = _file_size_and_sha256(
+            path,
+            maximum_bytes=limits.attachment_file_bytes,
+            error_type=BackupValidationError,
+        )
+        if actual != expected_metadata:
+            raise BackupValidationError("staged attachment checksum does not match")
+
+
+def _attachment_relative_from_member(member: object) -> str:
+    if not isinstance(member, str) or not member.startswith(BACKUP_ATTACHMENTS_PREFIX):
+        raise BackupValidationError("backup archive contains an unsafe member")
+    relative = member.removeprefix(BACKUP_ATTACHMENTS_PREFIX)
+    return _validate_attachment_relative_path(relative)
+
+
+def _validate_attachment_relative_path(
+    value: object,
+    *,
+    error_type: type[DataManagementError] = BackupValidationError,
+) -> str:
+    if not isinstance(value, str) or "\\" in value:
+        raise error_type("attachment path is invalid")
+    pure = PurePosixPath(value)
+    if (
+        pure.is_absolute()
+        or len(pure.parts) != 3
+        or pure.parts[0] != "objects"
+        or len(pure.parts[1]) != 2
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        raise error_type("attachment path is invalid")
+    stem = PurePosixPath(pure.parts[2]).stem
+    suffix = PurePosixPath(pure.parts[2]).suffix.casefold()
+    if (
+        _SHA256_PATTERN.fullmatch(stem) is None
+        or pure.parts[1] != stem[:2]
+        or suffix not in {".png", ".jpg", ".webp", ".pdf", ".txt", ".md", ".docx"}
+    ):
+        raise error_type("attachment path is invalid")
+    return pure.as_posix()
+
+
+def _plain_positive_int(
+    value: object,
+    label: str,
+    *,
+    maximum: int,
+    error_type: type[DataManagementError] = BackupValidationError,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= maximum:
+        raise error_type(f"{label} is invalid")
+    return value
+
+
 def _parse_manifest(manifest: Mapping[str, Any], limits: BackupLimits) -> BackupMetadata:
     if set(manifest) != {"format", "created_at", "app_version", "schemas", "files"}:
         raise BackupValidationError("backup manifest fields are invalid")
-    if manifest.get("format") != BACKUP_FORMAT:
+    backup_format = manifest.get("format")
+    if backup_format not in {BACKUP_FORMAT, LEGACY_BACKUP_FORMAT}:
         raise BackupValidationError("backup format is unsupported")
     created_at = manifest.get("created_at")
     app_version = manifest.get("app_version")
@@ -1295,9 +1590,35 @@ def _parse_manifest(manifest: Mapping[str, Any], limits: BackupLimits) -> Backup
         raise BackupValidationError("settings backup is newer than this application")
 
     files = manifest.get("files")
-    expected_files = {BACKUP_DATABASE_MEMBER, BACKUP_SETTINGS_MEMBER}
-    if not isinstance(files, Mapping) or set(files) != expected_files:
+    if not isinstance(files, Mapping):
         raise BackupValidationError("backup file manifest is invalid")
+    file_names = set(files)
+    if not BACKUP_MEMBERS.difference({BACKUP_MANIFEST_MEMBER}).issubset(file_names):
+        raise BackupValidationError("backup file manifest is invalid")
+    attachment_names = file_names.difference({BACKUP_DATABASE_MEMBER, BACKUP_SETTINGS_MEMBER})
+    if backup_format == LEGACY_BACKUP_FORMAT and attachment_names:
+        raise BackupValidationError("legacy backup contains unsupported members")
+    attachments: list[Mapping[str, object]] = []
+    attachment_total = 0
+    if len(attachment_names) > limits.attachment_count:
+        raise BackupValidationError("attachment count exceeds the backup limit")
+    for member in sorted(attachment_names):
+        relative = _attachment_relative_from_member(member)
+        size, digest = _parse_file_manifest(
+            files[member],
+            limits.attachment_file_bytes,
+        )
+        attachment_total += size
+        if attachment_total > limits.attachment_bytes:
+            raise BackupValidationError("attachment bytes exceed the backup limit")
+        attachments.append(
+            {
+                "member": member,
+                "relative_path": relative,
+                "size": size,
+                "sha256": digest,
+            }
+        )
     database_size, database_hash = _parse_file_manifest(
         files[BACKUP_DATABASE_MEMBER], limits.database_bytes
     )
@@ -1313,6 +1634,8 @@ def _parse_manifest(manifest: Mapping[str, Any], limits: BackupLimits) -> Backup
         database_sha256=database_hash,
         settings_size=settings_size,
         settings_sha256=settings_hash,
+        format=str(backup_format),
+        attachments=tuple(attachments),
     )
 
 
@@ -1329,16 +1652,20 @@ def _parse_file_manifest(value: object, maximum: int) -> tuple[int, str]:
 
 
 def _validate_zip_members(infos: Sequence[zipfile.ZipInfo], limits: BackupLimits) -> None:
-    if len(infos) != len(BACKUP_MEMBERS):
+    if (
+        len(infos) < len(BACKUP_MEMBERS)
+        or len(infos) > len(BACKUP_MEMBERS) + limits.attachment_count
+    ):
         raise BackupValidationError("backup archive members are invalid")
     names = [info.filename for info in infos]
-    if len(set(names)) != len(names) or set(names) != BACKUP_MEMBERS:
+    if len(set(names)) != len(names) or not BACKUP_MEMBERS.issubset(set(names)):
         raise BackupValidationError("backup archive members are invalid")
     member_limits = {
         BACKUP_MANIFEST_MEMBER: limits.manifest_bytes,
         BACKUP_DATABASE_MEMBER: limits.database_bytes,
         BACKUP_SETTINGS_MEMBER: limits.settings_bytes,
     }
+    attachment_total = 0
     for info in infos:
         path = PurePosixPath(info.filename)
         if (
@@ -1353,10 +1680,30 @@ def _validate_zip_members(infos: Sequence[zipfile.ZipInfo], limits: BackupLimits
         unix_mode = (info.external_attr >> 16) & 0xFFFF
         if stat.S_IFMT(unix_mode) == stat.S_IFLNK:
             raise BackupValidationError("backup archive contains a symbolic link")
-        if info.file_size <= 0 or info.file_size > member_limits[info.filename]:
+        if info.filename not in member_limits:
+            _attachment_relative_from_member(info.filename)
+            maximum = limits.attachment_file_bytes
+            attachment_total += info.file_size
+            if attachment_total > limits.attachment_bytes:
+                raise BackupValidationError("attachment bytes exceed the backup limit")
+        else:
+            maximum = member_limits[info.filename]
+        if info.file_size <= 0 or info.file_size > maximum:
             raise BackupValidationError("backup archive member size is invalid")
         if info.compress_size < 0:
             raise BackupValidationError("backup archive compressed size is invalid")
+
+
+def _validate_archive_manifest_members(
+    infos: Sequence[zipfile.ZipInfo],
+    metadata: BackupMetadata,
+) -> None:
+    expected = {
+        *BACKUP_MEMBERS,
+        *(str(item["member"]) for item in metadata.attachments),
+    }
+    if {info.filename for info in infos} != expected:
+        raise BackupValidationError("backup archive members do not match the manifest")
 
 
 def _read_member_bytes(
@@ -1437,6 +1784,8 @@ def _validate_database_file(
                 required_tables.update(_V2_TABLES)
             if schema >= 3:
                 required_tables.update(_V3_TABLES)
+            if schema >= 4:
+                required_tables.update(_V4_TABLES)
             available = {
                 str(row[0])
                 for row in connection.execute(
@@ -1445,6 +1794,13 @@ def _validate_database_file(
             }
             if not required_tables.issubset(available):
                 raise error_type("database schema is incomplete")
+            if schema >= 5:
+                message_columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+                }
+                if "input_modality" not in message_columns:
+                    raise error_type("database schema is incomplete")
             quick_rows = connection.execute("PRAGMA quick_check").fetchall()
             if not quick_rows or any(str(row[0]) != "ok" for row in quick_rows):
                 raise error_type("database integrity check failed")
@@ -1614,6 +1970,124 @@ def _copy_file_fsynced(source: Path, destination: Path) -> None:
         raise RestoreError("restore staging copy failed") from exc
 
 
+def _recheck_staged_attachments(payload: ValidatedRestorePayload) -> None:
+    if not payload.metadata.attachments:
+        return
+    root = payload.attachments_path
+    if root is None:
+        raise RestoreError("staged attachments are unavailable")
+    for item in payload.metadata.attachments:
+        relative = _validate_attachment_relative_path(
+            item["relative_path"],
+            error_type=RestoreError,
+        )
+        candidate = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise RestoreError("staged attachment path is unsafe") from exc
+        if candidate.is_symlink() or _is_reparse_point(candidate) or not candidate.is_file():
+            raise RestoreError("staged attachment is unsafe or unavailable")
+        actual = _file_size_and_sha256(
+            candidate,
+            maximum_bytes=DEFAULT_BACKUP_LIMITS.attachment_file_bytes,
+            error_type=RestoreError,
+        )
+        expected = (int(item["size"]), str(item["sha256"]))
+        if actual != expected:
+            raise RestoreError("staged attachment changed after validation")
+
+
+def _install_staged_attachments(
+    payload: ValidatedRestorePayload,
+    target_root: Path,
+) -> None:
+    """Install immutable objects before the DB switch; extras are always harmless."""
+
+    if not payload.metadata.attachments:
+        return
+    source_root = payload.attachments_path
+    if source_root is None:
+        raise RestoreError("staged attachments are unavailable")
+    try:
+        if _lexists(target_root) and (not target_root.is_dir() or _is_reparse_point(target_root)):
+            raise RestoreError("attachment restore directory is unsafe")
+        target_root.mkdir(parents=True, exist_ok=True)
+        target_root_resolved = target_root.resolve(strict=True)
+        for item in payload.metadata.attachments:
+            relative = _validate_attachment_relative_path(
+                item["relative_path"],
+                error_type=RestoreError,
+            )
+            source = source_root.joinpath(*PurePosixPath(relative).parts)
+            target = target_root.joinpath(*PurePosixPath(relative).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.parent.resolve(strict=True).relative_to(target_root_resolved)
+            expected = (int(item["size"]), str(item["sha256"]))
+            if _lexists(target):
+                if target.is_symlink() or _is_reparse_point(target) or not target.is_file():
+                    raise RestoreError("existing attachment object is unsafe")
+                actual = _file_size_and_sha256(
+                    target,
+                    maximum_bytes=DEFAULT_BACKUP_LIMITS.attachment_file_bytes,
+                    error_type=RestoreError,
+                )
+                if actual != expected:
+                    raise RestoreError("existing attachment object checksum conflicts")
+                continue
+            temporary = target.with_name(f".{target.name}.{uuid4().hex}.restore")
+            try:
+                _copy_file_fsynced(source, temporary)
+                _durable_replace(temporary, target)
+                _sync_replaced_target(target)
+            finally:
+                if _lexists(temporary):
+                    _require_regular_restore_file(temporary, "attachment restore temporary")
+                    temporary.unlink()
+    except RestoreError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RestoreError("attachments could not be installed safely") from exc
+
+
+def _cleanup_live_attachment_objects(
+    root: Path,
+    referenced_paths: tuple[str, ...],
+) -> None:
+    objects = root / "objects"
+    if not _lexists(objects):
+        return
+    if not objects.is_dir() or _is_reparse_point(objects):
+        raise RestoreError("attachment object directory is unsafe")
+    keep = {
+        _validate_attachment_relative_path(value, error_type=RestoreError)
+        for value in referenced_paths
+    }
+    try:
+        root_resolved = root.resolve(strict=True)
+        for candidate in objects.rglob("*"):
+            if candidate.is_symlink() or _is_reparse_point(candidate):
+                raise RestoreError("attachment object tree contains an unsafe entry")
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root_resolved)
+            relative = PurePosixPath(resolved.relative_to(root_resolved).as_posix()).as_posix()
+            if relative not in keep:
+                resolved.unlink()
+        for directory in sorted(
+            (candidate for candidate in objects.rglob("*") if candidate.is_dir()),
+            key=lambda value: len(value.parts),
+            reverse=True,
+        ):
+            with suppress(OSError):
+                directory.rmdir()
+    except RestoreError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RestoreError("orphan attachments could not be cleaned safely") from exc
+
+
 def _validate_payload_paths(payload: ValidatedRestorePayload) -> None:
     root = _absolute(payload.staging_root)
     if not root.name.startswith(_STAGING_PREFIX) or payload.staging_root.is_symlink():
@@ -1626,6 +2100,14 @@ def _validate_payload_paths(payload: ValidatedRestorePayload) -> None:
         raise BackupValidationError("staged settings path is unsafe")
     if payload.database_path.is_symlink() or payload.settings_path.is_symlink():
         raise BackupValidationError("restore staging files cannot be symbolic links")
+    expected_attachments = root / BACKUP_ATTACHMENTS_PREFIX.removesuffix("/")
+    if payload.attachments_path is not None:
+        if _absolute(payload.attachments_path) != expected_attachments:
+            raise BackupValidationError("staged attachment path is unsafe")
+        if payload.attachments_path.is_symlink() or _is_reparse_point(payload.attachments_path):
+            raise BackupValidationError("staged attachment directory is unsafe")
+    elif payload.metadata.attachments:
+        raise BackupValidationError("staged attachments are unavailable")
 
 
 def _remove_staging_root(root: Path, expected_parent: Path) -> None:

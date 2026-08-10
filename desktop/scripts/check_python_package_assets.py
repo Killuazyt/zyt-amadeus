@@ -88,11 +88,7 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
 
     with Image.open(BytesIO(icon)) as image:
         image.load()
-        if (
-            image.format != "PNG"
-            or image.mode not in {"RGB", "RGBA"}
-            or image.size != (1254, 1254)
-        ):
+        if image.format != "PNG" or image.mode not in {"RGB", "RGBA"} or image.size != (1254, 1254):
             raise ValueError(f"{label} Kurisu application icon metadata is invalid")
 
     with Image.open(BytesIO(sheet)) as image:
@@ -163,10 +159,11 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
     }:
         raise ValueError(f"{label} runtime icon license identity is invalid")
     icon_notice = payloads["resources/licenses/KURISU-ICON-NOTICE.txt"].decode("utf-8")
+    normalized_icon_notice = " ".join(icon_notice.split())
     if (
         "NOASSERTION" not in icon_notice
         or KURISU_ICON_SHA256 not in icon_notice
-        or "not independently verified" not in icon_notice
+        or "not independently verified" not in normalized_icon_notice
     ):
         raise ValueError(f"{label} Kurisu application icon notice is incomplete")
 

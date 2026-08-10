@@ -1,4 +1,4 @@
-"""SQLite schema v3, consistent migration backups, and fail-closed opening."""
+"""SQLite schema v5, consistent migration backups, and fail-closed opening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 AMADEUS_APPLICATION_ID = int.from_bytes(b"AMDS", "big")
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
@@ -416,10 +416,73 @@ def _migrate_to_v3(connection: sqlite3.Connection) -> None:
     connection.execute(f"PRAGMA application_id = {AMADEUS_APPLICATION_ID}")
 
 
+_SCHEMA_V4: tuple[str, ...] = (
+    """
+    CREATE TABLE attachments (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('image', 'document')),
+        source TEXT NOT NULL CHECK (
+            source IN ('file_picker', 'drop', 'clipboard', 'screenshot',
+                       'screen', 'window', 'camera')
+        ),
+        display_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+        sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+        relative_path TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ready' CHECK (status IN ('ready', 'failed')),
+        extracted_text TEXT NOT NULL DEFAULT '',
+        text_truncated INTEGER NOT NULL DEFAULT 0 CHECK (text_truncated IN (0, 1)),
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX attachments_sha256_idx ON attachments(sha256)
+    """,
+    """
+    CREATE INDEX attachments_relative_path_idx ON attachments(relative_path)
+    """,
+    """
+    CREATE TABLE message_attachments (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 5),
+        PRIMARY KEY (message_id, attachment_id),
+        UNIQUE (message_id, ordinal)
+    )
+    """,
+    """
+    CREATE INDEX message_attachments_attachment_idx
+    ON message_attachments(attachment_id, message_id)
+    """,
+)
+
+
+def _migrate_to_v4(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V4:
+        connection.execute(statement)
+
+
+_SCHEMA_V5: tuple[str, ...] = (
+    """
+    ALTER TABLE messages
+    ADD COLUMN input_modality TEXT NOT NULL DEFAULT 'text'
+        CHECK (input_modality IN ('text', 'voice'))
+    """,
+)
+
+
+def _migrate_to_v5(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V5:
+        connection.execute(statement)
+
+
 _DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
     3: _migrate_to_v3,
+    4: _migrate_to_v4,
+    5: _migrate_to_v5,
 }
 _REQUIRED_TABLES = {
     "profiles",
@@ -440,6 +503,8 @@ _REQUIRED_TABLES = {
     "persona_vectors",
     "persona_recall_events",
     "proactive_events",
+    "attachments",
+    "message_attachments",
 }
 _REQUIRED_TRIGGER_SQL_MARKERS = {
     "memory_versions_are_immutable": (
@@ -489,7 +554,23 @@ _REQUIRED_COLUMNS = {
         "updated_at",
         "completed_at",
         "origin",
+        "input_modality",
     },
+    "attachments": {
+        "id",
+        "kind",
+        "source",
+        "display_name",
+        "mime_type",
+        "size_bytes",
+        "sha256",
+        "relative_path",
+        "status",
+        "extracted_text",
+        "text_truncated",
+        "created_at",
+    },
+    "message_attachments": {"message_id", "attachment_id", "ordinal"},
     "memory_embedding_generations": {
         "id",
         "profile_id",

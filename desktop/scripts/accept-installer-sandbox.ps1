@@ -1628,7 +1628,7 @@ try {
     $script:ExternalExport = Join-Path ([Environment]::GetFolderPath('MyDocuments')) "amadeus-p7-external-$RunId.json"
     [IO.File]::WriteAllText(
         $script:ExternalExport,
-        '{"format":"amadeus-chat-export/v1","synthetic":true}',
+        '{"format":"amadeus-chat-export/v2","synthetic":true}',
         [Text.UTF8Encoding]::new($false)
     )
     Set-FakeCredential

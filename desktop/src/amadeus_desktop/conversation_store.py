@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import date, datetime
 from uuid import uuid4
 
@@ -24,6 +25,10 @@ from amadeus_desktop.storage_models import (
     StorageConflictError,
     StorageNotFoundError,
     StorageValidationError,
+    StoredAttachment,
+    StoredAttachmentKind,
+    StoredAttachmentSource,
+    StoredInputModality,
     StoredMessage,
     StoredMessageOrigin,
     StoredMessageRole,
@@ -220,6 +225,49 @@ class ConversationStore:
             self._database.purge_deleted_content()
         return deleted
 
+    def pop_orphan_attachment_paths(self) -> tuple[str, ...]:
+        """Delete unlinked metadata and return byte paths no linked row still owns."""
+
+        with self._database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, relative_path FROM attachments
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM message_attachments
+                    WHERE message_attachments.attachment_id = attachments.id
+                )
+                """
+            ).fetchall()
+            if not rows:
+                return ()
+            orphan_ids = tuple(str(row["id"]) for row in rows)
+            placeholders = ",".join("?" for _ in orphan_ids)
+            connection.execute(
+                f"DELETE FROM attachments WHERE id IN ({placeholders})",
+                orphan_ids,
+            )
+            candidates = tuple(dict.fromkeys(str(row["relative_path"]) for row in rows))
+            deletable: list[str] = []
+            for relative_path in candidates:
+                remaining = connection.execute(
+                    "SELECT 1 FROM attachments WHERE relative_path = ? LIMIT 1",
+                    (relative_path,),
+                ).fetchone()
+                if remaining is None:
+                    deletable.append(relative_path)
+        return tuple(deletable)
+
+    def referenced_attachment_paths(self) -> tuple[str, ...]:
+        rows = self._database.connection.execute(
+            """
+            SELECT DISTINCT a.relative_path
+            FROM attachments AS a
+            JOIN message_attachments AS ma ON ma.attachment_id = a.id
+            ORDER BY a.relative_path
+            """
+        ).fetchall()
+        return tuple(str(row["relative_path"]) for row in rows)
+
     def save_user_message(
         self,
         conversation_id: str,
@@ -229,18 +277,23 @@ class ConversationStore:
         *,
         created_at: datetime | None = None,
         participates_in_memory: bool = True,
+        input_modality: StoredInputModality = StoredInputModality.TEXT,
+        attachments: Sequence[StoredAttachment] = (),
     ) -> StoredMessage:
+        content = _user_content(content, attachments)
         return self._insert_message(
             conversation_id=conversation_id,
             turn_id=turn_id,
             message_id=message_id,
             role=StoredMessageRole.USER,
-            content=_required_text(content, "content", strip=False),
+            content=content,
             status=StoredMessageStatus.COMPLETED,
             attempt=1,
             created_at=created_at,
             completed=True,
             participates_in_memory=participates_in_memory,
+            input_modality=input_modality,
+            attachments=attachments,
         )
 
     def save_turn(
@@ -254,13 +307,17 @@ class ConversationStore:
         attempt: int = 1,
         participates_in_memory: bool = True,
         created_at: datetime | None = None,
+        input_modality: StoredInputModality = StoredInputModality.TEXT,
+        attachments: Sequence[StoredAttachment] = (),
     ) -> tuple[StoredMessage, StoredMessage]:
         """Atomically commit a user message and its stable assistant placeholder."""
 
         _required_identifier(turn_id, "turn_id")
         _required_identifier(user_message_id, "user_message_id")
         _required_identifier(assistant_message_id, "assistant_message_id")
-        user_content = _required_text(user_content, "user_content", strip=False)
+        user_content = _user_content(user_content, attachments)
+        input_modality = StoredInputModality(input_modality)
+        _validate_attachments(attachments)
         if attempt < 1:
             raise StorageValidationError("attempt must be positive")
         now = encode_utc(created_at or self._clock())
@@ -270,8 +327,9 @@ class ConversationStore:
                     """
                     INSERT INTO messages(
                         id, conversation_id, turn_id, role, origin, content, status, attempt,
-                        participates_in_memory, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, 'user', 'conversation', ?, 'completed', 1, ?, ?, ?, ?)
+                        participates_in_memory, created_at, updated_at, completed_at,
+                        input_modality
+                    ) VALUES (?, ?, ?, 'user', 'conversation', ?, 'completed', 1, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_message_id,
@@ -282,7 +340,14 @@ class ConversationStore:
                         now,
                         now,
                         now,
+                        input_modality.value,
                     ),
+                )
+                self._persist_attachments(
+                    connection,
+                    user_message_id,
+                    attachments,
+                    created_at=now,
                 )
                 connection.execute(
                     """
@@ -490,7 +555,7 @@ class ConversationStore:
         ).fetchone()
         if row is None:
             raise StorageNotFoundError("message does not exist")
-        return _message_from_row(row)
+        return self._messages_from_rows((row,))[0]
 
     def load_message_page(
         self,
@@ -531,7 +596,7 @@ class ConversationStore:
             ):
                 selected.append(next_older)
         has_older = len(rows) > len(selected)
-        items = tuple(_message_from_row(row) for row in reversed(selected))
+        items = self._messages_from_rows(tuple(reversed(selected)))
         next_cursor = items[0].sequence if has_older and items else None
         return MessagePage(items=items, next_before_sequence=next_cursor)
 
@@ -559,7 +624,7 @@ class ConversationStore:
             """,
             (conversation_id, limit),
         ).fetchall()
-        return tuple(_message_from_row(row) for row in reversed(rows))
+        return self._messages_from_rows(tuple(reversed(rows)))
 
     def load_message_context(
         self,
@@ -607,7 +672,7 @@ class ConversationStore:
             """,
             (conversation_id, after_sequence, limit),
         ).fetchall()
-        return tuple(_message_from_row(row) for row in rows)
+        return self._messages_from_rows(tuple(rows))
 
     def save_summary(
         self,
@@ -712,9 +777,13 @@ class ConversationStore:
         completed: bool,
         participates_in_memory: bool,
         origin: StoredMessageOrigin = StoredMessageOrigin.CONVERSATION,
+        input_modality: StoredInputModality = StoredInputModality.TEXT,
+        attachments: Sequence[StoredAttachment] = (),
     ) -> StoredMessage:
         _required_identifier(turn_id, "turn_id")
         _required_identifier(message_id, "message_id")
+        input_modality = StoredInputModality(input_modality)
+        _validate_attachments(attachments)
         now = encode_utc(created_at or self._clock())
         try:
             with self._database.transaction() as connection:
@@ -722,8 +791,9 @@ class ConversationStore:
                     """
                     INSERT INTO messages(
                         id, conversation_id, turn_id, role, origin, content, status, attempt,
-                        participates_in_memory, created_at, updated_at, completed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        participates_in_memory, created_at, updated_at, completed_at,
+                        input_modality
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -738,7 +808,14 @@ class ConversationStore:
                         now,
                         now,
                         now if completed else None,
+                        input_modality.value,
                     ),
+                )
+                self._persist_attachments(
+                    connection,
+                    message_id,
+                    attachments,
+                    created_at=now,
                 )
                 connection.execute(
                     """
@@ -751,6 +828,90 @@ class ConversationStore:
         except sqlite3.IntegrityError as exc:
             raise StorageConflictError("message or turn role already exists") from exc
         return self.get_message(message_id)
+
+    def _messages_from_rows(self, rows: Sequence[sqlite3.Row]) -> tuple[StoredMessage, ...]:
+        messages = tuple(_message_from_row(row) for row in rows)
+        if not messages:
+            return ()
+        identifiers = tuple(message.message_id for message in messages)
+        placeholders = ",".join("?" for _ in identifiers)
+        attachment_rows = self._database.connection.execute(
+            f"""
+            SELECT ma.message_id, ma.ordinal, a.*
+            FROM message_attachments AS ma
+            JOIN attachments AS a ON a.id = ma.attachment_id
+            WHERE ma.message_id IN ({placeholders})
+            ORDER BY ma.message_id, ma.ordinal
+            """,
+            identifiers,
+        ).fetchall()
+        grouped: dict[str, list[StoredAttachment]] = {identifier: [] for identifier in identifiers}
+        for row in attachment_rows:
+            grouped[str(row["message_id"])].append(_attachment_from_row(row))
+        return tuple(
+            replace(message, attachments=tuple(grouped[message.message_id])) for message in messages
+        )
+
+    @staticmethod
+    def _persist_attachments(
+        connection: sqlite3.Connection,
+        message_id: str,
+        attachments: Sequence[StoredAttachment],
+        *,
+        created_at: str,
+    ) -> None:
+        for ordinal, attachment in enumerate(attachments):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO attachments(
+                    id, kind, source, display_name, mime_type, size_bytes, sha256,
+                    relative_path, status, extracted_text, text_truncated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment.attachment_id,
+                    attachment.kind.value,
+                    attachment.source.value,
+                    attachment.display_name,
+                    attachment.mime_type,
+                    attachment.size_bytes,
+                    attachment.sha256,
+                    attachment.relative_path,
+                    attachment.status,
+                    attachment.extracted_text,
+                    int(attachment.text_truncated),
+                    created_at,
+                ),
+            )
+            existing = connection.execute(
+                """
+                SELECT kind, source, display_name, mime_type, size_bytes, sha256,
+                       relative_path, status, extracted_text, text_truncated
+                FROM attachments WHERE id = ?
+                """,
+                (attachment.attachment_id,),
+            ).fetchone()
+            expected = (
+                attachment.kind.value,
+                attachment.source.value,
+                attachment.display_name,
+                attachment.mime_type,
+                attachment.size_bytes,
+                attachment.sha256,
+                attachment.relative_path,
+                attachment.status,
+                attachment.extracted_text,
+                int(attachment.text_truncated),
+            )
+            if existing is None or tuple(existing) != expected:
+                raise StorageConflictError("attachment ID already has different metadata")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO message_attachments(message_id, attachment_id, ordinal)
+                VALUES (?, ?, ?)
+                """,
+                (message_id, attachment.attachment_id, ordinal),
+            )
 
     @staticmethod
     def _touch_conversation_for_message(
@@ -1257,6 +1418,62 @@ def _required_text(value: str, field: str, *, strip: bool = True) -> str:
     return result
 
 
+def _user_content(value: str, attachments: Sequence[StoredAttachment]) -> str:
+    if not isinstance(value, str):
+        raise StorageValidationError("user content must be text")
+    if not value.strip() and not attachments:
+        raise StorageValidationError("user content or attachments are required")
+    return value
+
+
+def _validate_attachments(attachments: Sequence[StoredAttachment]) -> None:
+    if len(attachments) > 5:
+        raise StorageValidationError("a message cannot contain more than five attachments")
+    total = 0
+    identifiers: set[str] = set()
+    for attachment in attachments:
+        if not isinstance(attachment, StoredAttachment):
+            raise StorageValidationError("attachment metadata is invalid")
+        _required_identifier(attachment.attachment_id, "attachment_id")
+        if attachment.attachment_id in identifiers:
+            raise StorageValidationError("attachment IDs must be unique per message")
+        identifiers.add(attachment.attachment_id)
+        if (
+            isinstance(attachment.size_bytes, bool)
+            or not isinstance(attachment.size_bytes, int)
+            or not 0 < attachment.size_bytes <= 25 * 1024 * 1024
+        ):
+            raise StorageValidationError("attachment size is invalid")
+        total += attachment.size_bytes
+        if total > 50 * 1024 * 1024:
+            raise StorageValidationError("attachment total size is invalid")
+        if len(attachment.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in attachment.sha256
+        ):
+            raise StorageValidationError("attachment checksum is invalid")
+        if (
+            not attachment.display_name
+            or len(attachment.display_name) > 255
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in attachment.display_name
+            )
+        ):
+            raise StorageValidationError("attachment display name is invalid")
+        parts = attachment.relative_path.split("/")
+        if (
+            not parts
+            or attachment.relative_path.startswith("/")
+            or "\\" in attachment.relative_path
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise StorageValidationError("attachment relative path is invalid")
+        if attachment.status != "ready":
+            raise StorageValidationError("only ready attachments can be linked")
+        if len(attachment.extracted_text) > 64_000:
+            raise StorageValidationError("attachment extracted text is too long")
+
+
 def _proactive_trigger(value: ProactiveTrigger | str) -> ProactiveTrigger:
     try:
         return ProactiveTrigger(str(value))
@@ -1327,6 +1544,28 @@ def _message_from_row(row: sqlite3.Row) -> StoredMessage:
         created_at=_required_datetime(row["created_at"]),
         updated_at=_required_datetime(row["updated_at"]),
         completed_at=decode_utc(row["completed_at"]),
+        input_modality=(
+            StoredInputModality(row["input_modality"])
+            if "input_modality" in tuple(row.keys())
+            else StoredInputModality.TEXT
+        ),
+    )
+
+
+def _attachment_from_row(row: sqlite3.Row) -> StoredAttachment:
+    return StoredAttachment(
+        attachment_id=str(row["id"]),
+        kind=StoredAttachmentKind(row["kind"]),
+        source=StoredAttachmentSource(row["source"]),
+        display_name=str(row["display_name"]),
+        mime_type=str(row["mime_type"]),
+        size_bytes=int(row["size_bytes"]),
+        sha256=str(row["sha256"]),
+        relative_path=str(row["relative_path"]),
+        status=str(row["status"]),
+        extracted_text=str(row["extracted_text"]),
+        text_truncated=bool(row["text_truncated"]),
+        created_at=_required_datetime(row["created_at"]),
     )
 
 

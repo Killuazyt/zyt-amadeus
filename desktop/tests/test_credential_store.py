@@ -11,6 +11,8 @@ import pytest
 
 from amadeus_desktop import credential_store as credential_store_module
 from amadeus_desktop.credential_store import (
+    WINCRED_MIMO_SPEECH_TARGET_NAME,
+    WINCRED_MULTIMODAL_TARGET_NAME,
     WINCRED_TARGET_NAME,
     CredentialStore,
     CredentialStoreError,
@@ -18,6 +20,11 @@ from amadeus_desktop.credential_store import (
     InvalidCredentialError,
     WinCredentialStore,
     run_wincred_acceptance_probe,
+)
+from amadeus_desktop.provider_config import (
+    MIMO_SPEECH_CREDENTIAL_REF,
+    MULTIMODAL_CREDENTIAL_REF,
+    PROVIDER_CREDENTIAL_REF,
 )
 
 _FAKE_SECRET = "invalid-test-credential-never-authorized"
@@ -38,6 +45,22 @@ def test_in_memory_store_matches_protocol_and_replaces_without_delete() -> None:
     store.delete_secret()
     store.delete_secret()
     assert store.read_secret() is None
+
+
+def test_wincred_references_map_to_three_distinct_code_owned_targets() -> None:
+    targets = {
+        WinCredentialStore(PROVIDER_CREDENTIAL_REF).target_name,
+        WinCredentialStore(MULTIMODAL_CREDENTIAL_REF).target_name,
+        WinCredentialStore(MIMO_SPEECH_CREDENTIAL_REF).target_name,
+    }
+
+    assert targets == {
+        WINCRED_TARGET_NAME,
+        WINCRED_MULTIMODAL_TARGET_NAME,
+        WINCRED_MIMO_SPEECH_TARGET_NAME,
+    }
+    with pytest.raises(ValueError):
+        WinCredentialStore("user-controlled-target")
 
 
 @pytest.mark.parametrize("secret", ["", " padded", "padded ", "bad\x00value", "tp-fake"])

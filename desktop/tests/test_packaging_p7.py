@@ -38,6 +38,33 @@ def test_ci_degraded_onedir_smoke_allows_bounded_cold_start() -> None:
     assert "$process.WaitForExit(15000)" not in source
 
 
+def test_ci_test_only_dispatch_skips_every_build_and_installer_step() -> None:
+    source = WORKFLOW_PATH.read_text(encoding="utf-8")
+    test_only_guard = (
+        "if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_only != true }}"
+    )
+
+    assert "test_only:" in source
+    assert "type: boolean" in source
+    assert "default: false" in source
+    for step_name in (
+        "Install project package",
+        "Build Python package",
+        "Verify Python package assets",
+        "Verify isolated wheel install",
+        "Build FTS-degraded onedir",
+        "Smoke FTS-degraded onedir",
+    ):
+        step_start = source.index(f"- name: {step_name}")
+        run_start = source.index("\n        run:", step_start)
+        assert test_only_guard in source[step_start:run_start]
+    installer_start = source.index("  package-installer:")
+    installer_needs = source.index("\n    needs: test", installer_start)
+    installer_guard = source[installer_start:installer_needs]
+    assert "github.event_name != 'workflow_dispatch'" in installer_guard
+    assert "inputs.test_only != true" in installer_guard
+
+
 def test_release_license_manifest_exactly_covers_runtime_lock() -> None:
     manifest = json.loads(
         (LICENSE_ROOT / "runtime-license-manifest.json").read_text(encoding="utf-8")
@@ -448,12 +475,7 @@ def test_payload_manifest_is_generated_and_detects_changes(tmp_path: Path) -> No
 
 def test_kurisu_icon_generator_produces_multisize_windows_icon(tmp_path: Path) -> None:
     source = (
-        DESKTOP_ROOT
-        / "src"
-        / "amadeus_desktop"
-        / "resources"
-        / "app_icon"
-        / "amadeus-kurisu.png"
+        DESKTOP_ROOT / "src" / "amadeus_desktop" / "resources" / "app_icon" / "amadeus-kurisu.png"
     )
     output = tmp_path / "amadeus.ico"
     completed = subprocess.run(

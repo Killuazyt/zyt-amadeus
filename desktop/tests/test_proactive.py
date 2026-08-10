@@ -19,7 +19,10 @@ from amadeus_desktop.proactive import (
     evaluate_proactive_policy,
     validate_generated_greeting,
 )
-from amadeus_desktop.proactive_controller import ProactiveInteractionController
+from amadeus_desktop.proactive_controller import (
+    ProactiveInteractionController,
+    ProactiveVisualPlan,
+)
 
 
 def _policy(
@@ -176,6 +179,7 @@ class _FakeData(QObject):
         self.display_event_ids: list[str] = []
         self.display_times: list[datetime] = []
         self.persist_calls: list[tuple[str, str]] = []
+        self.persist_metadata: list[tuple[str | None, str | None]] = []
         self.click_times: list[datetime] = []
         self.dismiss_calls: list[str] = []
 
@@ -198,6 +202,7 @@ class _FakeData(QObject):
 
     def persist_proactive_greeting(self, event_id: str, greeting: str, **kwargs) -> bool:
         self.persist_calls.append((event_id, greeting))
+        self.persist_metadata.append((kwargs["provider_name"], kwargs["model_name"]))
         self.click_times.append(kwargs["clicked_at"])
         event = SimpleNamespace(event_id=event_id)
         self.proactive_greeting_persisted.emit(event, SimpleNamespace())
@@ -242,11 +247,22 @@ class _DeferredRunner:
         self.starts = 0
         self._on_success = None
         self._on_failure = None
+        self.request = None
+        self.resumes = 0
+        self.pauses: list[int] = []
 
-    def start(self, _request, *, on_success, on_failure) -> bool:
+    def start(self, request, *, on_success, on_failure) -> bool:
         self.starts += 1
+        self.request = request
         self._on_success = on_success
         self._on_failure = on_failure
+        return True
+
+    def resume(self) -> None:
+        self.resumes += 1
+
+    def pause(self, wait_ms: int) -> bool:
+        self.pauses.append(wait_ms)
         return True
 
     def succeed(self, content: str = "我在这里。") -> None:
@@ -509,3 +525,115 @@ def test_ai_callback_after_stop_is_discarded_without_double_release(qtbot, outco
     assert not bubble.visible
     assert data.display_calls == []
     assert releases == [True]
+
+
+def test_active_visual_claims_existing_opportunity_and_uses_volatile_runner(qtbot) -> None:
+    now = datetime(2026, 8, 3, 10)
+    data = _FakeData()
+    bubble = _FakeBubble()
+    text_runner = _DeferredRunner()
+    visual_runner = _DeferredRunner()
+    settings = _ai_settings()
+    settings["proactive"]["ai_greetings_enabled"] = False  # type: ignore[index]
+    statuses: list[str] = []
+    releases: list[bool] = []
+    request = build_proactive_request(now, ProactiveTrigger.STARTUP)
+    controller = ProactiveInteractionController(
+        data=data,
+        bubble=bubble,  # type: ignore[arg-type]
+        generation_runner=text_runner,  # type: ignore[arg-type]
+        visual_generation_runner=visual_runner,  # type: ignore[arg-type]
+        visual_plan_builder=lambda _now, _trigger: ProactiveVisualPlan(
+            request,
+            ("vision-provider", "vision-model"),
+        ),
+        presence_probe=_FakePresence(),
+        settings_reader=lambda: settings,
+        clock=lambda: now,
+        pet_visible=lambda: True,
+        conversation_active=lambda: False,
+        settings_open=lambda: False,
+        data_writable=lambda: True,
+        exiting=lambda: False,
+        pet_geometry=lambda: QRect(),
+        work_areas=lambda: [QRect(0, 0, 100, 100)],
+        provider_configured=lambda: False,
+        provider_metadata=lambda: (None, None),
+        acquire_ai_lane=lambda: True,
+        release_ai_lane=lambda: releases.append(True),
+        cancel_ai_lane=lambda _wait: True,
+        open_chat=lambda: None,
+        startup_delay_ms=1,
+        poll_interval_ms=60_000,
+    )
+    controller.status_changed.connect(statuses.append)
+
+    controller.start()
+    qtbot.waitUntil(lambda: visual_runner.starts == 1)
+    assert text_runner.starts == 0
+    assert visual_runner.request is request
+    assert visual_runner.resumes == 1
+
+    visual_runner.succeed("画面很安静，慢慢来就好。")
+    qtbot.waitUntil(lambda: bubble.visible)
+    bubble.clicked.emit()
+
+    assert releases == [True]
+    assert data.persist_metadata == [("vision-provider", "vision-model")]
+    assert "visual_generation_failed" not in statuses
+    assert controller.stop()
+
+
+@pytest.mark.parametrize("outcome", ["failure", "invalid-success"])
+def test_active_visual_failure_drops_frame_without_local_or_text_fallback(
+    qtbot,
+    outcome: str,
+) -> None:
+    now = datetime(2026, 8, 3, 10)
+    data = _FakeData()
+    bubble = _FakeBubble()
+    text_runner = _DeferredRunner()
+    visual_runner = _DeferredRunner()
+    settings = _ai_settings()
+    statuses: list[str] = []
+    controller = ProactiveInteractionController(
+        data=data,
+        bubble=bubble,  # type: ignore[arg-type]
+        generation_runner=text_runner,  # type: ignore[arg-type]
+        visual_generation_runner=visual_runner,  # type: ignore[arg-type]
+        visual_plan_builder=lambda _now, _trigger: ProactiveVisualPlan(
+            build_proactive_request(now, ProactiveTrigger.STARTUP)
+        ),
+        presence_probe=_FakePresence(),
+        settings_reader=lambda: settings,
+        clock=lambda: now,
+        pet_visible=lambda: True,
+        conversation_active=lambda: False,
+        settings_open=lambda: False,
+        data_writable=lambda: True,
+        exiting=lambda: False,
+        pet_geometry=lambda: QRect(),
+        work_areas=lambda: [QRect(0, 0, 100, 100)],
+        provider_configured=lambda: True,
+        provider_metadata=lambda: ("text", "text"),
+        acquire_ai_lane=lambda: True,
+        release_ai_lane=lambda: None,
+        cancel_ai_lane=lambda _wait: True,
+        open_chat=lambda: None,
+        startup_delay_ms=1,
+        poll_interval_ms=60_000,
+    )
+    controller.status_changed.connect(statuses.append)
+
+    controller.start()
+    qtbot.waitUntil(lambda: visual_runner.starts == 1)
+    if outcome == "failure":
+        visual_runner.fail()
+    else:
+        visual_runner.succeed("x" * 10_000)
+    qtbot.waitUntil(lambda: "visual_generation_failed" in statuses)
+
+    assert not bubble.visible
+    assert not data.display_calls
+    assert text_runner.starts == 0
+    assert controller.stop()

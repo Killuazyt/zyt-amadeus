@@ -5,7 +5,7 @@ from enum import StrEnum
 
 import pytest
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QTextOption
+from PySide6.QtGui import QImage, QTextOption
 from PySide6.QtWidgets import QWidget
 
 from amadeus_desktop.focus_mode import FOCUS_STATUS_TEXT
@@ -178,6 +178,42 @@ def test_enter_sends_original_text_and_shift_enter_inserts_newline(panel, qtbot)
 
     assert panel.input.toPlainText() == "第一行\nsecond"
     assert len(sent) == 1
+
+
+def test_clipboard_image_is_forwarded_as_qimage_for_background_encoding(panel) -> None:
+    captured: list[tuple[object, str, object]] = []
+    panel.attachment_image_requested.connect(
+        lambda image, name, source: captured.append((image, name, source))
+    )
+    image = QImage(64, 48, QImage.Format.Format_RGBA8888)
+    image.fill(0x80FF0000)
+
+    panel._request_pasted_image(image)
+
+    assert len(captured) == 1
+    forwarded, name, _source = captured[0]
+    assert isinstance(forwarded, QImage)
+    assert forwarded.size() == image.size()
+    assert name == "clipboard-image.png"
+
+
+def test_privacy_mode_blocks_new_voice_and_visual_capture_controls(panel) -> None:
+    panel.set_voice_available(True, hands_free_available=True)
+    assert panel.push_to_talk_button.isEnabled()
+    assert panel.hands_free_button.isEnabled()
+    assert panel.screenshot_button.isEnabled()
+
+    panel.set_privacy_mode(True)
+
+    assert not panel.push_to_talk_button.isEnabled()
+    assert not panel.hands_free_button.isEnabled()
+    assert not panel.screenshot_button.isEnabled()
+    assert not panel.visual_start_button.isEnabled()
+
+    panel.set_privacy_mode(False)
+    assert panel.push_to_talk_button.isEnabled()
+    assert panel.hands_free_button.isEnabled()
+    assert panel.screenshot_button.isEnabled()
 
 
 def test_whitespace_and_rejected_send_are_safe(panel, qtbot) -> None:

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import io
+from datetime import UTC, datetime
+
+from PIL import Image
+
+from amadeus_desktop.chat_models import ImagePart, ProviderRoute
 from amadeus_desktop.hybrid_retrieval import RankedRetrievalHit
 from amadeus_desktop.local_data_service import create_local_data_stores
 from amadeus_desktop.prompt_context import DefaultPromptContextService
@@ -9,11 +15,40 @@ from amadeus_desktop.retrieval_pipeline import (
     collect_prompt_retrieval_seed,
     finalize_prepared_prompt,
 )
-from amadeus_desktop.storage_models import PersonaKnowledgeDraft, StoredMessageStatus
+from amadeus_desktop.storage_models import (
+    PersonaKnowledgeDraft,
+    StoredAttachment,
+    StoredAttachmentKind,
+    StoredAttachmentSource,
+    StoredMessageStatus,
+)
 
 
 def _stores(tmp_path):
     return create_local_data_stores(tmp_path / "amadeus.sqlite3", tmp_path / "backups")
+
+
+def _stored_image(stores, index: int) -> StoredAttachment:
+    output = io.BytesIO()
+    Image.new("RGB", (12 + index, 10), (index * 20, 40, 80)).save(output, format="PNG")
+    attachment = stores.attachments.import_bytes(
+        output.getvalue(),
+        display_name=f"image-{index}.png",
+    )
+    return StoredAttachment(
+        attachment_id=attachment.attachment_id,
+        kind=StoredAttachmentKind.IMAGE,
+        source=StoredAttachmentSource.FILE_PICKER,
+        display_name=attachment.display_name,
+        mime_type=attachment.mime_type,
+        size_bytes=attachment.size_bytes,
+        sha256=attachment.sha256,
+        relative_path=attachment.relative_path,
+        status="ready",
+        extracted_text="",
+        text_truncated=False,
+        created_at=datetime.now(UTC),
+    )
 
 
 def _seed_user_and_persona(stores):
@@ -183,7 +218,7 @@ def test_prompt_keeps_twenty_historical_messages_after_removing_current(tmp_path
             prompt_service=DefaultPromptContextService(),
         )
 
-        assert len(seed.recent_messages) == 21
+        assert len(seed.recent_messages) == 20
         dialogue = tuple(message for message in prepared.messages if message.role.value != "system")
         assert len(dialogue[:-1]) == 20
         assert dialogue[-1].content == current
@@ -211,5 +246,91 @@ def test_user_retrieval_decay_anchor_uses_immutable_version_timestamp(tmp_path) 
 
         item = _user_item(updated, None)
         assert item.created_at == updated.current_version.created_at
+    finally:
+        stores.close()
+
+
+def test_visual_context_keeps_only_previous_two_user_rounds_then_returns_to_text(
+    tmp_path,
+) -> None:
+    stores = _stores(tmp_path)
+    try:
+        conversation = stores.conversations.create_conversation()
+        images = tuple(_stored_image(stores, index) for index in range(1, 4))
+        for index, attachment in enumerate(images, start=1):
+            stores.conversations.save_turn(
+                conversation.conversation_id,
+                f"visual-turn-{index}",
+                f"visual-user-{index}",
+                f"画面 {index}",
+                f"visual-assistant-{index}",
+                attachments=(attachment,),
+            )
+            stores.conversations.finalize_assistant(
+                f"visual-assistant-{index}",
+                f"回答 {index}",
+                status=StoredMessageStatus.COMPLETED,
+                terminal_reason="completed",
+                attempt=1,
+            )
+        stores.conversations.save_turn(
+            conversation.conversation_id,
+            "current-turn",
+            "current-user",
+            "继续看看",
+            "current-assistant",
+        )
+
+        seed = collect_prompt_retrieval_seed(
+            stores,
+            conversation.conversation_id,
+            "继续看看",
+            memory_enabled=False,
+        )
+
+        assert seed.provider_route is ProviderRoute.MULTIMODAL
+        assert {item.attachment_id for item in seed.attachments} == {
+            images[1].attachment_id,
+            images[2].attachment_id,
+        }
+        assert all(
+            image.attachment_id != images[0].attachment_id
+            for message in seed.recent_messages
+            if isinstance(message.content, tuple)
+            for image in message.content
+            if isinstance(image, ImagePart)
+        )
+
+        stores.conversations.finalize_assistant(
+            "current-assistant",
+            "继续回答",
+            status=StoredMessageStatus.COMPLETED,
+            terminal_reason="completed",
+            attempt=1,
+        )
+        for index in range(2):
+            stores.conversations.save_turn(
+                conversation.conversation_id,
+                f"text-turn-{index}",
+                f"text-user-{index}",
+                f"纯文字 {index}",
+                f"text-assistant-{index}",
+            )
+            stores.conversations.finalize_assistant(
+                f"text-assistant-{index}",
+                f"文字回答 {index}",
+                status=StoredMessageStatus.COMPLETED,
+                terminal_reason="completed",
+                attempt=1,
+            )
+
+        evicted = collect_prompt_retrieval_seed(
+            stores,
+            conversation.conversation_id,
+            "纯文字 1",
+            memory_enabled=False,
+        )
+        assert evicted.provider_route is ProviderRoute.TEXT
+        assert evicted.attachments == ()
     finally:
         stores.close()

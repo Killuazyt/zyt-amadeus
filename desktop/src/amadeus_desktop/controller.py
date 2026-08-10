@@ -11,20 +11,34 @@ from collections.abc import Callable
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QScreen
+from PySide6.QtGui import QDesktopServices, QImage, QScreen
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QSystemTrayIcon
 
 from amadeus_desktop import __version__
+from amadeus_desktop.attachment_runtime import AttachmentImportRuntime
+from amadeus_desktop.attachments import AttachmentStore
+from amadeus_desktop.audio_runtime import (
+    AudioDeviceCatalog,
+    MicrophoneCapture,
+    WavPlaybackQueue,
+)
 from amadeus_desktop.autostart import AutostartError, AutostartManager
 from amadeus_desktop.background_generation import BackgroundGenerationRunner
 from amadeus_desktop.build_info import BuildInfo, load_build_info
 from amadeus_desktop.chat_geometry import calculate_chat_panel_placement
-from amadeus_desktop.chat_models import ConversationState
+from amadeus_desktop.chat_models import (
+    AttachmentSnapshot,
+    AttachmentSource,
+    ConversationState,
+    InputModality,
+    ProviderCapability,
+)
 from amadeus_desktop.chat_provider import (
     ChatProvider,
     OpenAICompatibleChatProvider,
@@ -90,31 +104,61 @@ from amadeus_desktop.pet_position import (
     screen_geometry,
 )
 from amadeus_desktop.presence import PresenceProbe, WindowsPresenceProbe
-from amadeus_desktop.proactive_controller import ProactiveInteractionController
-from amadeus_desktop.provider_config import ProviderConfig
+from amadeus_desktop.proactive import ProactiveTrigger, build_proactive_visual_request
+from amadeus_desktop.proactive_controller import (
+    ProactiveInteractionController,
+    ProactiveVisualPlan,
+)
+from amadeus_desktop.provider_config import (
+    MIMO_SPEECH_CREDENTIAL_REF,
+    MULTIMODAL_CREDENTIAL_REF,
+    PROVIDER_CREDENTIAL_REF,
+    AuthMode,
+    ProviderConfig,
+    ProviderPreset,
+)
+from amadeus_desktop.provider_router import ProviderRouter
 from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
+    InvalidSettingsError,
     SettingsError,
     SettingsFileSnapshot,
     SettingsRepository,
+    validate_settings_document,
 )
 from amadeus_desktop.single_instance import SingleInstance
+from amadeus_desktop.speech import MiMoSpeechClient, MiMoSpeechConfig, SpeechToken, VoiceState
+from amadeus_desktop.speech_runtime import SpeechNetworkRuntime
 from amadeus_desktop.storage_models import PersonaKnowledgeDraft
 from amadeus_desktop.ui.chat_panel import ChatPanel
 from amadeus_desktop.ui.control_window import ControlWindow
 from amadeus_desktop.ui.greeting_bubble import GreetingBubble
 from amadeus_desktop.ui.model_settings import ModelSettingsWindow
+from amadeus_desktop.ui.multimodal_settings import MultimodalSettingsPage
 from amadeus_desktop.ui.pet_window import PetWindow
 from amadeus_desktop.ui.settings_window import SettingsWindow
 from amadeus_desktop.ui.tray import TrayController
+from amadeus_desktop.ui.visual_settings import VisualSettingsPage
+from amadeus_desktop.ui.voice_settings import VoiceSettingsPage
 from amadeus_desktop.vector_index import VectorIndexCoordinator, VectorIndexRepositories
 from amadeus_desktop.vector_runtime import PriorityVectorRuntime
+from amadeus_desktop.visual import VisualSourceKind
+from amadeus_desktop.visual_runtime import VisualSourceManager, _LatestImageEncoder
+from amadeus_desktop.voice_session import VoiceSessionController
 
 
 def _local_now() -> datetime:
     """Return timezone-aware local wall time for policy and durable timestamps."""
 
     return datetime.now().astimezone()
+
+
+@dataclass(frozen=True, slots=True)
+class _SendAction:
+    text: str
+    attachments: tuple[AttachmentSnapshot, ...] = ()
+    input_modality: InputModality = InputModality.TEXT
+    visual_sampled: bool = False
 
 
 _AUTOSTART_RECONCILE_WARNING = "Windows 开机启动状态已同步，但设置文件未能保存。"
@@ -139,6 +183,8 @@ class ApplicationController:
         mock_chat: bool = False,
         allow_saved_provider: bool = True,
         credential_store: CredentialStore | None = None,
+        multimodal_credential_store: CredentialStore | None = None,
+        speech_credential_store: CredentialStore | None = None,
         connection_tester: ProviderConnectionTester | None = None,
         first_chunk_timeout_ms: int = 15_000,
         focused_first_chunk_timeout_ms: int = DEFAULT_FOCUSED_FIRST_CHUNK_TIMEOUT_MS,
@@ -177,12 +223,12 @@ class ApplicationController:
         )
         self._data_initialized = False
         self._data_writable = False
-        self._pending_initial_message: str | None = None
+        self._pending_initial_message: _SendAction | None = None
         self._conversation_switch_pending = False
         self._pending_conversation_change_kind: str | None = None
         self._pending_conversation_change_target: str | None = None
         self._pending_conversation_previous_id: str | None = None
-        self._pending_foreground_action: tuple[str, str] | None = None
+        self._pending_foreground_action: tuple[str, object] | None = None
         self._provider_switch_pending = False
         self._pending_provider_configuration: ProviderConfig | None = None
         self._pending_provider_secret: str | None = None
@@ -206,6 +252,14 @@ class ApplicationController:
         self._mock_chat = mock_chat
         self._settings_trusted = allow_saved_provider
         self.credential_store = credential_store or WinCredentialStore()
+        self.multimodal_config = ProviderConfig.from_mapping(settings["multimodal"]["provider"])
+        self.multimodal_credential_store = multimodal_credential_store or WinCredentialStore(
+            self.multimodal_config.credential_ref
+        )
+        self.speech_credential_store = speech_credential_store or WinCredentialStore(
+            MIMO_SPEECH_CREDENTIAL_REF
+        )
+        self._pending_voice_token: SpeechToken | None = None
         self.autostart_manager = autostart_manager or AutostartManager()
         self._reconcile_autostart_setting()
         self._clear_expired_proactive_pause()
@@ -227,6 +281,26 @@ class ApplicationController:
                     if status_message
                     else credential_message
                 )
+
+        has_multimodal_secret = False
+        has_own_multimodal_secret = False
+        selected_multimodal_store: CredentialStore | None = None
+        multimodal_settings = settings["multimodal"]
+        if allow_saved_provider:
+            try:
+                has_own_multimodal_secret = self.multimodal_credential_store.has_secret()
+            except CredentialStoreError:
+                has_own_multimodal_secret = False
+        if chat_provider is None and not mock_chat and allow_saved_provider:
+            selected_multimodal_store = self._selected_multimodal_credential_store()
+            if selected_multimodal_store is not None:
+                try:
+                    has_multimodal_secret = selected_multimodal_store.has_secret()
+                except CredentialStoreError as exc:
+                    logger.warning(
+                        "Multimodal credential store unavailable error_type=%s",
+                        type(exc).__name__,
+                    )
 
         if tray_available is None:
             tray_available = QSystemTrayIcon.isSystemTrayAvailable()
@@ -276,6 +350,24 @@ class ApplicationController:
             )
         else:
             selected_provider = UnconfiguredChatProvider()
+        if explicit_provider or mock_chat:
+            selected_multimodal_provider: ChatProvider | None = selected_provider
+        elif (
+            has_multimodal_secret
+            and allow_saved_provider
+            and multimodal_settings["enabled"] is True
+            and selected_multimodal_store is not None
+        ):
+            selected_multimodal_provider = OpenAICompatibleChatProvider(
+                self.multimodal_config,
+                selected_multimodal_store,
+            )
+        else:
+            selected_multimodal_provider = None
+        self.provider_router = ProviderRouter(
+            selected_provider,
+            selected_multimodal_provider,
+        )
         self._active_chat_provider = selected_provider
         if background_jobs_enabled is None:
             background_jobs_enabled = not explicit_provider
@@ -286,10 +378,39 @@ class ApplicationController:
             and settings.get("provider_enabled") is True
         )
         self._chat_available = explicit_provider or mock_chat or provider_ready
+        self.attachment_store = AttachmentStore(self.paths.attachments_directory)
+        self.attachment_runtime = AttachmentImportRuntime(
+            self.attachment_store,
+            parent=application,
+        )
+        self.chat_panel.set_attachment_root(self.paths.attachments_directory)
+        self.chat_panel.attachment_paths_requested.connect(self._import_attachment_paths)
+        self.chat_panel.attachment_image_requested.connect(self._import_attachment_image)
+        self.attachment_runtime.imported.connect(self._on_attachment_imported)
+        self.attachment_runtime.failed.connect(
+            lambda message: self.chat_panel.set_status(message, kind="error")
+        )
+        self.attachment_runtime.busy_changed.connect(self.chat_panel.set_attachment_processing)
+        self.attachment_runtime.context_imported.connect(self._on_context_attachment_imported)
+        self.attachment_runtime.context_failed.connect(self._on_context_attachment_failed)
+        self.visual_sources = VisualSourceManager(parent=application)
+        self.region_screenshot_encoder = _LatestImageEncoder(parent=application)
+        self.region_screenshot_encoder.encoded.connect(self._on_region_screenshot_encoded)
+        self.region_screenshot_encoder.failed.connect(self._on_attachment_image_encode_failed)
+        self._privacy_mode = False
+        self._active_visual_turn_id: str | None = None
+        self._region_screenshot_overlay = None
+        self.visual_sources.state_changed.connect(self.chat_panel.set_visual_state)
+        self.visual_sources.failed.connect(self._on_visual_source_failed)
+        self.chat_panel.region_screenshot_requested.connect(self._request_region_screenshot)
+        self.chat_panel.visual_source_requested.connect(self._start_visual_source)
+        self.chat_panel.visual_stop_requested.connect(self._stop_visual_source)
+        self.chat_panel.privacy_mode_requested.connect(self._set_privacy_mode)
         self.data_runtime = SerialDataThread(
             lambda: create_local_data_stores(
                 self.paths.database_file,
                 self.paths.migration_backup_directory,
+                self.attachment_store,
             ),
             resource_close=lambda stores: stores.close(),
             parent=application,
@@ -325,6 +446,11 @@ class ApplicationController:
             parent=application,
         )
         self.background_generation.idle.connect(self._on_background_provider_idle)
+        self.visual_background_generation = BackgroundGenerationRunner(
+            self.provider_router,
+            parent=application,
+        )
+        self.visual_background_generation.idle.connect(self._on_visual_generation_idle)
         self.memory_jobs = MemoryJobCoordinator(
             self.data_runtime,
             self.background_generation,
@@ -348,13 +474,22 @@ class ApplicationController:
         )
         if mock_chat or isinstance(selected_provider, ScriptedChatProvider):
             self.data_service.set_provider_metadata("explicit_mock", "scripted")
+            self.data_service.set_multimodal_provider_metadata("explicit_mock", "scripted")
         else:
             self.data_service.set_provider_metadata(
                 self.provider_config.preset.value,
                 self.provider_config.model,
             )
+            self.data_service.set_multimodal_provider_metadata(
+                (
+                    self.multimodal_config.preset.value
+                    if selected_multimodal_provider is not None
+                    else None
+                ),
+                self.multimodal_config.model if selected_multimodal_provider is not None else None,
+            )
         self.conversation = ConversationCoordinator(
-            selected_provider,
+            self.provider_router,
             first_chunk_timeout_ms=first_chunk_timeout_ms,
             stream_idle_timeout_ms=stream_idle_timeout_ms,
             persistence=self.data_service,
@@ -362,6 +497,7 @@ class ApplicationController:
         )
         self.pet_window.clicked.connect(self.toggle_chat)
         self.chat_panel.send_requested.connect(self._send_chat_message)
+        self.chat_panel.send_with_attachments_requested.connect(self._send_chat_message)
         self.chat_panel.stop_requested.connect(self.conversation.stop)
         self.chat_panel.retry_requested.connect(self._retry_chat_turn)
         self.chat_panel.hide_requested.connect(self.hide_chat)
@@ -371,6 +507,61 @@ class ApplicationController:
         self.conversation.state_changed.connect(self._on_conversation_state_changed)
         self.conversation.request_finished.connect(self._record_conversation_evidence)
 
+        voice_settings = settings["voice"]
+        self.audio_device_catalog = AudioDeviceCatalog(parent=application)
+        self.microphone_capture = MicrophoneCapture(
+            self.audio_device_catalog,
+            parent=application,
+        )
+        self.voice_playback = WavPlaybackQueue(
+            self.audio_device_catalog,
+            parent=application,
+        )
+        selected_speech_store = self._speech_store_for_source(
+            str(voice_settings["credential_source"])
+        )
+        speech_client = MiMoSpeechClient(
+            self._speech_config_from_settings(voice_settings),
+            selected_speech_store or self.speech_credential_store,
+        )
+        self.speech_network = SpeechNetworkRuntime(
+            speech_client,
+            speech_client,
+            parent=application,
+        )
+        self.voice_session = VoiceSessionController(
+            self.microphone_capture,
+            self.speech_network,
+            self.voice_playback,
+            input_device_id=str(voice_settings["input_device_id"]),
+            output_device_id=str(voice_settings["output_device_id"]),
+            parent=application,
+        )
+        has_own_speech_secret = False
+        if allow_saved_provider:
+            with suppress(CredentialStoreError):
+                has_own_speech_secret = self.speech_credential_store.has_secret()
+        has_selected_speech_secret = False
+        if selected_speech_store is not None and allow_saved_provider:
+            with suppress(CredentialStoreError):
+                has_selected_speech_secret = selected_speech_store.has_secret()
+        self._voice_configured = bool(
+            voice_settings["enabled"]
+            and selected_speech_store is not None
+            and has_selected_speech_secret
+        )
+        self.chat_panel.push_to_talk_pressed.connect(self._press_to_talk)
+        self.chat_panel.push_to_talk_released.connect(self.voice_session.release_to_send)
+        self.chat_panel.hands_free_requested.connect(self._set_hands_free_session)
+        self.chat_panel.voice_stop_requested.connect(self.voice_session.stop_session)
+        self.voice_session.state_changed.connect(self.chat_panel.set_voice_state)
+        self.voice_session.status_changed.connect(self.chat_panel.set_voice_status)
+        self.voice_session.hands_free_changed.connect(self.chat_panel.set_hands_free_checked)
+        self.voice_session.transcript_ready.connect(self._on_voice_transcript)
+        self.voice_session.stop_chat_requested.connect(self._stop_voice_chat)
+        self.conversation.chunk_received.connect(self._on_voice_chat_chunk)
+        self.conversation.request_finished.connect(self._on_voice_chat_finished)
+
         self.model_settings_window = ModelSettingsWindow(
             self.provider_config,
             has_saved_secret=has_provider_secret,
@@ -378,7 +569,46 @@ class ApplicationController:
             tester=connection_tester,
         )
         self.model_settings_window.save_requested.connect(self._save_provider_configuration)
-        self.settings_window = SettingsWindow(self.model_settings_window)
+        reusable_multimodal_secret = has_provider_secret and self._can_reuse_mimo_credential(
+            self.provider_config,
+            self.multimodal_config,
+        )
+        self.multimodal_settings_page = MultimodalSettingsPage(
+            self.multimodal_config,
+            enabled=bool(multimodal_settings["enabled"]),
+            reuse_mimo_credential=bool(multimodal_settings["reuse_mimo_credential"]),
+            has_saved_secret=has_own_multimodal_secret,
+            has_reusable_secret=reusable_multimodal_secret,
+            credential_reader=self._read_multimodal_secret,
+            reusable_credential_reader=self._read_provider_secret,
+            tester=connection_tester,
+        )
+        self.multimodal_settings_page.save_requested.connect(self._save_multimodal_configuration)
+        self.voice_settings_page = VoiceSettingsPage(
+            voice_settings,
+            self.audio_device_catalog,
+            has_own_secret=has_own_speech_secret,
+            text_credential_reusable=(
+                has_provider_secret and self._mimo_credential_compatible(self.provider_config)
+            ),
+            multimodal_credential_reusable=(
+                has_multimodal_secret and self._mimo_credential_compatible(self.multimodal_config)
+            ),
+        )
+        self.voice_settings_page.save_requested.connect(self._save_voice_configuration)
+        self.visual_settings_page = VisualSettingsPage(settings["visual"])
+        self.visual_settings_page.save_requested.connect(self._save_visual_configuration)
+        preferred_visual_index = self.chat_panel.visual_source_combo.findData(
+            str(settings["visual"]["preferred_source"])
+        )
+        if preferred_visual_index >= 0:
+            self.chat_panel.visual_source_combo.setCurrentIndex(preferred_visual_index)
+        self.settings_window = SettingsWindow(
+            self.model_settings_window,
+            multimodal_page=self.multimodal_settings_page,
+            voice_page=self.voice_settings_page,
+            visual_page=self.visual_settings_page,
+        )
         self.general_page = self.settings_window.general_page
         self.pet_page = self.settings_window.pet_page
         self.persona_page = self.settings_window.persona_page
@@ -431,6 +661,8 @@ class ApplicationController:
             release_ai_lane=self._release_proactive_ai_lane,
             cancel_ai_lane=self.background_generation.pause,
             open_chat=self.show_chat,
+            visual_generation_runner=self.visual_background_generation,
+            visual_plan_builder=self._build_proactive_visual_plan,
             greeting_catalog_path=(
                 self.paths.directory(AppDirectory.PERSONAS) / "kurisu" / "greetings.json"
             ),
@@ -971,6 +1203,38 @@ class ApplicationController:
             return None, None
         return self.provider_config.preset.value, self.provider_config.model
 
+    def _build_proactive_visual_plan(
+        self,
+        now: datetime,
+        trigger: ProactiveTrigger,
+    ) -> ProactiveVisualPlan | None:
+        """Claim only an existing opportunity and keep its sampled frame volatile."""
+
+        visual = self.settings.get("visual")
+        if (
+            not isinstance(visual, dict)
+            or visual.get("active_vision_enabled") is not True
+            or self._privacy_mode
+            or not self.visual_sources.active
+        ):
+            return None
+        frame = self.visual_sources.latest()
+        multimodal = self.settings.get("multimodal")
+        if (
+            frame is None
+            or not isinstance(multimodal, dict)
+            or multimodal.get("enabled") is not True
+            or self.provider_router.provider(ProviderCapability.MULTIMODAL) is None
+        ):
+            return ProactiveVisualPlan(None)
+        return ProactiveVisualPlan(
+            build_proactive_visual_request(now, trigger, frame),
+            (
+                self.multimodal_config.preset.value,
+                self.multimodal_config.model,
+            ),
+        )
+
     def _acquire_proactive_ai_lane(self) -> bool:
         if (
             self._exiting
@@ -978,6 +1242,7 @@ class ApplicationController:
             or self.conversation.state is not ConversationState.IDLE
             or self.memory_jobs.has_active_job
             or self.background_generation.is_running
+            or self.visual_background_generation.is_running
         ):
             return False
         if not self.memory_jobs.pause(wait_ms=0):
@@ -1007,6 +1272,9 @@ class ApplicationController:
             "storage_error": "主动互动账本暂时不可用。",
             "storage_unavailable": "主动互动账本尚未就绪。",
             "display_failed": "问候气泡未能显示。",
+            "visual_unavailable": "主动视觉没有可用画面或多模态配置，请检查来源后重试。",
+            "visual_busy": "主动视觉资源正忙，本次机会已安全跳过。",
+            "visual_generation_failed": "主动视觉分析失败，本次画面未保留；可稍后重试。",
         }
         if category in {"storage_error", "storage_unavailable"}:
             self._last_safe_error_category = "storage_error"
@@ -1162,7 +1430,11 @@ class ApplicationController:
             self.history_page.set_status("聊天导出失败。", error=True)
 
     def _request_backup(self) -> None:
+        # Data-management controls are disabled while another exclusive operation runs.
+        # Keep direct/programmatic re-entry silent as in the established P6 contract.
         if self._data_change_state != "idle":
+            return
+        if not self._can_start_data_change():
             return
         destination, _filter = QFileDialog.getSaveFileName(
             self.settings_window,
@@ -1180,6 +1452,7 @@ class ApplicationController:
                 database_backup=stores.database.create_backup,
                 settings_snapshot=settings_snapshot,
                 app_version=__version__,
+                attachment_root=self.paths.attachments_directory,
             ),
             priority=DataPriority.INTERACTIVE,
             on_success=self._on_backup_created,
@@ -1260,6 +1533,7 @@ class ApplicationController:
                 database_backup=stores.database.create_backup,
                 settings_snapshot=settings_snapshot,
                 app_version=__version__,
+                attachment_root=self.paths.attachments_directory,
             ),
             priority=DataPriority.FOREGROUND,
             on_success=lambda _path: self._apply_staged_restore(),
@@ -1365,6 +1639,9 @@ class ApplicationController:
             or self._provider_switch_pending
             or self.conversation.state is not ConversationState.IDLE
             or self.conversation.is_active
+            or self.attachment_runtime.busy
+            or self.region_screenshot_encoder.busy
+            or self.voice_session.state is not VoiceState.OFF
         ):
             QMessageBox.information(
                 self.settings_window,
@@ -1379,11 +1656,13 @@ class ApplicationController:
             raise RuntimeError("an exclusive data operation is already active")
         self._data_change_state = state
         self._set_data_management_controls_enabled(False)
+        self._sync_voice_availability()
 
     def _finish_data_operation(self) -> None:
         self._data_change_state = "idle"
         self._services_stopped_for_data_change = False
         self._set_data_management_controls_enabled(True)
+        self._sync_voice_availability()
 
     def _set_data_management_controls_enabled(self, enabled: bool) -> None:
         self.general_page.backup_button.setEnabled(enabled)
@@ -1419,6 +1698,7 @@ class ApplicationController:
             self._data_writable,
             read_only=not self._data_writable,
         )
+        self._sync_voice_availability()
         if self._data_writable:
             self.memory_maintenance_timer.start()
             self.memory_jobs.resume()
@@ -1489,10 +1769,19 @@ class ApplicationController:
             self.autostart_manager.set_enabled(False)
         except AutostartError:
             failures = True
-        try:
-            self.credential_store.delete_secret()
-        except CredentialStoreError:
-            failures = True
+        deleted_store_ids: set[int] = set()
+        for store in (
+            self.credential_store,
+            self.multimodal_credential_store,
+            self.speech_credential_store,
+        ):
+            if id(store) in deleted_store_ids:
+                continue
+            deleted_store_ids.add(id(store))
+            try:
+                store.delete_secret()
+            except CredentialStoreError:
+                failures = True
         logging.shutdown()
         for target in reset_plan.targets:
             try:
@@ -1666,13 +1955,14 @@ class ApplicationController:
         pending = self._pending_initial_message
         self._pending_initial_message = None
         if pending is not None and self._data_writable:
-            self._send_chat_message(pending)
+            self._queue_send_action(pending)
 
     def _on_data_startup_failed(self, category: str) -> None:
         self._data_initialized = True
         self._data_writable = False
         self._pending_initial_message = None
         self.chat_panel.set_storage_availability(False, read_only=True)
+        self._sync_voice_availability()
         self._last_safe_error_category = "database_unavailable"
         self._refresh_diagnostics()
         self.logger.warning("Local database unavailable error_type=%s", category)
@@ -1686,6 +1976,7 @@ class ApplicationController:
             self.memory_jobs.shutdown(wait_ms=0)
         if self._data_initialized:
             self.chat_panel.set_storage_availability(writable, read_only=not writable)
+            self._sync_voice_availability()
         if self._data_change_state == "idle":
             self.memory_page.clear_all_button.setEnabled(writable)
 
@@ -1768,7 +2059,12 @@ class ApplicationController:
         if not self._can_change_conversation():
             return
         self._start_conversation_change("delete", conversation_id)
-        self.data_service.delete_conversation(conversation_id)
+        self.data_service.delete_conversation(
+            conversation_id,
+            protected_attachment_paths=self.chat_panel.draft_attachment_paths(
+                excluding_conversation_ids=(conversation_id,)
+            ),
+        )
 
     def _request_clear_history(self) -> None:
         if not self._can_change_conversation():
@@ -1803,9 +2099,7 @@ class ApplicationController:
         current_id = (
             None if snapshot.conversation is None else snapshot.conversation.conversation_id
         )
-        conversation_ids = {
-            conversation.conversation_id for conversation in snapshot.conversations
-        }
+        conversation_ids = {conversation.conversation_id for conversation in snapshot.conversations}
         if kind == "switch":
             return current_id == self._pending_conversation_change_target
         if kind == "create":
@@ -1822,13 +2116,17 @@ class ApplicationController:
 
     def _can_change_conversation(self) -> bool:
         if (
-            self._conversation_switch_pending
+            self._data_change_state != "idle"
+            or self._conversation_switch_pending
             or self._provider_switch_pending
             or self._pending_foreground_action is not None
             or self.conversation.state is not ConversationState.IDLE
             or self.conversation.is_active
         ):
-            if self._conversation_switch_pending:
+            if self._data_change_state != "idle":
+                history_message = "本地数据操作进行中，请稍候。"
+                chat_message = "本地数据操作进行中，请稍候。"
+            elif self._conversation_switch_pending:
                 history_message = "会话正在更新，请稍候。"
                 chat_message = "会话正在更新，请稍候。"
             elif self._provider_switch_pending:
@@ -2047,6 +2345,310 @@ class ApplicationController:
     def _read_provider_secret(self) -> str | None:
         return self.credential_store.read_secret()
 
+    def _read_multimodal_secret(self) -> str | None:
+        return self.multimodal_credential_store.read_secret()
+
+    @staticmethod
+    def _mimo_credential_compatible(config: ProviderConfig) -> bool:
+        return (
+            config.preset is ProviderPreset.MIMO_PAYG
+            and config.base_url == "https://api.xiaomimimo.com/v1"
+            and config.auth_mode is AuthMode.API_KEY
+        )
+
+    @classmethod
+    def _can_reuse_mimo_credential(
+        cls,
+        text_config: ProviderConfig,
+        multimodal_config: ProviderConfig,
+    ) -> bool:
+        return bool(
+            cls._mimo_credential_compatible(text_config)
+            and cls._mimo_credential_compatible(multimodal_config)
+            and text_config.credential_scope == multimodal_config.credential_scope
+        )
+
+    def _speech_store_for_source(self, source: str) -> CredentialStore | None:
+        if source == "independent":
+            return self.speech_credential_store
+        if source == PROVIDER_CREDENTIAL_REF:
+            return (
+                self.credential_store
+                if self._mimo_credential_compatible(self.provider_config)
+                else None
+            )
+        if source == MULTIMODAL_CREDENTIAL_REF:
+            if not self._mimo_credential_compatible(self.multimodal_config):
+                return None
+            return self._selected_multimodal_credential_store()
+        return None
+
+    @staticmethod
+    def _speech_config_from_settings(settings: object) -> MiMoSpeechConfig:
+        if not isinstance(settings, dict):
+            raise ValueError("voice settings are invalid")
+        return MiMoSpeechConfig(
+            base_url=str(settings["base_url"]),
+            asr_model=str(settings["asr_model"]),
+            tts_model=str(settings["tts_model"]),
+            tts_voice=str(settings["tts_voice"]),
+            tts_format=str(settings["tts_format"]),
+            connect_timeout_seconds=float(settings["connect_timeout_seconds"]),
+            request_timeout_seconds=float(settings["request_timeout_seconds"]),
+        ).validated()
+
+    def _selected_multimodal_credential_store(self) -> CredentialStore | None:
+        multimodal = self.settings.get("multimodal", {})
+        if isinstance(multimodal, dict) and multimodal.get("reuse_mimo_credential") is True:
+            return (
+                self.credential_store
+                if self._can_reuse_mimo_credential(
+                    self.provider_config,
+                    self.multimodal_config,
+                )
+                else None
+            )
+        return self.multimodal_credential_store
+
+    def _set_text_provider(self, provider: ChatProvider) -> bool:
+        if not self.conversation.set_provider(self.provider_router):
+            return False
+        self.provider_router.set_provider(ProviderCapability.TEXT, provider)
+        return True
+
+    def _save_multimodal_configuration(
+        self,
+        config_object: object,
+        secret_object: object,
+        enabled: bool,
+        reuse_mimo_credential: bool,
+    ) -> None:
+        if not isinstance(config_object, ProviderConfig):
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="多模态供应商配置无效。",
+            )
+            return
+        if config_object.credential_ref != MULTIMODAL_CREDENTIAL_REF:
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="多模态凭据引用无效。",
+            )
+            return
+        if (
+            enabled
+            and reuse_mimo_credential
+            and not self._can_reuse_mimo_credential(
+                self.provider_config,
+                config_object,
+            )
+        ):
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="只有相同 MiMo PAYG 安全域才能复用对话密钥。",
+            )
+            return
+        voice = self.settings.get("voice")
+        if (
+            enabled
+            and isinstance(voice, dict)
+            and voice.get("enabled") is True
+            and voice.get("credential_source") == MULTIMODAL_CREDENTIAL_REF
+            and not self._mimo_credential_compatible(config_object)
+        ):
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="语音正在复用多模态 MiMo PAYG 密钥，请先调整语音配置。",
+            )
+            return
+        if self.conversation.is_active or self.conversation.state is not ConversationState.IDLE:
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="请等当前回复结束后再更新多模态配置。",
+            )
+            return
+        self.proactive_interactions.cancel_ai_generation(wait_ms=0)
+        if self.visual_background_generation.is_running:
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="主动视觉分析正在安全停止，请稍后重试保存。",
+            )
+            return
+        secret = secret_object if isinstance(secret_object, str) and secret_object else None
+        previous_settings = deepcopy(self.settings)
+        snapshot = self.settings_repository.snapshot()
+        try:
+            previous_secret = self.multimodal_credential_store.read_secret()
+        except CredentialStoreError:
+            previous_secret = None
+        previous_provider = self.provider_router.provider(ProviderCapability.MULTIMODAL)
+        candidate = deepcopy(self.settings)
+        candidate["multimodal"] = {
+            "enabled": bool(enabled),
+            "reuse_mimo_credential": bool(reuse_mimo_credential),
+            "provider": config_object.validated().to_mapping(),
+        }
+        disabled = deepcopy(candidate)
+        disabled["multimodal"]["enabled"] = False
+        wrote_secret = False
+        try:
+            self.settings_repository.save(disabled)
+            if not reuse_mimo_credential and secret is not None:
+                self.multimodal_credential_store.write_secret(secret)
+                wrote_secret = True
+            credential_store = (
+                self.credential_store
+                if reuse_mimo_credential
+                and self._can_reuse_mimo_credential(
+                    self.provider_config,
+                    config_object,
+                )
+                else self.multimodal_credential_store
+            )
+            if enabled and not credential_store.has_secret():
+                raise SettingsError("Multimodal credential is unavailable.")
+            provider = (
+                OpenAICompatibleChatProvider(config_object, credential_store) if enabled else None
+            )
+            self.settings_repository.save(candidate)
+            self.provider_router.set_provider(ProviderCapability.MULTIMODAL, provider)
+        except (CredentialStoreError, SettingsError, ValueError) as exc:
+            with suppress(SettingsError):
+                self.settings_repository.restore_snapshot(snapshot)
+            if wrote_secret:
+                with suppress(CredentialStoreError):
+                    if previous_secret is None:
+                        self.multimodal_credential_store.delete_secret()
+                    else:
+                        self.multimodal_credential_store.write_secret(previous_secret)
+            self.provider_router.set_provider(
+                ProviderCapability.MULTIMODAL,
+                previous_provider,
+            )
+            self.settings.clear()
+            self.settings.update(previous_settings)
+            self.logger.warning(
+                "Multimodal configuration save failed error_type=%s",
+                type(exc).__name__,
+            )
+            self.multimodal_settings_page.apply_save_result(
+                success=False,
+                message="多模态配置保存失败，原配置已保留。",
+            )
+            return
+        self.settings.clear()
+        self.settings.update(candidate)
+        self.multimodal_config = config_object
+        self.data_service.set_multimodal_provider_metadata(
+            config_object.preset.value if enabled else None,
+            config_object.model if enabled else None,
+        )
+        self.multimodal_settings_page.apply_save_result(
+            success=True,
+            message=(
+                "图片与视觉多模态模型已启用。"
+                if enabled
+                else "图片与视觉多模态模型已停用；文字聊天不受影响。"
+            ),
+        )
+
+    def _save_voice_configuration(
+        self,
+        voice_object: object,
+        secret_object: object,
+    ) -> None:
+        if not isinstance(voice_object, dict):
+            self.voice_settings_page.apply_save_result(
+                success=False,
+                message="语音设置无效。",
+            )
+            return
+        candidate_voice = deepcopy(voice_object)
+        candidate = deepcopy(self.settings)
+        candidate["voice"] = candidate_voice
+        disabled = deepcopy(candidate)
+        disabled["voice"]["enabled"] = False
+        try:
+            # Full-document validation also rejects secret-like fields and
+            # unsupported endpoints/models before any credential change.
+            validate_settings_document(candidate)
+            speech_config = self._speech_config_from_settings(candidate_voice)
+        except (InvalidSettingsError, ValueError, KeyError, TypeError):
+            self.voice_settings_page.apply_save_result(
+                success=False,
+                message="语音设置不符合固定的 MiMo PAYG 契约。",
+            )
+            return
+
+        source = str(candidate_voice.get("credential_source", ""))
+        selected_store = self._speech_store_for_source(source)
+        enabled = candidate_voice.get("enabled") is True
+        if enabled and selected_store is None:
+            with suppress(SettingsError):
+                self.settings_repository.save(self.settings)
+            self.voice_settings_page.apply_save_result(
+                success=False,
+                message="所选凭据不是相同的 MiMo PAYG 安全域。",
+            )
+            return
+        secret = secret_object if isinstance(secret_object, str) and secret_object else None
+        previous_settings = deepcopy(self.settings)
+        snapshot = self.settings_repository.snapshot()
+        try:
+            previous_secret = self.speech_credential_store.read_secret()
+        except CredentialStoreError:
+            previous_secret = None
+        wrote_secret = False
+        self.voice_session.stop_session()
+        try:
+            self.settings_repository.save(disabled)
+            if source == "independent" and secret is not None:
+                self.speech_credential_store.write_secret(secret)
+                wrote_secret = True
+            if enabled:
+                assert selected_store is not None
+                if not selected_store.has_secret():
+                    raise CredentialStoreError("speech credential is unavailable")
+            runtime_store = selected_store or self.speech_credential_store
+            client = MiMoSpeechClient(speech_config, runtime_store)
+            if not self.speech_network.set_services(client, client):
+                raise SettingsError("speech runtime is busy")
+            self.settings_repository.save(candidate)
+        except (CredentialStoreError, SettingsError, ValueError) as exc:
+            with suppress(SettingsError):
+                self.settings_repository.restore_snapshot(snapshot)
+            if wrote_secret:
+                with suppress(CredentialStoreError):
+                    if previous_secret is None:
+                        self.speech_credential_store.delete_secret()
+                    else:
+                        self.speech_credential_store.write_secret(previous_secret)
+            self.settings.clear()
+            self.settings.update(previous_settings)
+            self.logger.warning(
+                "Voice configuration save failed error_type=%s",
+                type(exc).__name__,
+            )
+            self.voice_settings_page.apply_save_result(
+                success=False,
+                message="语音设置保存失败，原配置已保留。",
+            )
+            return
+        self.settings.clear()
+        self.settings.update(candidate)
+        self._voice_configured = enabled
+        self.voice_session.set_devices(
+            str(candidate_voice["input_device_id"]),
+            str(candidate_voice["output_device_id"]),
+        )
+        self._sync_voice_availability()
+        self.voice_settings_page.apply_save_result(
+            success=True,
+            message=(
+                "逐句语音已启用；采集仍需在聊天面板中显式开始。" if enabled else "逐句语音已停用。"
+            ),
+        )
+
     def _restore_provider_transaction(
         self,
         settings_snapshot: SettingsFileSnapshot,
@@ -2108,6 +2710,33 @@ class ApplicationController:
             self.model_settings_window.apply_save_result(
                 success=False,
                 message="供应商配置不安全或格式无效，未保存。",
+            )
+            return
+        multimodal = self.settings.get("multimodal")
+        if (
+            isinstance(multimodal, dict)
+            and multimodal.get("enabled") is True
+            and multimodal.get("reuse_mimo_credential") is True
+            and not self._can_reuse_mimo_credential(
+                config_object,
+                self.multimodal_config,
+            )
+        ):
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="多模态正在复用对话 MiMo PAYG 密钥，请先调整多模态配置。",
+            )
+            return
+        voice = self.settings.get("voice")
+        if (
+            isinstance(voice, dict)
+            and voice.get("enabled") is True
+            and voice.get("credential_source") == PROVIDER_CREDENTIAL_REF
+            and not self._mimo_credential_compatible(config_object)
+        ):
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="语音正在复用对话 MiMo PAYG 密钥，请先调整语音配置。",
             )
             return
         if self._provider_switch_pending:
@@ -2209,6 +2838,10 @@ class ApplicationController:
             secret,
             resume_background=self._background_jobs_enabled,
         )
+
+    def _on_visual_generation_idle(self) -> None:
+        if self._pending_foreground_action is not None:
+            self._dispatch_pending_foreground_action()
 
     def _on_provider_switch_timeout(self, generation: int) -> None:
         if (
@@ -2325,7 +2958,7 @@ class ApplicationController:
             self.settings_repository.save(disabled_settings)
             disabled_marker_saved = True
             if not self._mock_chat:
-                if not self.conversation.set_provider(disabled_provider):
+                if not self._set_text_provider(disabled_provider):
                     raise SettingsError("Provider could not be disabled while saving.")
                 provider_switched = True
                 if not self.background_generation.set_provider(disabled_provider):
@@ -2334,7 +2967,7 @@ class ApplicationController:
             if secret is not None:
                 credential_write_attempted = True
                 self.credential_store.write_secret(secret)
-            if not self._mock_chat and not self.conversation.set_provider(candidate_provider):
+            if not self._mock_chat and not self._set_text_provider(candidate_provider):
                 raise SettingsError("Provider could not be switched while saving.")
             if not self._mock_chat and not self.background_generation.set_provider(
                 candidate_provider
@@ -2343,7 +2976,7 @@ class ApplicationController:
             self.settings_repository.save(candidate_settings)
         except (CredentialStoreError, SettingsError, ValueError) as exc:
             if provider_switched:
-                self.conversation.set_provider(disabled_provider)
+                self._set_text_provider(disabled_provider)
             if background_provider_switched:
                 self.background_generation.set_provider(disabled_provider)
             settings_restored, credential_restored = self._restore_provider_transaction(
@@ -2352,9 +2985,7 @@ class ApplicationController:
                 restore_settings=disabled_marker_saved,
                 restore_credential=credential_write_attempted,
             )
-            provider_restored = not provider_switched or self.conversation.set_provider(
-                previous_provider
-            )
+            provider_restored = not provider_switched or self._set_text_provider(previous_provider)
             background_provider_restored = (
                 not background_provider_switched
                 or self.background_generation.set_provider(previous_provider)
@@ -2392,10 +3023,11 @@ class ApplicationController:
                 if not self._mock_chat:
                     self._chat_available = False
                     safe_provider = UnconfiguredChatProvider()
-                    self.conversation.set_provider(safe_provider)
+                    self._set_text_provider(safe_provider)
                     self.background_generation.set_provider(safe_provider)
                     self._active_chat_provider = safe_provider
                     self.chat_panel.set_provider_mode("unconfigured")
+                    self._sync_voice_availability()
             self.model_settings_window.apply_save_result(success=False, message=message)
             self._refresh_diagnostics()
             return
@@ -2422,6 +3054,7 @@ class ApplicationController:
             success=True,
             message="对话模型配置已安全保存并启用。",
         )
+        self._sync_voice_availability()
         self._refresh_diagnostics()
 
     def show_pet(self) -> None:
@@ -2460,24 +3093,420 @@ class ApplicationController:
         if not visible and hasattr(self, "proactive_interactions"):
             self.proactive_interactions.dismiss_current()
 
-    def _send_chat_message(self, text: str) -> None:
+    def _import_attachment_paths(self, paths_object: object, source_object: object) -> None:
+        if self._data_change_state != "idle":
+            self.chat_panel.set_status("本地数据操作进行中，暂时不能添加附件。", kind="error")
+            return
+        try:
+            paths = tuple(str(path) for path in paths_object)
+            source = AttachmentSource(source_object)
+        except (TypeError, ValueError):
+            self.chat_panel.set_status("附件来源无效。", kind="error")
+            return
+        self.attachment_runtime.import_paths(
+            paths,
+            source=source,
+            existing=self.chat_panel.draft_attachments,
+        )
+
+    def _import_attachment_image(
+        self,
+        image_object: object,
+        display_name: str,
+        source_object: object,
+    ) -> None:
+        if self._data_change_state != "idle":
+            self.chat_panel.set_status("本地数据操作进行中，暂时不能添加附件。", kind="error")
+            return
+        if not isinstance(image_object, QImage) or image_object.isNull():
+            self.chat_panel.set_status("剪贴板图片无效。", kind="error")
+            return
+        try:
+            source = AttachmentSource(source_object)
+        except ValueError:
+            self.chat_panel.set_status("附件来源无效。", kind="error")
+            return
+        if self.region_screenshot_encoder.busy or self.attachment_runtime.busy:
+            self.chat_panel.set_status("请等当前图片处理结束后再添加。", kind="error")
+            return
+        self.chat_panel.set_attachment_processing(True)
+        self.chat_panel.set_status("正在后台处理剪贴板图片…")
+        self.region_screenshot_encoder.submit(image_object, (display_name, source))
+
+    def _on_attachment_imported(self, attachment_object: object) -> None:
+        if not isinstance(attachment_object, AttachmentSnapshot):
+            self.chat_panel.set_status("附件处理结果无效。", kind="error")
+            return
+        if self.chat_panel.add_draft_attachment(attachment_object):
+            self.chat_panel.set_status("附件已在本地安全处理，可发送。", kind="success")
+
+    def _on_context_attachment_imported(
+        self,
+        context_object: object,
+        attachments_object: object,
+    ) -> None:
+        if not isinstance(context_object, _SendAction):
+            return
+        try:
+            imported = tuple(attachments_object)
+        except TypeError:
+            imported = ()
+        if len(imported) != 1 or not isinstance(imported[0], AttachmentSnapshot):
+            self._on_context_attachment_failed(
+                context_object,
+                "实时画面处理结果无效。",
+            )
+            return
+        action = replace(
+            context_object,
+            attachments=(*context_object.attachments, imported[0]),
+            visual_sampled=True,
+        )
+        if not self._queue_send_action(action) and action.input_modality is InputModality.VOICE:
+            token = self._pending_voice_token
+            self._pending_voice_token = None
+            if token is not None:
+                self.voice_session.submission_failed(token)
+
+    def _on_context_attachment_failed(
+        self,
+        context_object: object,
+        message: str,
+    ) -> None:
+        self.chat_panel.set_status(message, kind="error")
+        if (
+            isinstance(context_object, _SendAction)
+            and context_object.input_modality is InputModality.VOICE
+        ):
+            token = self._pending_voice_token
+            self._pending_voice_token = None
+            if token is not None:
+                self.voice_session.submission_failed(token)
+
+    def _start_visual_source(self, kind_value: str) -> None:
+        if self._privacy_mode:
+            self.chat_panel.set_status("请先退出隐私模式。", kind="error")
+            return
+        if self.provider_router.provider(ProviderCapability.MULTIMODAL) is None:
+            self.chat_panel.set_status(
+                "请先在设置中配置并启用图片与视觉模型。",
+                kind="error",
+            )
+            return
+        try:
+            kind = VisualSourceKind(kind_value)
+        except ValueError:
+            self.chat_panel.set_status("视觉来源无效。", kind="error")
+            return
+        visual = self.settings["visual"]
+        source_id = str(
+            visual[
+                {
+                    VisualSourceKind.SCREEN: "screen_id",
+                    VisualSourceKind.WINDOW: "window_id",
+                    VisualSourceKind.CAMERA: "camera_id",
+                }[kind]
+            ]
+        )
+        if kind is VisualSourceKind.WINDOW and not source_id:
+            self.chat_panel.set_status("请先在视觉设置中选择窗口。", kind="error")
+            return
+        self.proactive_interactions.cancel_ai_generation(wait_ms=0)
+        if not self.visual_sources.start(kind, source_id):
+            self.chat_panel.set_status("视觉来源无法启动。", kind="error")
+
+    def _stop_visual_source(self) -> None:
+        self.proactive_interactions.cancel_ai_generation(wait_ms=0)
+        self.visual_sources.stop()
+
+    def _on_visual_source_failed(self, message: str) -> None:
+        self.proactive_interactions.cancel_ai_generation(wait_ms=0)
+        self.chat_panel.set_status(message, kind="error")
+
+    def _request_region_screenshot(self) -> None:
+        if self._privacy_mode:
+            self.chat_panel.set_status("请先退出隐私模式再截图。", kind="error")
+            return
+        if (
+            self._data_change_state != "idle"
+            or self.attachment_runtime.busy
+            or self.region_screenshot_encoder.busy
+            or self.conversation.is_active
+        ):
+            self.chat_panel.set_status("请等当前处理结束后再截图。", kind="error")
+            return
+        from amadeus_desktop.ui.region_screenshot import RegionScreenshotOverlay
+
+        self.hide_chat()
+        overlay = RegionScreenshotOverlay()
+        self._region_screenshot_overlay = overlay
+        overlay.captured.connect(self._on_region_screenshot_captured)
+        overlay.cancelled.connect(self._on_region_screenshot_cancelled)
+        overlay.destroyed.connect(lambda: setattr(self, "_region_screenshot_overlay", None))
+        QTimer.singleShot(150, overlay, overlay.begin)
+
+    def _on_region_screenshot_captured(self, payload_object: object) -> None:
+        self.show_chat()
+        if not isinstance(payload_object, QImage) or payload_object.isNull():
+            self.chat_panel.set_status("截图结果无效。", kind="error")
+            return
+        self.chat_panel.set_status("正在后台处理区域截图…")
+        self.chat_panel.set_attachment_processing(True)
+        self.region_screenshot_encoder.submit(
+            payload_object,
+            ("region-screenshot.png", AttachmentSource.SCREENSHOT),
+        )
+
+    def _on_region_screenshot_encoded(self, result_object: object) -> None:
+        try:
+            display_name, source_object, payload_object = tuple(result_object)
+        except (TypeError, ValueError):
+            self.chat_panel.set_attachment_processing(False)
+            self.chat_panel.set_status("截图处理结果无效。", kind="error")
+            return
+        try:
+            source = AttachmentSource(source_object)
+        except ValueError:
+            source = None
+        if (
+            not isinstance(display_name, str)
+            or not isinstance(payload_object, bytes)
+            or source is None
+        ):
+            self.chat_panel.set_attachment_processing(False)
+            self.chat_panel.set_status("截图处理结果无效。", kind="error")
+            return
+        self.chat_panel.set_attachment_processing(False)
+        self.attachment_runtime.import_bytes(
+            payload_object,
+            display_name=display_name,
+            source=source,
+            existing=self.chat_panel.draft_attachments,
+        )
+
+    def _on_attachment_image_encode_failed(self, message: str) -> None:
+        self.chat_panel.set_attachment_processing(False)
+        self.chat_panel.set_status(message, kind="error")
+
+    def _on_region_screenshot_cancelled(self) -> None:
+        self.show_chat()
+        self.chat_panel.set_status("已取消区域截图。")
+
+    def _set_privacy_mode(self, enabled: bool) -> None:
+        self._privacy_mode = bool(enabled)
+        self.chat_panel.set_privacy_mode(self._privacy_mode)
+        if not self._privacy_mode:
+            return
+        self.proactive_interactions.cancel_ai_generation(wait_ms=0)
+        self.visual_sources.privacy_stop()
+        self.region_screenshot_encoder.cancel()
+        self.chat_panel.set_attachment_processing(False)
+        self.attachment_runtime.cancel_all()
+        overlay = self._region_screenshot_overlay
+        if overlay is not None:
+            overlay.close()
+            self._region_screenshot_overlay = None
+        self.voice_session.stop_session()
+        self._pending_voice_token = None
+        if self._active_visual_turn_id is not None:
+            self.conversation.stop()
+        self.chat_panel.set_status("隐私模式已停止并清空实时采集。", kind="success")
+
+    def _save_visual_configuration(self, visual_object: object) -> None:
+        if not isinstance(visual_object, dict):
+            self.visual_settings_page.apply_save_result(
+                success=False,
+                message="视觉设置无效。",
+            )
+            return
+        candidate = deepcopy(self.settings)
+        candidate["visual"] = deepcopy(visual_object)
+        try:
+            self.settings_repository.save(candidate)
+        except SettingsError as exc:
+            self.logger.warning(
+                "Visual settings save failed error_type=%s",
+                type(exc).__name__,
+            )
+            self.visual_settings_page.apply_save_result(
+                success=False,
+                message="视觉设置保存失败。",
+            )
+            return
+        self._stop_visual_source()
+        self.settings.clear()
+        self.settings.update(candidate)
+        index = self.chat_panel.visual_source_combo.findData(
+            str(candidate["visual"]["preferred_source"])
+        )
+        if index >= 0:
+            self.chat_panel.visual_source_combo.setCurrentIndex(index)
+        self.visual_settings_page.apply_save_result(
+            success=True,
+            message="视觉设置已保存；本次启动不会自动开始采集。",
+        )
+
+    def _set_hands_free_session(self, enabled: bool) -> None:
+        if enabled:
+            if not (
+                not self._privacy_mode
+                and self._voice_configured
+                and self._chat_available
+                and self._data_initialized
+                and self._data_writable
+                and self._data_change_state == "idle"
+                and self.settings["voice"]["hands_free_enabled"] is True
+            ):
+                self.chat_panel.set_hands_free_checked(False)
+                self.chat_panel.set_voice_status("语音尚未安全配置。", True)
+                return
+            if not self.voice_session.start_hands_free():
+                self.chat_panel.set_hands_free_checked(False)
+        else:
+            self.voice_session.stop_session()
+
+    def _press_to_talk(self) -> None:
+        if not (
+            not self._privacy_mode
+            and self._voice_configured
+            and self._chat_available
+            and self._data_initialized
+            and self._data_writable
+            and self._data_change_state == "idle"
+        ):
+            self.chat_panel.set_voice_status("语音尚未安全配置或当前不可用。", True)
+            return
+        self.voice_session.press_to_talk()
+
+    def _on_voice_transcript(self, transcript: str, token_object: object) -> None:
+        if not isinstance(token_object, SpeechToken):
+            return
+        self._pending_voice_token = token_object
+        if not self._send_chat_message(transcript, (), InputModality.VOICE):
+            self._pending_voice_token = None
+            self.voice_session.submission_failed(token_object)
+
+    def _on_voice_chat_chunk(
+        self,
+        _request_id: str,
+        turn_id: str,
+        chunk: str,
+    ) -> None:
+        self.voice_session.on_chat_chunk(turn_id, chunk)
+
+    def _on_voice_chat_finished(
+        self,
+        _request_id: str,
+        turn_object: object,
+        state_object: object,
+    ) -> None:
+        turn_id = getattr(turn_object, "turn_id", None)
+        if not isinstance(turn_id, str):
+            return
+        try:
+            state = ConversationState(state_object)
+        except (TypeError, ValueError):
+            return
+        self.voice_session.on_chat_finished(turn_id, state)
+
+    def _stop_voice_chat(self) -> None:
+        action = self._pending_foreground_action
+        if (
+            action is not None
+            and action[0] == "send"
+            and isinstance(action[1], _SendAction)
+            and action[1].input_modality is InputModality.VOICE
+        ):
+            self._pending_foreground_action = None
+            self._foreground_lane_timer.stop()
+            self.chat_panel.set_foreground_preparing(False)
+            self._set_foreground_lane_active(False)
+        self._pending_voice_token = None
+        self.conversation.stop()
+
+    def _sync_voice_availability(self) -> None:
+        available = bool(
+            self._voice_configured
+            and self._chat_available
+            and self._data_initialized
+            and self._data_writable
+            and not self._exiting
+            and self._data_change_state == "idle"
+        )
+        voice_settings = self.settings.get("voice", {})
+        hands_free_available = bool(
+            isinstance(voice_settings, dict) and voice_settings.get("hands_free_enabled") is True
+        )
+        self.chat_panel.set_voice_available(
+            available,
+            hands_free_available=hands_free_available,
+        )
+        if not available and self.voice_session.state.value != "off":
+            self.voice_session.stop_session()
+
+    def _send_chat_message(
+        self,
+        text: str,
+        attachments_object: object = (),
+        input_modality: InputModality = InputModality.TEXT,
+    ) -> bool:
+        try:
+            attachments = tuple(attachments_object)
+            if any(not isinstance(item, AttachmentSnapshot) for item in attachments):
+                raise TypeError
+            input_modality = InputModality(input_modality)
+        except (TypeError, ValueError):
+            self.chat_panel.set_status("附件或输入模态无效，消息未发送。", kind="error")
+            return False
+        action = _SendAction(text, attachments, input_modality)
+        return self._queue_send_action(action)
+
+    def _queue_send_action(self, action: _SendAction) -> bool:
+        if self._data_change_state != "idle":
+            self.chat_panel.set_status("本地数据操作进行中，消息未发送。", kind="error")
+            return False
         if self._provider_switch_pending:
             self.chat_panel.set_status("对话模型切换中，请稍候。", kind="error")
-            return
+            return False
         if not self._chat_available:
             self.chat_panel.set_status("请先配置并测试对话模型。", kind="error")
-            return
+            return False
         if not self._data_initialized:
-            self._pending_initial_message = text
+            self._pending_initial_message = action
             self.chat_panel.set_status("正在初始化本地聊天数据，稍后会自动发送。")
-            return
+            return True
         if not self._data_writable:
             self.chat_panel.set_status("本地数据当前无法安全写入，消息未发送。", kind="error")
-            return
+            return False
         if self._conversation_switch_pending:
             self.chat_panel.set_status("会话切换中，请稍候。", kind="error")
-            return
-        self._begin_foreground_action("send", text)
+            return False
+        if self.visual_sources.active and not action.visual_sampled:
+            frame = self.visual_sources.latest()
+            if frame is None:
+                self.chat_panel.set_status(
+                    "实时视觉尚未产生可用画面，请稍候后重试。",
+                    kind="error",
+                )
+                return False
+            if len(action.attachments) >= 5:
+                self.chat_panel.set_status(
+                    "当前消息已含 5 个附件，无法再加入实时画面。",
+                    kind="error",
+                )
+                return False
+            source = AttachmentSource(frame.source_kind.value)
+            accepted = self.attachment_runtime.import_bytes(
+                frame.png_bytes,
+                display_name=f"{frame.source_kind.value}-latest.png",
+                source=source,
+                existing=action.attachments,
+                context=action,
+            )
+            if accepted:
+                self.chat_panel.set_status("正在固定本轮最新画面…")
+            return accepted
+        return self._begin_foreground_action("send", action)
 
     def _retry_chat_turn(self, turn_id: str) -> None:
         if self._provider_switch_pending:
@@ -2494,12 +3523,12 @@ class ApplicationController:
             return
         self._begin_foreground_action("retry", turn_id)
 
-    def _begin_foreground_action(self, kind: str, payload: str) -> None:
+    def _begin_foreground_action(self, kind: str, payload: object) -> bool:
         """Give visible chat exclusive provider priority without blocking Qt."""
 
         if self._pending_foreground_action is not None:
             self.chat_panel.set_status("正在为前台对话让出模型资源，请稍候。")
-            return
+            return False
         self._pending_foreground_action = (kind, payload)
         self.chat_panel.set_foreground_preparing(True)
         self.chat_panel.set_status("正在停止后台生成并准备对话。")
@@ -2514,14 +3543,16 @@ class ApplicationController:
         if (
             self._pending_foreground_action is not None
             and not self.background_generation.is_running
+            and not self.visual_background_generation.is_running
         ):
             self._dispatch_pending_foreground_action()
+        return True
 
     def _dispatch_pending_foreground_action(self) -> None:
         action = self._pending_foreground_action
         if action is None:
             return
-        if self.background_generation.is_running:
+        if self.background_generation.is_running or self.visual_background_generation.is_running:
             return
         self._pending_foreground_action = None
         self._foreground_lane_timer.stop()
@@ -2536,6 +3567,11 @@ class ApplicationController:
             or self.conversation.state is not ConversationState.IDLE
             or self.conversation.is_active
         ):
+            if isinstance(payload, _SendAction) and payload.input_modality is InputModality.VOICE:
+                token = self._pending_voice_token
+                self._pending_voice_token = None
+                if token is not None:
+                    self.voice_session.submission_failed(token)
             self.chat_panel.set_foreground_preparing(False)
             self._set_foreground_lane_active(False)
             self.chat_panel.set_status("当前状态已变化，消息未发送。", kind="error")
@@ -2548,16 +3584,36 @@ class ApplicationController:
             self._focused_first_chunk_timeout_ms if focus_decision.active else None
         )
         if kind == "send":
+            if not isinstance(payload, _SendAction):
+                self.chat_panel.set_foreground_preparing(False)
+                self._set_foreground_lane_active(False)
+                return
             turn = self.conversation.send_message(
-                payload,
+                payload.text,
                 first_chunk_timeout_ms=first_chunk_timeout_ms,
+                attachments=payload.attachments,
+                input_modality=payload.input_modality,
             )
             if turn is not None:
                 self._turn_started_at[turn.turn_id] = started
+                if payload.visual_sampled:
+                    self._active_visual_turn_id = turn.turn_id
+                if payload.input_modality is InputModality.VOICE:
+                    token = self._pending_voice_token
+                    self._pending_voice_token = None
+                    if token is None or not self.voice_session.bind_chat_turn(
+                        token,
+                        turn.turn_id,
+                    ):
+                        self.voice_session.stop_session()
                 return
-        elif kind == "retry" and self.conversation.retry(
-            payload,
-            first_chunk_timeout_ms=first_chunk_timeout_ms,
+        elif (
+            kind == "retry"
+            and isinstance(payload, str)
+            and self.conversation.retry(
+                payload,
+                first_chunk_timeout_ms=first_chunk_timeout_ms,
+            )
         ):
             self._turn_started_at[payload] = started
             return
@@ -2567,14 +3623,29 @@ class ApplicationController:
         self._set_foreground_lane_active(False)
         message = "当前无法重试这轮对话。" if kind == "retry" else "消息未能发送，请重试。"
         self.chat_panel.set_status(message, kind="error")
+        if isinstance(payload, _SendAction) and payload.input_modality is InputModality.VOICE:
+            token = self._pending_voice_token
+            self._pending_voice_token = None
+            if token is not None:
+                self.voice_session.submission_failed(token)
 
     def _on_foreground_lane_timeout(self) -> None:
         if self._pending_foreground_action is None:
             return
+        kind, payload = self._pending_foreground_action
         self._pending_foreground_action = None
         self.chat_panel.set_foreground_preparing(False)
         self._set_foreground_lane_active(False)
         self.chat_panel.set_status("后台生成未能及时停止，消息未发送，请重试。", kind="error")
+        if (
+            kind == "send"
+            and isinstance(payload, _SendAction)
+            and payload.input_modality is InputModality.VOICE
+        ):
+            token = self._pending_voice_token
+            self._pending_voice_token = None
+            if token is not None:
+                self.voice_session.submission_failed(token)
 
     def _set_foreground_lane_active(self, active: bool) -> None:
         if self._background_jobs_enabled:
@@ -2594,6 +3665,8 @@ class ApplicationController:
 
         del request_id
         turn_id = getattr(turn, "turn_id", "unknown")
+        if str(turn_id) == self._active_visual_turn_id:
+            self._active_visual_turn_id = None
         started = self._turn_started_at.pop(str(turn_id), None)
         if started is None:
             return
@@ -2615,7 +3688,10 @@ class ApplicationController:
             self._last_safe_error_category = diagnostic_categories[provider_category]
             self._refresh_diagnostics()
         state_name = getattr(state, "value", state)
-        if self.chat_panel.provider_mode == "mock":
+        finalized_metadata = self.data_service.pop_finalized_provider_metadata(str(turn_id))
+        if finalized_metadata is not None:
+            provider_name, model_name = finalized_metadata
+        elif self.chat_panel.provider_mode == "mock":
             provider_name = "explicit_mock"
             model_name = "scripted"
         else:
@@ -2685,10 +3761,10 @@ class ApplicationController:
         self.pet_window.animation.set_activity("waiting", False)
         self.pet_window.animation.set_activity("responding", False)
 
-    def _focus_decision_for_action(self, kind: str, payload: str) -> FocusModeDecision:
-        if kind == "send":
-            return classify_focus_mode(payload)
-        if kind == "retry":
+    def _focus_decision_for_action(self, kind: str, payload: object) -> FocusModeDecision:
+        if kind == "send" and isinstance(payload, _SendAction):
+            return classify_focus_mode(payload.text)
+        if kind == "retry" and isinstance(payload, str):
             for turn in self.conversation.turns:
                 if turn.turn_id == payload:
                     return classify_focus_mode(turn.user_message.content)
@@ -2841,10 +3917,19 @@ class ApplicationController:
             return min(remaining, round(total_ms * fraction))
 
         proactive_clean = self.proactive_interactions.stop(wait_ms=slice_ms(0.10))
+        visual_generation_clean = self.visual_background_generation.shutdown(wait_ms=slice_ms(0.05))
+        voice_clean = self.voice_session.shutdown(wait_ms=slice_ms(0.10))
+        self.visual_sources.shutdown()
+        self.region_screenshot_encoder.shutdown()
+        overlay = self._region_screenshot_overlay
+        if overlay is not None:
+            overlay.close()
+            self._region_screenshot_overlay = None
+        attachment_clean = self.attachment_runtime.shutdown(wait_ms=slice_ms(0.05))
         background_clean = self.memory_jobs.shutdown(wait_ms=slice_ms(0.15))
         # Start cancellation for the connection test before waiting on conversation cleanup.
         self.model_settings_window.cancel_test()
-        conversation_clean = self.conversation.shutdown(wait_ms=slice_ms(0.25))
+        conversation_clean = self.conversation.shutdown(wait_ms=slice_ms(0.20))
         vector_clean = True
         remaining_seconds = min(
             max(0.0, deadline - time.monotonic()),
@@ -2873,6 +3958,12 @@ class ApplicationController:
             self.logger.error(
                 "Background memory worker did not stop within the shared shutdown deadline"
             )
+        if not attachment_clean:
+            self.logger.error("Attachment preprocessing did not stop within the deadline")
+        if not voice_clean:
+            self.logger.error("Voice workers did not stop within the shutdown deadline")
+        if not visual_generation_clean:
+            self.logger.error("Active visual worker did not stop within the shutdown deadline")
         if not settings_clean:
             self.logger.error(
                 "Provider connection test did not stop within the shared shutdown deadline"
@@ -2883,6 +3974,9 @@ class ApplicationController:
             self.logger.error("Local data thread did not stop within the shutdown deadline")
         return (
             proactive_clean
+            and visual_generation_clean
+            and voice_clean
+            and attachment_clean
             and background_clean
             and conversation_clean
             and vector_clean

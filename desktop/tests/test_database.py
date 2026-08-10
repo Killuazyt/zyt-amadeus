@@ -14,10 +14,10 @@ from amadeus_desktop.database import (
 )
 
 
-def test_schema_v3_enables_required_pragmas_and_entities(tmp_path) -> None:
+def test_schema_v5_enables_required_pragmas_and_entities(tmp_path) -> None:
     path = tmp_path / "data" / "amadeus.sqlite3"
     with SQLiteDatabase(path, busy_timeout_ms=3_210) as database:
-        assert database.schema_version == SCHEMA_VERSION == 3
+        assert database.schema_version == SCHEMA_VERSION == 5
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert str(database.pragma_value("journal_mode")).lower() == "wal"
         assert database.pragma_value("foreign_keys") == 1
@@ -43,13 +43,19 @@ def test_schema_v3_enables_required_pragmas_and_entities(tmp_path) -> None:
             "persona_vectors",
             "persona_recall_events",
             "proactive_events",
+            "attachments",
+            "message_attachments",
         }.issubset(table_names(database.connection))
+        message_columns = {
+            row[1] for row in database.connection.execute("PRAGMA table_info(messages)")
+        }
+        assert "input_modality" in message_columns
 
     assert path.exists()
     assert path.parent.name == "data"
 
 
-def test_schema_v1_is_backed_up_and_migrated_to_v3_without_losing_data(tmp_path) -> None:
+def test_schema_v1_is_backed_up_and_migrated_to_v5_without_losing_data(tmp_path) -> None:
     path = tmp_path / "amadeus.sqlite3"
     legacy = sqlite3.connect(path)
     legacy.execute("PRAGMA foreign_keys = ON")
@@ -64,7 +70,7 @@ def test_schema_v1_is_backed_up_and_migrated_to_v3_without_losing_data(tmp_path)
     database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
     try:
         assert not database.read_only
-        assert database.schema_version == 3
+        assert database.schema_version == 5
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert database.last_backup_path is not None
         assert (
@@ -83,6 +89,8 @@ def test_schema_v1_is_backed_up_and_migrated_to_v3_without_losing_data(tmp_path)
             "persona_vectors",
             "persona_recall_events",
             "proactive_events",
+            "attachments",
+            "message_attachments",
         }.issubset(table_names(database.connection))
     finally:
         database.close()
@@ -136,13 +144,14 @@ def test_schema_v2_migrates_messages_and_application_identity_without_data_loss(
     backup_path = database.last_backup_path
     try:
         assert not database.read_only
-        assert database.schema_version == 3
+        assert database.schema_version == 5
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         row = database.connection.execute(
-            "SELECT content, origin FROM messages WHERE id = 'm'"
+            "SELECT content, origin, input_modality FROM messages WHERE id = 'm'"
         ).fetchone()
-        assert tuple(row) == ("preserved", "conversation")
+        assert tuple(row) == ("preserved", "conversation", "text")
         assert "proactive_events" in table_names(database.connection)
+        assert "attachments" in table_names(database.connection)
     finally:
         database.close()
 
@@ -304,6 +313,13 @@ def test_claimed_current_but_incomplete_schema_fails_closed(tmp_path) -> None:
         CREATE TABLE proactive_events(id TEXT PRIMARY KEY);
         """,
         """
+        DROP TABLE message_attachments;
+        CREATE TABLE message_attachments(message_id TEXT PRIMARY KEY);
+        """,
+        """
+        ALTER TABLE messages DROP COLUMN input_modality;
+        """,
+        """
         PRAGMA application_id = 0;
         """,
     ),
@@ -313,6 +329,8 @@ def test_claimed_current_but_incomplete_schema_fails_closed(tmp_path) -> None:
         "fts-table",
         "v2-columns",
         "v3-columns",
+        "v4-columns",
+        "v5-columns",
         "application-id",
     ),
 )

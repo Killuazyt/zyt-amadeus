@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from amadeus_desktop.provider_config import ProviderConfig, ProviderPreset
+from amadeus_desktop.provider_config import (
+    MULTIMODAL_CREDENTIAL_REF,
+    PROVIDER_CREDENTIAL_REF,
+    ProviderConfig,
+    ProviderPreset,
+)
 from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
     DEFAULT_SETTINGS,
@@ -116,7 +121,7 @@ def test_schema_v2_migrates_to_deepseek_provider_default(tmp_path: Path) -> None
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
 
-def test_schema_v4_migrates_to_p6_defaults_without_losing_existing_data(
+def test_schema_v4_migrates_through_p7e_defaults_without_losing_existing_data(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "settings.json"
@@ -141,7 +146,7 @@ def test_schema_v4_migrates_to_p6_defaults_without_losing_existing_data(
 
     loaded = SettingsRepository(path).load()
 
-    assert loaded["schema_version"] == 5
+    assert loaded["schema_version"] == CURRENT_SCHEMA_VERSION
     assert loaded["ui"] == legacy["ui"]
     assert loaded["pet"] == {
         **legacy["pet"],
@@ -153,6 +158,9 @@ def test_schema_v4_migrates_to_p6_defaults_without_losing_existing_data(
     assert loaded["general"] == DEFAULT_SETTINGS["general"]
     assert loaded["persona"] == DEFAULT_SETTINGS["persona"]
     assert loaded["proactive"] == DEFAULT_SETTINGS["proactive"]
+    assert loaded["multimodal"] == DEFAULT_SETTINGS["multimodal"]
+    assert loaded["voice"] == DEFAULT_SETTINGS["voice"]
+    assert loaded["visual"] == DEFAULT_SETTINGS["visual"]
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
 
@@ -179,6 +187,71 @@ def test_schema_v4_preserves_already_present_p6_values(tmp_path: Path) -> None:
     assert loaded["pet"] == legacy["pet"]
     assert loaded["persona"] == legacy["persona"]
     assert loaded["proactive"] == legacy["proactive"]
+
+
+@pytest.mark.parametrize(
+    ("version", "existing_section", "defaulted_sections"),
+    (
+        (5, None, ("multimodal", "voice", "visual")),
+        (6, "multimodal", ("voice", "visual")),
+        (7, "voice", ("visual",)),
+    ),
+)
+def test_p7c_to_p7e_settings_migrations_are_missing_only_and_persisted(
+    tmp_path: Path,
+    version: int,
+    existing_section: str | None,
+    defaulted_sections: tuple[str, ...],
+) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy["schema_version"] = version
+    for section in ("multimodal", "voice", "visual"):
+        if section in defaulted_sections:
+            legacy.pop(section)
+    if existing_section == "multimodal":
+        legacy["multimodal"]["enabled"] = True
+    elif existing_section == "voice":
+        legacy["voice"]["input_device_id"] = "saved-microphone"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["schema_version"] == CURRENT_SCHEMA_VERSION
+    for section in defaulted_sections:
+        assert loaded[section] == DEFAULT_SETTINGS[section]
+    if existing_section is not None:
+        assert loaded[existing_section] == legacy[existing_section]
+    assert json.loads(path.read_text(encoding="utf-8")) == loaded
+
+
+def test_mimo_credential_reuse_requires_same_payg_security_scope() -> None:
+    invalid = deepcopy(DEFAULT_SETTINGS)
+    invalid["multimodal"]["reuse_mimo_credential"] = True
+    with pytest.raises(InvalidSettingsError, match="reuse scope"):
+        validate_settings_document(invalid)
+
+    valid = deepcopy(DEFAULT_SETTINGS)
+    valid["provider"] = ProviderConfig.for_preset(
+        ProviderPreset.MIMO_PAYG,
+        credential_ref=PROVIDER_CREDENTIAL_REF,
+    ).to_mapping()
+    valid["multimodal"]["provider"] = ProviderConfig.for_preset(
+        ProviderPreset.MIMO_PAYG,
+        credential_ref=MULTIMODAL_CREDENTIAL_REF,
+    ).to_mapping()
+    valid["multimodal"]["reuse_mimo_credential"] = True
+
+    validate_settings_document(valid)
+
+
+def test_enabled_voice_rejects_incompatible_reused_provider_credential() -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document["voice"]["enabled"] = True
+    document["voice"]["credential_source"] = PROVIDER_CREDENTIAL_REF
+
+    with pytest.raises(InvalidSettingsError, match="Voice cannot reuse"):
+        validate_settings_document(document)
 
 
 @pytest.mark.parametrize("scale", [49, 201, True, "100"])

@@ -69,6 +69,12 @@ class AppPaths:
         return self.directory(AppDirectory.BACKUPS) / "migrations"
 
     @property
+    def attachments_directory(self) -> Path:
+        """Return the only root allowed to contain managed conversation media."""
+
+        return self.directory(AppDirectory.DATA) / "attachments"
+
+    @property
     def embedding_model_directory(self) -> Path:
         """Return the fixed P5B embedding snapshot directory."""
 

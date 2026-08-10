@@ -157,9 +157,7 @@ class ModelSettingsWindow(QWidget):
         self.stream_check = QCheckBox("启用流式输出")
 
         self.form_layout = QFormLayout()
-        self.form_layout.setFieldGrowthPolicy(
-            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
-        )
+        self.form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.form_layout.addRow("预设", self.preset_combo)
         self.form_layout.addRow("Base URL", self.base_url_edit)
@@ -216,9 +214,7 @@ class ModelSettingsWindow(QWidget):
         self.scroll_area.setObjectName("modelSettingsScrollArea")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setWidget(self.scroll_content)
 
         layout = QVBoxLayout(self)

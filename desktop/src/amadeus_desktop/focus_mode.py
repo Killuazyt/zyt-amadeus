@@ -10,8 +10,7 @@ from enum import StrEnum
 DEFAULT_FOCUSED_FIRST_CHUNK_TIMEOUT_MS = 30_000
 FOCUS_STATUS_TEXT = "凝神中 · 正在认真梳理这个问题…"
 FOCUS_STATUS_TOOLTIP = (
-    "凝神模式只表示 Amadeus 正在整理并等待回复；"
-    "不会展示、保存或记录模型的隐藏思维链。"
+    "凝神模式只表示 Amadeus 正在整理并等待回复；不会展示、保存或记录模型的隐藏思维链。"
 )
 
 

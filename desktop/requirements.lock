@@ -67,11 +67,15 @@ packaging==26.2
     #   huggingface-hub
     #   onnxruntime
 pillow==12.3.0
-    # via fastembed
+    # via
+    #   amadeus-desktop (pyproject.toml)
+    #   fastembed
 protobuf==7.35.1
     # via onnxruntime
 py-rust-stemmers==0.1.8
     # via fastembed
+pypdf==6.15.0
+    # via amadeus-desktop (pyproject.toml)
 pyside6==6.11.1
     # via amadeus-desktop (pyproject.toml)
 pyside6-addons==6.11.1

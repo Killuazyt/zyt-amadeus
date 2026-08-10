@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import io
 from concurrent.futures import Future
 from dataclasses import replace
 
+from PIL import Image
+
+from amadeus_desktop.attachments import AttachmentStore
 from amadeus_desktop.chat_models import (
+    AttachmentSource,
     ChatMessage,
     ConversationTurn,
     MessageRole,
     MessageStatus,
     PreparedPrompt,
+    ProviderRoute,
     TurnTerminalReason,
 )
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
@@ -38,6 +44,82 @@ def _turn(
             MessageStatus.PENDING,
         ),
     )
+
+
+def _image_bytes() -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (16, 12), (20, 40, 60)).save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_multimodal_route_persists_its_own_provider_metadata(qtbot, tmp_path) -> None:
+    attachment_store = AttachmentStore(tmp_path / "attachments")
+    runtime = SerialDataThread(
+        lambda: create_local_data_stores(
+            tmp_path / "amadeus.sqlite3",
+            tmp_path / "backups",
+            attachment_store,
+        ),
+        resource_close=lambda stores: stores.close(),
+    )
+    service = LocalDataService(runtime, memory_enabled=False)
+    service.set_provider_metadata("text-provider", "text-model")
+    service.set_multimodal_provider_metadata("vision-provider", "vision-model")
+    service.start()
+    qtbot.waitUntil(lambda: service.is_writable, timeout=2_000)
+    attachment = attachment_store.import_bytes(
+        _image_bytes(),
+        display_name="frame.png",
+        source=AttachmentSource.SCREEN,
+    )
+    base_turn = _turn()
+    turn = replace(
+        base_turn,
+        user_message=replace(base_turn.user_message, attachments=(attachment,)),
+    )
+    prompts: list[PreparedPrompt] = []
+    failures: list[str] = []
+
+    assert service.prepare_new_turn(turn, prompts.append, failures.append)
+    qtbot.waitUntil(lambda: bool(prompts or failures), timeout=2_000)
+    assert failures == []
+    assert prompts[0].provider_route is ProviderRoute.MULTIMODAL
+
+    completed = replace(
+        turn,
+        assistant_message=replace(
+            turn.assistant_message,
+            content="已看到画面。",
+            status=MessageStatus.COMPLETED,
+        ),
+        terminal_reason=TurnTerminalReason.COMPLETED,
+    )
+    finalized: list[bool] = []
+    assert service.finalize_turn(
+        completed,
+        lambda: finalized.append(True),
+        lambda _category: None,
+    )
+    qtbot.waitUntil(lambda: bool(finalized), timeout=2_000)
+    metadata: list[tuple[str, str]] = []
+    assert runtime.submit(
+        lambda stores: tuple(
+            stores.database.connection.execute(
+                "SELECT provider_name, model_name FROM messages WHERE id = ?",
+                (turn.assistant_message.message_id,),
+            ).fetchone()
+        ),
+        priority=DataPriority.FOREGROUND,
+        on_success=metadata.append,
+    )
+    qtbot.waitUntil(lambda: bool(metadata), timeout=2_000)
+
+    assert metadata == [("vision-provider", "vision-model")]
+    assert service.pop_finalized_provider_metadata(turn.turn_id) == (
+        "vision-provider",
+        "vision-model",
+    )
+    assert service.shutdown(2_000)
 
 
 def test_slow_vector_query_falls_back_without_delaying_or_duplicating_user_row(
