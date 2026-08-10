@@ -181,6 +181,7 @@ class ConversationCoordinator(QObject):
             raise ValueError("stream_idle_timeout_ms must be positive")
         self._provider = provider
         self._persistence = persistence
+        self._default_first_chunk_timeout_ms = first_chunk_timeout_ms
         self._state = ConversationState.IDLE
         self._turns: list[ConversationTurn] = []
         self._contexts: dict[str, _RequestContext] = {}
@@ -252,9 +253,18 @@ class ConversationCoordinator(QObject):
         self._provider = provider
         return True
 
-    def send_message(self, text: str) -> ConversationTurn | None:
+    def send_message(
+        self,
+        text: str,
+        *,
+        first_chunk_timeout_ms: int | None = None,
+    ) -> ConversationTurn | None:
         """Append a new in-memory turn and start exactly one provider attempt."""
 
+        attempt_timeout_ms = _resolve_first_chunk_timeout(
+            first_chunk_timeout_ms,
+            default=self._default_first_chunk_timeout_ms,
+        )
         if (
             self._shutting_down
             or self._active_request_id is not None
@@ -280,12 +290,25 @@ class ConversationCoordinator(QObject):
         )
         self._turns.append(turn)
         self.turn_added.emit(turn)
-        self._prepare_attempt(turn, is_retry=False)
+        self._prepare_attempt(
+            turn,
+            is_retry=False,
+            first_chunk_timeout_ms=attempt_timeout_ms,
+        )
         return turn
 
-    def retry(self, turn_id: str) -> bool:
+    def retry(
+        self,
+        turn_id: str,
+        *,
+        first_chunk_timeout_ms: int | None = None,
+    ) -> bool:
         """Retry a failed turn without adding or replacing either message ID."""
 
+        attempt_timeout_ms = _resolve_first_chunk_timeout(
+            first_chunk_timeout_ms,
+            default=self._default_first_chunk_timeout_ms,
+        )
         if (
             self._shutting_down
             or self._active_request_id is not None
@@ -315,7 +338,11 @@ class ConversationCoordinator(QObject):
         )
         self._turns[index] = retried
         self.turn_updated.emit(retried)
-        self._prepare_attempt(retried, is_retry=True)
+        self._prepare_attempt(
+            retried,
+            is_retry=True,
+            first_chunk_timeout_ms=attempt_timeout_ms,
+        )
         return True
 
     def stop(self) -> bool:
@@ -437,7 +464,13 @@ class ConversationCoordinator(QObject):
         self._turns = list(turns)
         return True
 
-    def _prepare_attempt(self, turn: ConversationTurn, *, is_retry: bool) -> None:
+    def _prepare_attempt(
+        self,
+        turn: ConversationTurn,
+        *,
+        is_retry: bool,
+        first_chunk_timeout_ms: int,
+    ) -> None:
         self._set_state(ConversationState.SENDING)
         request_id = uuid4().hex
         if self._persistence is None:
@@ -445,6 +478,7 @@ class ConversationCoordinator(QObject):
                 turn,
                 self._prompt_messages(turn.turn_id),
                 request_id=request_id,
+                first_chunk_timeout_ms=first_chunk_timeout_ms,
             )
             return
         self._preparation_generation += 1
@@ -468,6 +502,7 @@ class ConversationCoordinator(QObject):
                     current,
                     _prepared_prompt(value),
                     request_id=request_id,
+                    first_chunk_timeout_ms=first_chunk_timeout_ms,
                 )
 
         def failed(_category: str) -> None:
@@ -524,6 +559,7 @@ class ConversationCoordinator(QObject):
         turn: ConversationTurn,
         prepared_prompt: PreparedPrompt | tuple[PromptMessage, ...],
         *,
+        first_chunk_timeout_ms: int,
         request_id: str | None = None,
     ) -> None:
         request_id = request_id or uuid4().hex
@@ -561,6 +597,7 @@ class ConversationCoordinator(QObject):
         thread.finished.connect(self._on_thread_finished)
 
         self._set_state(ConversationState.WAITING_FIRST_CHUNK)
+        self._first_chunk_timer.setInterval(first_chunk_timeout_ms)
         self._first_chunk_timer.start()
         thread.start()
 
@@ -956,3 +993,11 @@ class ConversationCoordinator(QObject):
             return
         self._state = state
         self.state_changed.emit(state)
+
+
+def _resolve_first_chunk_timeout(value: int | None, *, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("first_chunk_timeout_ms must be a positive integer")
+    return value

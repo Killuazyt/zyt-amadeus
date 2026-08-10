@@ -30,6 +30,22 @@ def test_priority_and_same_state_do_not_restart(qapp) -> None:
     assert controller.state == "idle"
 
 
+def test_thinking_replaces_waiting_but_stays_below_dragging(qapp) -> None:
+    controller = make_controller()
+    controller.set_activity("waiting", True)
+    controller.set_activity("thinking", True)
+
+    assert controller.state == "thinking"
+
+    controller.set_activity("move_left", True)
+    assert controller.state == "move_left"
+    controller.set_activity("move_left", False)
+    assert controller.state == "thinking"
+
+    controller.set_activity("thinking", False)
+    assert controller.state == "waiting"
+
+
 def test_missing_action_falls_back_to_idle(qapp) -> None:
     controller = make_controller()
 

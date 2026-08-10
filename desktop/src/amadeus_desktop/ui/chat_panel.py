@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from amadeus_desktop.chat_geometry import compact_panel_size
+from amadeus_desktop.focus_mode import FOCUS_STATUS_TOOLTIP
 
 _ACTIVE_STATES = {"sending", "waiting_first_chunk", "streaming"}
 _STATE_PRESENTATION = {
@@ -307,6 +308,7 @@ class ChatPanel(QWidget):
         self.status_label = QLabel("就绪")
         self.status_label.setObjectName("conversationStatus")
         self.status_label.setProperty("kind", "neutral")
+        self.status_label.setAccessibleName("对话状态")
         self.status_label.setWordWrap(True)
 
         self.input = ChatInput()
@@ -499,7 +501,13 @@ class ChatPanel(QWidget):
         self._resize_bubbles()
 
     @Slot(object)
-    def set_conversation_state(self, state: object, detail: str | None = None) -> None:
+    def set_conversation_state(
+        self,
+        state: object,
+        detail: str | None = None,
+        *,
+        focus_mode: bool = False,
+    ) -> None:
         state_name = _enum_text(state).lower()
         self._conversation_active = state_name in _ACTIVE_STATES
         self._turn_locked = state_name != "idle"
@@ -513,6 +521,14 @@ class ChatPanel(QWidget):
         self._send_pending = False
         self._pending_send_text = None
         status, kind = _STATE_PRESENTATION.get(state_name, (state_name, "neutral"))
+        focus_active = focus_mode and state_name in {"sending", "waiting_first_chunk"}
+        if focus_active:
+            kind = "focus"
+            self.status_label.setToolTip(FOCUS_STATUS_TOOLTIP)
+            self.status_label.setAccessibleDescription(FOCUS_STATUS_TOOLTIP)
+        else:
+            self.status_label.setToolTip("")
+            self.status_label.setAccessibleDescription("")
         self.set_status(detail or status, kind=kind)
         self.action_button.setText("停止" if self._conversation_active else "发送")
         self.action_button.setProperty("active", self._conversation_active)
@@ -1104,6 +1120,7 @@ QPushButton#retryButton {
 }
 QLabel#conversationStatus { color: #94a3b8; }
 QLabel#conversationStatus[kind="working"] { color: #67e8f9; }
+QLabel#conversationStatus[kind="focus"] { color: #c4b5fd; font-weight: 600; }
 QLabel#conversationStatus[kind="success"] { color: #86efac; }
 QLabel#conversationStatus[kind="error"] { color: #fca5a5; }
 QPlainTextEdit#chatInput {

@@ -13,7 +13,7 @@ STATE_PRIORITY = {
     "idle": 0,
     "greeting": 100,
     "jump": 100,
-    "thinking": 200,
+    "thinking": 305,
     "waiting": 300,
     "responding": 310,
     "move_left": 400,

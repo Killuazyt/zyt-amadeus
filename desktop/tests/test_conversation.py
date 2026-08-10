@@ -169,6 +169,37 @@ def test_slow_first_chunk_can_complete_before_timeout(qtbot, coordinator_factory
     assert coordinator.turns[0].terminal_reason is TurnTerminalReason.COMPLETED
 
 
+def test_per_attempt_first_chunk_timeout_override_does_not_change_default(
+    qtbot,
+    coordinator_factory,
+) -> None:
+    provider = ScriptedChatProvider(
+        ScriptedScenario.SLOW_FIRST,
+        chunks=("放宽后成功",),
+        slow_first_delay_ms=60,
+    )
+    coordinator = coordinator_factory(provider, first_chunk_timeout_ms=25)
+
+    coordinator.send_message("凝神请求", first_chunk_timeout_ms=500)
+    wait_until_idle(qtbot, coordinator)
+    assert coordinator.turns[0].terminal_reason is TurnTerminalReason.COMPLETED
+
+    coordinator.send_message("普通请求")
+    wait_until_idle(qtbot, coordinator)
+    assert coordinator.turns[1].terminal_reason is TurnTerminalReason.FIRST_CHUNK_TIMEOUT
+
+
+def test_invalid_per_attempt_first_chunk_timeout_is_rejected_without_a_turn(
+    coordinator_factory,
+) -> None:
+    coordinator = coordinator_factory(ScriptedChatProvider())
+
+    with pytest.raises(ValueError, match="positive integer"):
+        coordinator.send_message("不会发送", first_chunk_timeout_ms=0)
+
+    assert coordinator.turns == ()
+
+
 def test_first_chunk_timeout_cancels_never_returning_provider(
     qtbot,
     coordinator_factory,

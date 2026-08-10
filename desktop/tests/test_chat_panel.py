@@ -8,6 +8,7 @@ from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QTextOption
 from PySide6.QtWidgets import QWidget
 
+from amadeus_desktop.focus_mode import FOCUS_STATUS_TEXT
 from amadeus_desktop.ui.chat_panel import ChatPanel
 
 
@@ -59,6 +60,25 @@ def test_panel_is_focusable_tool_window_with_independent_mock_banner(panel) -> N
 
     assert panel.status_label.text() == "模拟中断"
     assert "本地模拟模式" in panel.mock_banner.text()
+
+
+def test_focus_status_is_distinct_and_clears_when_streaming_starts(panel) -> None:
+    panel.set_conversation_state(
+        State.WAITING_FIRST_CHUNK,
+        FOCUS_STATUS_TEXT,
+        focus_mode=True,
+    )
+
+    assert panel.status_label.text() == FOCUS_STATUS_TEXT
+    assert panel.status_label.property("kind") == "focus"
+    assert "不会展示" in panel.status_label.toolTip()
+    assert "思维链" in panel.status_label.toolTip()
+
+    panel.set_conversation_state(State.STREAMING)
+
+    assert panel.status_label.text() == "正在回复…"
+    assert panel.status_label.property("kind") == "working"
+    assert panel.status_label.toolTip() == ""
 
 
 def test_provider_modes_are_explicit_and_unconfigured_mode_blocks_send(panel, qtbot) -> None:

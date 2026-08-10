@@ -58,6 +58,12 @@ from amadeus_desktop.diagnostics import DiagnosticStatusService
 from amadeus_desktop.embedding_backend import FastEmbedEmbeddingBackend
 from amadeus_desktop.embedding_calibration import calibrate_backend
 from amadeus_desktop.embedding_model import resolve_runtime_model_directory
+from amadeus_desktop.focus_mode import (
+    DEFAULT_FOCUSED_FIRST_CHUNK_TIMEOUT_MS,
+    FOCUS_STATUS_TEXT,
+    FocusModeDecision,
+    classify_focus_mode,
+)
 from amadeus_desktop.greetings import GreetingCatalog, load_greeting_catalog
 from amadeus_desktop.local_data_service import (
     ConversationSnapshot,
@@ -135,6 +141,7 @@ class ApplicationController:
         credential_store: CredentialStore | None = None,
         connection_tester: ProviderConnectionTester | None = None,
         first_chunk_timeout_ms: int = 15_000,
+        focused_first_chunk_timeout_ms: int = DEFAULT_FOCUSED_FIRST_CHUNK_TIMEOUT_MS,
         stream_idle_timeout_ms: int = 30_000,
         background_jobs_enabled: bool | None = None,
         autostart_manager: AutostartManager | None = None,
@@ -157,6 +164,17 @@ class ApplicationController:
         self._restore_scheduled = False
         self._chat_reposition_scheduled = False
         self._turn_started_at: dict[str, float] = {}
+        self._active_focus_decision = FocusModeDecision()
+        if (
+            isinstance(focused_first_chunk_timeout_ms, bool)
+            or not isinstance(focused_first_chunk_timeout_ms, int)
+            or focused_first_chunk_timeout_ms <= 0
+        ):
+            raise ValueError("focused_first_chunk_timeout_ms must be a positive integer")
+        self._focused_first_chunk_timeout_ms = max(
+            first_chunk_timeout_ms,
+            focused_first_chunk_timeout_ms,
+        )
         self._data_initialized = False
         self._data_writable = False
         self._pending_initial_message: str | None = None
@@ -2524,15 +2542,27 @@ class ApplicationController:
             return
 
         started = time.perf_counter()
+        focus_decision = self._focus_decision_for_action(kind, payload)
+        self._active_focus_decision = focus_decision
+        first_chunk_timeout_ms = (
+            self._focused_first_chunk_timeout_ms if focus_decision.active else None
+        )
         if kind == "send":
-            turn = self.conversation.send_message(payload)
+            turn = self.conversation.send_message(
+                payload,
+                first_chunk_timeout_ms=first_chunk_timeout_ms,
+            )
             if turn is not None:
                 self._turn_started_at[turn.turn_id] = started
                 return
-        elif kind == "retry" and self.conversation.retry(payload):
+        elif kind == "retry" and self.conversation.retry(
+            payload,
+            first_chunk_timeout_ms=first_chunk_timeout_ms,
+        ):
             self._turn_started_at[payload] = started
             return
 
+        self._active_focus_decision = FocusModeDecision()
         self.chat_panel.set_foreground_preparing(False)
         self._set_foreground_lane_active(False)
         message = "当前无法重试这轮对话。" if kind == "retry" else "消息未能发送，请重试。"
@@ -2607,16 +2637,27 @@ class ApplicationController:
         # The runner is also used by opt-in proactive greetings even when the
         # durable memory scheduler is disabled by a test/development injection.
         self._set_foreground_lane_active(state is not ConversationState.IDLE)
-        self.chat_panel.set_conversation_state(state)
+        focus_active = self._active_focus_decision.active and state in {
+            ConversationState.SENDING,
+            ConversationState.WAITING_FIRST_CHUNK,
+        }
+        self.chat_panel.set_conversation_state(
+            state,
+            FOCUS_STATUS_TEXT if focus_active else None,
+            focus_mode=focus_active,
+        )
         animation = self.pet_window.animation
         if state is ConversationState.SENDING:
             animation.clear_transient()
             animation.set_activity("responding", False)
-            animation.set_activity("waiting", True)
+            animation.set_activity("waiting", not focus_active)
+            animation.set_activity("thinking", focus_active)
         elif state is ConversationState.WAITING_FIRST_CHUNK:
             animation.set_activity("responding", False)
-            animation.set_activity("waiting", True)
+            animation.set_activity("waiting", not focus_active)
+            animation.set_activity("thinking", focus_active)
         elif state is ConversationState.STREAMING:
+            animation.set_activity("thinking", False)
             animation.set_activity("waiting", False)
             animation.set_activity("responding", True)
         elif state is ConversationState.COMPLETED:
@@ -2633,10 +2674,25 @@ class ApplicationController:
         elif state is ConversationState.IDLE:
             # Preserve a terminal success/error action until it finishes naturally.
             self._clear_conversation_activities()
+        if state not in {
+            ConversationState.SENDING,
+            ConversationState.WAITING_FIRST_CHUNK,
+        }:
+            self._active_focus_decision = FocusModeDecision()
 
     def _clear_conversation_activities(self) -> None:
+        self.pet_window.animation.set_activity("thinking", False)
         self.pet_window.animation.set_activity("waiting", False)
         self.pet_window.animation.set_activity("responding", False)
+
+    def _focus_decision_for_action(self, kind: str, payload: str) -> FocusModeDecision:
+        if kind == "send":
+            return classify_focus_mode(payload)
+        if kind == "retry":
+            for turn in self.conversation.turns:
+                if turn.turn_id == payload:
+                    return classify_focus_mode(turn.user_message.content)
+        return FocusModeDecision()
 
     def _success_action(self) -> str | None:
         animations = self.pet_window.asset.manifest.animations

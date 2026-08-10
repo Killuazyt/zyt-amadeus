@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
 from amadeus_desktop.chat_models import (
     ConversationState,
     MessageStatus,
+    TurnTerminalReason,
 )
 from amadeus_desktop.chat_provider import ScriptedChatProvider, ScriptedScenario
 from amadeus_desktop.controller import ApplicationController
@@ -40,6 +41,7 @@ def make_controller(
     provider: ScriptedChatProvider,
     *,
     first_chunk_timeout_ms: int = 1_000,
+    focused_first_chunk_timeout_ms: int = 30_000,
     stream_idle_timeout_ms: int = 1_000,
 ) -> ApplicationController:
     paths = AppPaths.for_current_user(tmp_path)
@@ -57,6 +59,7 @@ def make_controller(
         tray_available=False,
         chat_provider=provider,
         first_chunk_timeout_ms=first_chunk_timeout_ms,
+        focused_first_chunk_timeout_ms=focused_first_chunk_timeout_ms,
         stream_idle_timeout_ms=stream_idle_timeout_ms,
     )
 
@@ -124,6 +127,177 @@ def test_normal_stream_updates_panel_and_pet_states(qapp, qtbot, tmp_path) -> No
         assert "waiting" in animation_states
         assert "responding" in animation_states
         assert "jump" in animation_states
+    finally:
+        controller.request_exit()
+
+
+def test_complex_or_emotional_input_uses_focus_status_and_thinking_action(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    provider = ScriptedChatProvider(ScriptedScenario.NEVER)
+    controller = make_controller(qapp, tmp_path, provider)
+    add_controller_widgets(qtbot, controller)
+    try:
+        send_from_panel(qtbot, controller, "今天星期几？")
+        qtbot.waitUntil(
+            lambda: controller.conversation.state is ConversationState.WAITING_FIRST_CHUNK
+        )
+        assert controller.pet_window.animation.state == "waiting"
+        assert "凝神中" not in controller.chat_panel.status_label.text()
+        assert controller.conversation.stop()
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.IDLE
+                and not controller.conversation.has_running_worker
+            ),
+            timeout=3_000,
+        )
+
+        send_from_panel(qtbot, controller, "我最近很焦虑，也有点撑不住。")
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.WAITING_FIRST_CHUNK
+                and controller.pet_window.animation.state == "thinking"
+            )
+        )
+        assert "凝神中" in controller.chat_panel.status_label.text()
+        assert controller.chat_panel.status_label.property("kind") == "focus"
+        assert "思维链" in controller.chat_panel.status_label.toolTip()
+
+        assert controller.conversation.stop()
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.IDLE
+                and not controller.conversation.has_running_worker
+            ),
+            timeout=3_000,
+        )
+        assert controller.pet_window.animation.state == "idle"
+        assert controller.chat_panel.status_label.toolTip() == ""
+    finally:
+        controller.request_exit()
+
+
+def test_focused_request_gets_only_the_bounded_first_chunk_timeout_extension(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    provider = ScriptedChatProvider(
+        ScriptedScenario.SLOW_FIRST,
+        chunks=("已经认真整理好了。",),
+        slow_first_delay_ms=75,
+    )
+    controller = make_controller(
+        qapp,
+        tmp_path,
+        provider,
+        first_chunk_timeout_ms=25,
+        focused_first_chunk_timeout_ms=500,
+    )
+    add_controller_widgets(qtbot, controller)
+    try:
+        send_from_panel(qtbot, controller, "我现在很焦虑，不知道该怎么办。")
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.IDLE
+                and bool(controller.conversation.turns)
+                and controller.conversation.turns[0].assistant_message.status
+                is MessageStatus.COMPLETED
+            ),
+            timeout=3_000,
+        )
+
+        assert controller.conversation.turns[0].terminal_reason is TurnTerminalReason.COMPLETED
+    finally:
+        controller.request_exit()
+
+
+def test_retry_reclassifies_the_original_input_and_restores_focus_mode(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    provider = ScriptedChatProvider(
+        ScriptedScenario.PARTIAL_ERROR,
+        chunks=("部分内容",),
+        first_delay_ms=5,
+        chunk_delay_ms=5,
+        slow_first_delay_ms=75,
+    )
+    controller = make_controller(
+        qapp,
+        tmp_path,
+        provider,
+        first_chunk_timeout_ms=25,
+        focused_first_chunk_timeout_ms=500,
+    )
+    add_controller_widgets(qtbot, controller)
+    try:
+        send_from_panel(qtbot, controller, "我很焦虑，请详细分析该怎么办。")
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.IDLE
+                and controller.conversation.turns[0].assistant_message.status
+                is MessageStatus.FAILED
+            ),
+            timeout=3_000,
+        )
+        failed = controller.conversation.turns[0]
+        retry = controller.chat_panel.message_widget(failed.assistant_message.message_id)
+        assert retry is not None and retry.retry_button.isVisible()
+
+        provider.scenario = ScriptedScenario.SLOW_FIRST
+        qtbot.mouseClick(retry.retry_button, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.WAITING_FIRST_CHUNK
+                and controller.pet_window.animation.state == "thinking"
+            )
+        )
+        assert "凝神中" in controller.chat_panel.status_label.text()
+
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.IDLE
+                and controller.conversation.turns[0].assistant_message.status
+                is MessageStatus.COMPLETED
+            ),
+            timeout=3_000,
+        )
+        assert controller.conversation.turns[0].attempt == 2
+    finally:
+        controller.request_exit()
+
+
+def test_exit_during_focus_mode_clears_thinking_and_stops_the_worker(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    controller = make_controller(
+        qapp,
+        tmp_path,
+        ScriptedChatProvider(ScriptedScenario.NEVER),
+    )
+    add_controller_widgets(qtbot, controller)
+    try:
+        send_from_panel(qtbot, controller, "我现在很不安，也不知道该怎么办。")
+        qtbot.waitUntil(
+            lambda: (
+                controller.conversation.state is ConversationState.WAITING_FIRST_CHUNK
+                and controller.pet_window.animation.state == "thinking"
+            )
+        )
+
+        controller.request_exit()
+
+        assert controller.shutdown_clean is True
+        assert controller.conversation.state is ConversationState.IDLE
+        assert not controller.conversation.has_running_worker
+        assert controller.pet_window.animation.state == "idle"
     finally:
         controller.request_exit()
 
