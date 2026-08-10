@@ -126,7 +126,15 @@ def test_builtin_pet_matches_approved_exact_asset(qapp, tmp_path: Path) -> None:
         "waiting": 6,
         "thinking": 6,
     }
-    assert asset.manifest.animations["thinking"].fps == 3
+    assert {
+        name: asset.manifest.animations[name].fps
+        for name in ("move_right", "move_left", "greeting", "thinking")
+    } == {
+        "move_right": 8,
+        "move_left": 8,
+        "greeting": 4,
+        "thinking": 3,
+    }
 
 
 def test_verified_legacy_profile_uses_nine_rows(qapp, tmp_path: Path) -> None:
