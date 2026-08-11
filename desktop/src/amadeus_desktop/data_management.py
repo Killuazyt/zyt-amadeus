@@ -41,7 +41,7 @@ from amadeus_desktop.settings import (
 )
 
 CHAT_EXPORT_FORMAT = "amadeus-chat-export/v2"
-MEMORY_EXPORT_FORMAT = "amadeus-memory-export/v1"
+MEMORY_EXPORT_FORMAT = "amadeus-memory-export/v2"
 BACKUP_FORMAT = "amadeus-backup/v2"
 LEGACY_BACKUP_FORMAT = "amadeus-backup/v1"
 
@@ -159,6 +159,17 @@ class MemoryExportBundle:
     groups: tuple[Mapping[str, object], ...]
     versions: tuple[Mapping[str, object], ...]
     sources: tuple[Mapping[str, object], ...]
+    recent_summaries: tuple[Mapping[str, object], ...] = ()
+    recent_message_refs: tuple[Mapping[str, object], ...] = ()
+    reflection_groups: tuple[Mapping[str, object], ...] = ()
+    reflection_versions: tuple[Mapping[str, object], ...] = ()
+    reflection_sources: tuple[Mapping[str, object], ...] = ()
+    persona_groups: tuple[Mapping[str, object], ...] = ()
+    persona_versions: tuple[Mapping[str, object], ...] = ()
+    persona_sources: tuple[Mapping[str, object], ...] = ()
+    evidence_signals: tuple[Mapping[str, object], ...] = ()
+    conflicts: tuple[Mapping[str, object], ...] = ()
+    audit_events: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,19 +333,30 @@ class SQLiteExportRepository:
 
     def load_memory_bundle(self) -> MemoryExportBundle:
         schema = self._schema_version()
+        group_columns = self._table_columns("memory_groups")
+        version_columns = self._table_columns("memory_versions")
+        subject_scope = (
+            "subject_scope" if "subject_scope" in group_columns else "'user' AS subject_scope"
+        )
         groups = self._rows(
-            """
-            SELECT id, profile_id, kind, topic_key, status, pinned, current_version_id,
+            f"""
+            SELECT id, profile_id, kind, {subject_scope}, topic_key, status, pinned,
+                   current_version_id,
                    created_at, updated_at
             FROM memory_groups
             ORDER BY created_at, id
             """
         )
+        temporal_fields = (
+            ", event_started_at, event_ended_at, time_confidence, deep_memory_eligible"
+            if "deep_memory_eligible" in version_columns
+            else ""
+        )
         versions = self._rows(
-            """
+            f"""
             SELECT id, memory_id, version_number, content, normalized_content, content_hash,
                    search_text, importance, confidence, origin, operation,
-                   supersedes_version_id, created_at
+                   supersedes_version_id, created_at {temporal_fields}
             FROM memory_versions
             ORDER BY memory_id, version_number, id
             """
@@ -347,7 +369,128 @@ class SQLiteExportRepository:
             ORDER BY version_id, created_at, id
             """
         )
-        return MemoryExportBundle(schema, groups, versions, sources)
+        recent_summaries = self._rows(
+            """
+            SELECT id, conversation_id, content, covers_through_sequence,
+                   message_count, character_count, created_at
+            FROM conversation_summaries
+            ORDER BY conversation_id, covers_through_sequence, id
+            """
+        )
+        recent_message_refs = self._rows(
+            """
+            SELECT sequence, id, conversation_id, turn_id, role, status, participates_in_memory,
+                   created_at, updated_at
+            FROM messages
+            ORDER BY sequence, id
+            """
+        )
+        if schema < 6:
+            return MemoryExportBundle(
+                schema,
+                groups,
+                versions,
+                sources,
+                recent_summaries,
+                recent_message_refs,
+            )
+        reflection_groups = self._rows(
+            """
+            SELECT id, profile_id, subject_scope, topic_key, status, pinned,
+                   current_version_id, archive_candidate_since, created_at, updated_at
+            FROM memory_reflections
+            ORDER BY created_at, id
+            """
+        )
+        reflection_versions = self._rows(
+            """
+            SELECT id, reflection_id, version_number, content, normalized_content,
+                   content_hash, search_text, importance, confidence, origin, operation,
+                   supersedes_version_id, created_at
+            FROM memory_reflection_versions
+            ORDER BY reflection_id, version_number, id
+            """
+        )
+        reflection_sources = self._rows(
+            """
+            SELECT id, version_id, fact_version_id, source_message_id, live_message_id,
+                   extraction_method, created_at
+            FROM memory_reflection_sources
+            ORDER BY version_id, created_at, id
+            """
+        )
+        persona_groups = self._rows(
+            """
+            SELECT id, profile_id, subject_scope, topic_key, status, pinned,
+                   current_version_id, archive_candidate_since, created_at, updated_at
+            FROM memory_persona_impressions
+            ORDER BY created_at, id
+            """
+        )
+        persona_versions = self._rows(
+            """
+            SELECT id, impression_id, version_number, content, normalized_content,
+                   content_hash, search_text, importance, confidence, origin, operation,
+                   supersedes_version_id, created_at
+            FROM memory_persona_impression_versions
+            ORDER BY impression_id, version_number, id
+            """
+        )
+        persona_sources = self._rows(
+            """
+            SELECT id, version_id, reflection_version_id, source_message_id,
+                   live_message_id, extraction_method, created_at
+            FROM memory_persona_impression_sources
+            ORDER BY version_id, created_at, id
+            """
+        )
+        evidence_signals = self._rows(
+            """
+            SELECT id, profile_id, target_layer, target_group_id, target_version_id,
+                   source_message_id, source_fact_version_id, signal_kind,
+                   reinforcement_delta, disputation_delta, correlation_key, created_at
+            FROM memory_evidence_signals
+            ORDER BY created_at, id
+            """
+        )
+        conflicts = self._rows(
+            """
+            SELECT id, profile_id, target_layer, target_group_id, incumbent_version_id,
+                   challenger_version_id, status, resolution, source_message_id,
+                   created_at, resolved_at
+            FROM memory_conflicts
+            ORDER BY created_at, id
+            """
+        )
+        audit_events = tuple(
+            _decode_audit_metadata(row)
+            for row in self._rows(
+                """
+                SELECT id, profile_id, owner_layer, owner_group_id, version_id,
+                       source_message_id, event_type, reason_code, reinforcement_delta,
+                       disputation_delta, metadata_json, occurred_at
+                FROM memory_audit_events
+                ORDER BY occurred_at, id
+                """
+            )
+        )
+        return MemoryExportBundle(
+            schema,
+            groups,
+            versions,
+            sources,
+            recent_summaries,
+            recent_message_refs,
+            reflection_groups,
+            reflection_versions,
+            reflection_sources,
+            persona_groups,
+            persona_versions,
+            persona_sources,
+            evidence_signals,
+            conflicts,
+            audit_events,
+        )
 
     def _schema_version(self) -> int:
         row = self._connection.execute("PRAGMA user_version").fetchone()
@@ -363,6 +506,19 @@ class SQLiteExportRepository:
         cursor = self._connection.execute(statement)
         columns = tuple(str(column[0]) for column in (cursor.description or ()))
         return tuple(dict(zip(columns, row, strict=True)) for row in cursor.fetchall())
+
+
+def _decode_audit_metadata(row: Mapping[str, object]) -> Mapping[str, object]:
+    decoded = dict(row)
+    raw = decoded.pop("metadata_json", "{}")
+    try:
+        metadata = json.loads(str(raw))
+    except json.JSONDecodeError as exc:
+        raise ExportError("memory audit metadata is invalid") from exc
+    if not isinstance(metadata, dict):
+        raise ExportError("memory audit metadata must be an object")
+    decoded["metadata"] = metadata
+    return decoded
 
 
 def export_chat_json(
@@ -395,7 +551,7 @@ def export_memory_json(
     *,
     exported_at: datetime | None = None,
 ) -> Path:
-    """Load one memory snapshot and atomically write ``amadeus-memory-export/v1``."""
+    """Export persistent five-layer semantics without vectors or chat-body copies."""
 
     bundle = load_bundle()
     if not isinstance(bundle, MemoryExportBundle):
@@ -404,9 +560,30 @@ def export_memory_json(
         "format": MEMORY_EXPORT_FORMAT,
         "exported_at": _timestamp(exported_at),
         "database_schema": bundle.database_schema,
-        "groups": list(bundle.groups),
-        "versions": list(bundle.versions),
-        "sources": list(bundle.sources),
+        "layers": {
+            "recent": {
+                "summaries": list(bundle.recent_summaries),
+                "message_refs": list(bundle.recent_message_refs),
+            },
+            "facts": {
+                "groups": list(bundle.groups),
+                "versions": list(bundle.versions),
+                "sources": list(bundle.sources),
+            },
+            "reflections": {
+                "groups": list(bundle.reflection_groups),
+                "versions": list(bundle.reflection_versions),
+                "sources": list(bundle.reflection_sources),
+            },
+            "persona_impressions": {
+                "groups": list(bundle.persona_groups),
+                "versions": list(bundle.persona_versions),
+                "sources": list(bundle.persona_sources),
+            },
+        },
+        "evidence_signals": list(bundle.evidence_signals),
+        "conflicts": list(bundle.conflicts),
+        "audit_events": list(bundle.audit_events),
     }
     return _atomic_write_json(Path(destination), payload, error_type=ExportError)
 

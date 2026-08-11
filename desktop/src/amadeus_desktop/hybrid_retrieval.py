@@ -11,11 +11,14 @@ from enum import StrEnum
 
 RRF_K = 60
 MAX_SOURCE_HITS = 30
-MAX_USER_RESULTS = 8
+MAX_USER_RESULTS = 6
+MAX_REFLECTION_RESULTS = 2
+MAX_PERSONA_IMPRESSION_RESULTS = 2
 MAX_PERSONA_RESULTS = 4
+MAX_DERIVED_AND_FACT_RESULTS = 8
 PINNED_COEFFICIENT = 1.25
-MAX_SUCCESSFUL_RECALLS_FOR_BOOST = 5
-SUCCESSFUL_RECALL_STEP = 0.01
+RECENT_RECALL_PENALTY = 0.70
+STRONG_VECTOR_RELEVANCE = 0.82
 EVENT_HALF_LIFE_DAYS = 30.0
 AUTO_ARCHIVE_INACTIVE_DAYS = 90.0
 AUTO_ARCHIVE_SCORE = 0.15
@@ -33,6 +36,8 @@ _SUCCESS_TERMINALS = frozenset({"completed", "user_stopped"})
 
 class RetrievalCorpus(StrEnum):
     USER_MEMORY = "user_memory"
+    MEMORY_REFLECTION = "memory_reflection"
+    MEMORY_PERSONA_IMPRESSION = "memory_persona_impression"
     PERSONA_KNOWLEDGE = "persona_knowledge"
 
 
@@ -53,8 +58,11 @@ class RetrievalItem:
     corpus: RetrievalCorpus
     content: str
     kind: str = ""
+    topic_key: str = ""
     importance: float = 1.0
     confidence: float = 1.0
+    evidence_score: float = 0.0
+    status_weight: float = 1.0
     pinned: bool = False
     successful_recall_count: int = 0
     created_at: datetime | None = None
@@ -74,6 +82,8 @@ class HybridResult:
     decay_weight: float
     pinned_weight: float
     success_weight: float
+    evidence_weight: float
+    repetition_weight: float
     fts_rank: int | None
     vector_rank: int | None
     vector_similarity: float | None
@@ -84,6 +94,8 @@ class RetrievalBundle:
     """Separated results ready for independent prompt budget sections."""
 
     user_memories: tuple[HybridResult, ...] = ()
+    reflections: tuple[HybridResult, ...] = ()
+    persona_impressions: tuple[HybridResult, ...] = ()
     persona_knowledge: tuple[HybridResult, ...] = ()
 
     @property
@@ -93,6 +105,14 @@ class RetrievalBundle:
     @property
     def persona_knowledge_ids(self) -> tuple[str, ...]:
         return tuple(result.item.target_id for result in self.persona_knowledge)
+
+    @property
+    def reflection_version_ids(self) -> tuple[str, ...]:
+        return tuple(result.item.target_id for result in self.reflections)
+
+    @property
+    def persona_impression_version_ids(self) -> tuple[str, ...]:
+        return tuple(result.item.target_id for result in self.persona_impressions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +181,8 @@ def fuse_hybrid_results(
     vector_threshold: float,
     now: datetime | None = None,
     limit: int = MAX_USER_RESULTS,
+    query_text: str = "",
+    recently_recalled_ids: Iterable[str] = (),
 ) -> tuple[HybridResult, ...]:
     """Fuse two top-30 lists with RRF, relevance gating, and quality weights."""
 
@@ -180,6 +202,7 @@ def fuse_hybrid_results(
     vector_scores = {hit.target_id: float(hit.score) for hit in qualified_vector_hits}
     candidate_ids = set(fts_ranks) | set(vector_ranks)
     reference_time = _as_utc(now or datetime.now(UTC))
+    recently_recalled = frozenset(recently_recalled_ids)
 
     results: list[HybridResult] = []
     for target_id in candidate_ids:
@@ -195,19 +218,29 @@ def fuse_hybrid_results(
         quality = (item.importance + item.confidence) / 2.0
         decay = decay_weight(item, now=reference_time)
         pinned = PINNED_COEFFICIENT if item.pinned else 1.0
-        success = 1.0 + SUCCESSFUL_RECALL_STEP * min(
-            item.successful_recall_count,
-            MAX_SUCCESSFUL_RECALLS_FOR_BOOST,
+        success = 1.0
+        evidence = max(0.25, min(1.25, item.status_weight * (1.0 + item.evidence_score / 8.0)))
+        strong_relevance = vector_scores.get(
+            target_id, -1.0
+        ) >= STRONG_VECTOR_RELEVANCE or _topic_directly_hit(query_text, item.topic_key)
+        repetition = (
+            RECENT_RECALL_PENALTY
+            if target_id in recently_recalled and not strong_relevance
+            else 1.0
         )
         results.append(
             HybridResult(
                 item=item,
-                final_score=rrf_score * quality * decay * pinned * success,
+                final_score=(
+                    rrf_score * quality * decay * pinned * success * evidence * repetition
+                ),
                 rrf_score=rrf_score,
                 quality_weight=quality,
                 decay_weight=decay,
                 pinned_weight=pinned,
                 success_weight=success,
+                evidence_weight=evidence,
+                repetition_weight=repetition,
                 fts_rank=fts_rank,
                 vector_rank=vector_rank,
                 vector_similarity=vector_scores.get(target_id),
@@ -222,14 +255,23 @@ def build_retrieval_bundle(
     user_fts_hits: Sequence[RankedRetrievalHit],
     user_vector_hits: Sequence[RankedRetrievalHit],
     user_items: Mapping[str, RetrievalItem] | Iterable[RetrievalItem],
+    reflection_fts_hits: Sequence[RankedRetrievalHit] = (),
+    reflection_vector_hits: Sequence[RankedRetrievalHit] = (),
+    reflection_items: Mapping[str, RetrievalItem] | Iterable[RetrievalItem] = (),
+    persona_impression_fts_hits: Sequence[RankedRetrievalHit] = (),
+    persona_impression_vector_hits: Sequence[RankedRetrievalHit] = (),
+    persona_impression_items: Mapping[str, RetrievalItem] | Iterable[RetrievalItem] = (),
     persona_fts_hits: Sequence[RankedRetrievalHit],
     persona_vector_hits: Sequence[RankedRetrievalHit],
     persona_items: Mapping[str, RetrievalItem] | Iterable[RetrievalItem],
     vector_threshold: float,
     now: datetime | None = None,
+    query_text: str = "",
+    recently_recalled: Mapping[RetrievalCorpus, Iterable[str]] | None = None,
 ) -> RetrievalBundle:
     """Fuse user and persona stores independently and enforce their result caps."""
 
+    recent = recently_recalled or {}
     users = fuse_hybrid_results(
         fts_hits=user_fts_hits,
         vector_hits=user_vector_hits,
@@ -237,6 +279,28 @@ def build_retrieval_bundle(
         vector_threshold=vector_threshold,
         now=now,
         limit=MAX_USER_RESULTS,
+        query_text=query_text,
+        recently_recalled_ids=recent.get(RetrievalCorpus.USER_MEMORY, ()),
+    )
+    reflections = fuse_hybrid_results(
+        fts_hits=reflection_fts_hits,
+        vector_hits=reflection_vector_hits,
+        items=reflection_items,
+        vector_threshold=vector_threshold,
+        now=now,
+        limit=MAX_REFLECTION_RESULTS,
+        query_text=query_text,
+        recently_recalled_ids=recent.get(RetrievalCorpus.MEMORY_REFLECTION, ()),
+    )
+    impressions = fuse_hybrid_results(
+        fts_hits=persona_impression_fts_hits,
+        vector_hits=persona_impression_vector_hits,
+        items=persona_impression_items,
+        vector_threshold=vector_threshold,
+        now=now,
+        limit=MAX_PERSONA_IMPRESSION_RESULTS,
+        query_text=query_text,
+        recently_recalled_ids=recent.get(RetrievalCorpus.MEMORY_PERSONA_IMPRESSION, ()),
     )
     personas = fuse_hybrid_results(
         fts_hits=persona_fts_hits,
@@ -245,8 +309,27 @@ def build_retrieval_bundle(
         vector_threshold=vector_threshold,
         now=now,
         limit=MAX_PERSONA_RESULTS,
+        query_text=query_text,
+        recently_recalled_ids=recent.get(RetrievalCorpus.PERSONA_KNOWLEDGE, ()),
     )
-    return RetrievalBundle(user_memories=users, persona_knowledge=personas)
+    semantic = sorted(
+        (*users, *reflections, *impressions),
+        key=lambda result: (-result.final_score, result.item.target_id),
+    )[:MAX_DERIVED_AND_FACT_RESULTS]
+    return RetrievalBundle(
+        user_memories=tuple(
+            result for result in semantic if result.item.corpus is RetrievalCorpus.USER_MEMORY
+        ),
+        reflections=tuple(
+            result for result in semantic if result.item.corpus is RetrievalCorpus.MEMORY_REFLECTION
+        ),
+        persona_impressions=tuple(
+            result
+            for result in semantic
+            if result.item.corpus is RetrievalCorpus.MEMORY_PERSONA_IMPRESSION
+        ),
+        persona_knowledge=personas,
+    )
 
 
 def decay_weight(item: RetrievalItem, *, now: datetime | None = None) -> float:
@@ -344,6 +427,21 @@ def _validate_item(item: RetrievalItem) -> None:
         raise ValueError("confidence must be finite and between 0 and 1")
     if item.successful_recall_count < 0:
         raise ValueError("successful_recall_count must not be negative")
+    if not math.isfinite(item.evidence_score):
+        raise ValueError("evidence_score must be finite")
+    if not math.isfinite(item.status_weight) or item.status_weight <= 0.0:
+        raise ValueError("status_weight must be finite and positive")
+
+
+def _topic_directly_hit(query: str, topic_key: str) -> bool:
+    normalized_query = " ".join(query.casefold().split())
+    normalized_topic = " ".join(topic_key.casefold().split())
+    if not normalized_query or not normalized_topic:
+        return False
+    if normalized_topic in normalized_query:
+        return True
+    terms = tuple(term for term in re.split(r"[^\w\u3400-\u9fff]+", normalized_topic) if term)
+    return bool(terms) and all(term in normalized_query for term in terms)
 
 
 def _validate_similarity(value: float) -> float:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from inspect import Parameter, signature
 from pathlib import Path
@@ -34,8 +34,9 @@ from amadeus_desktop.conversation_store import (
 )
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
 from amadeus_desktop.database import SQLiteDatabase
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
 from amadeus_desktop.memory_models import MemoryKind as DomainMemoryKind
-from amadeus_desktop.memory_models import PromptMemory
+from amadeus_desktop.memory_models import MemoryLayer, PromptMemory, WorkingMemorySnapshot
 from amadeus_desktop.memory_service import MemoryService
 from amadeus_desktop.persona import (
     build_capability_safety_boundary,
@@ -55,6 +56,8 @@ from amadeus_desktop.storage_models import (
     Conversation,
     MemoryRecord,
     MemorySource,
+    MemoryVersionOperation,
+    MemoryVersionOrigin,
     MessagePage,
     ProactiveTrigger,
     StorageNotFoundError,
@@ -76,6 +79,8 @@ MESSAGE_PAGE_SIZE = 40
 # prompt budgeter, so fetch one extra row to retain 20 historical messages.
 PROMPT_RECENT_MESSAGE_LIMIT = 21
 _USER_MEMORY_SECTION_PREFIX = "[用户长期记忆："
+_REFLECTION_SECTION_PREFIX = "[长期反思："
+_PERSONA_IMPRESSION_SECTION_PREFIX = "[互动人格印象："
 
 
 @dataclass(slots=True)
@@ -83,6 +88,7 @@ class LocalDataStores:
     database: SQLiteDatabase
     conversations: ConversationStore
     memories: MemoryService
+    deep_memories: DeepMemoryStore
     personas: PersonaRepository
     vectors: VectorStore
     jobs: BackgroundJobStore
@@ -130,6 +136,15 @@ class OlderMessagesSnapshot:
 class MemoryListSnapshot:
     rows: tuple[dict[str, object], ...]
     failed_jobs: tuple[dict[str, object], ...]
+    working_rows: tuple[dict[str, object], ...] = ()
+    recent_rows: tuple[dict[str, object], ...] = ()
+    reflection_rows: tuple[dict[str, object], ...] = ()
+    persona_rows: tuple[dict[str, object], ...] = ()
+    static_persona_rows: tuple[dict[str, object], ...] = ()
+    timeline_rows: tuple[dict[str, object], ...] = ()
+    audit_rows: tuple[dict[str, object], ...] = ()
+    conflict_rows: tuple[dict[str, object], ...] = ()
+    layer_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -138,14 +153,19 @@ class _PendingPromptPreparation:
     turn: object
     memory_enabled: bool
     memory_disable_epoch: int
+    deep_memory_enabled: bool
+    deep_memory_disable_epoch: int
     follow_user_language: bool
     on_success: Callable[[PreparedPrompt], None]
     on_failure: Callable[[str], None]
     vector_future: Future[VectorRetrievalResult] | None = None
 
 
-def _supports_include_user(vector_query: Callable[..., object] | None) -> bool:
-    """Detect the P5B keyword without breaking legacy injected callbacks."""
+def _supports_parameter(
+    vector_query: Callable[..., object] | None,
+    name: str,
+) -> bool:
+    """Detect optional vector-query keywords without breaking injected callbacks."""
 
     if vector_query is None:
         return False
@@ -154,7 +174,7 @@ def _supports_include_user(vector_query: Callable[..., object] | None) -> bool:
     except (TypeError, ValueError):
         return False
     return any(
-        parameter.name == "include_user" or parameter.kind is Parameter.VAR_KEYWORD
+        parameter.name == name or parameter.kind is Parameter.VAR_KEYWORD
         for parameter in parameters
     )
 
@@ -169,10 +189,59 @@ def _without_user_memory(prepared: PreparedPrompt) -> PreparedPrompt:
             for message in prepared.messages
             if not (
                 message.role is PromptRole.SYSTEM
-                and message.content.startswith(_USER_MEMORY_SECTION_PREFIX)
+                and isinstance(message.content, str)
+                and message.content.startswith(
+                    (
+                        _USER_MEMORY_SECTION_PREFIX,
+                        _REFLECTION_SECTION_PREFIX,
+                        _PERSONA_IMPRESSION_SECTION_PREFIX,
+                    )
+                )
             )
         ),
         user_memory_version_ids=(),
+        reflection_version_ids=(),
+        persona_impression_version_ids=(),
+        working_memory_snapshot=_filtered_working_snapshot(
+            prepared.working_memory_snapshot,
+            allowed_layers={MemoryLayer.STATIC_PERSONA},
+        ),
+    )
+
+
+def _without_deep_memory(prepared: PreparedPrompt) -> PreparedPrompt:
+    return replace(
+        prepared,
+        messages=tuple(
+            message
+            for message in prepared.messages
+            if not (
+                message.role is PromptRole.SYSTEM
+                and isinstance(message.content, str)
+                and message.content.startswith(
+                    (_REFLECTION_SECTION_PREFIX, _PERSONA_IMPRESSION_SECTION_PREFIX)
+                )
+            )
+        ),
+        reflection_version_ids=(),
+        persona_impression_version_ids=(),
+        working_memory_snapshot=_filtered_working_snapshot(
+            prepared.working_memory_snapshot,
+            allowed_layers={MemoryLayer.FACT, MemoryLayer.STATIC_PERSONA},
+        ),
+    )
+
+
+def _filtered_working_snapshot(
+    snapshot: WorkingMemorySnapshot | None,
+    *,
+    allowed_layers: set[MemoryLayer],
+) -> WorkingMemorySnapshot | None:
+    if snapshot is None:
+        return None
+    return replace(
+        snapshot,
+        selected=tuple(item for item in snapshot.selected if item.layer in allowed_layers),
     )
 
 
@@ -191,6 +260,7 @@ def create_local_data_stores(
         database=database,
         conversations=ConversationStore(database),
         memories=MemoryStore(database),
+        deep_memories=DeepMemoryStore(database),
         personas=PersonaRepository(database),
         vectors=VectorStore(database),
         jobs=BackgroundJobStore(database),
@@ -214,6 +284,9 @@ class LocalDataService(QObject):
     memories_loaded = Signal(object)
     memories_cleared = Signal(int)
     memory_sources_loaded = Signal(str, object)
+    layer_sources_loaded = Signal(str, str, object)
+    layer_versions_loaded = Signal(str, str, object)
+    deletion_impact_loaded = Signal(str, str, object)
     source_context_loaded = Signal(object, str)
     operation_failed = Signal(str, str)
     write_availability_changed = Signal(bool)
@@ -230,6 +303,7 @@ class LocalDataService(QObject):
         runtime: SerialDataThread,
         *,
         memory_enabled: bool = True,
+        deep_memory_enabled: bool = True,
         follow_user_language: bool = True,
         prompt_service: DefaultPromptContextService | None = None,
         vector_query: Callable[..., Future[VectorRetrievalResult]] | None = None,
@@ -239,16 +313,26 @@ class LocalDataService(QObject):
         super().__init__(parent)
         self.runtime = runtime
         self._memory_enabled = bool(memory_enabled)
+        self._deep_memory_enabled = bool(deep_memory_enabled)
         self._follow_user_language = bool(follow_user_language)
         self._memory_disable_epoch = 0
+        self._deep_memory_disable_epoch = 0
         self._prompt_service = prompt_service or DefaultPromptContextService()
         self._vector_query = vector_query
-        self._vector_query_supports_include_user = _supports_include_user(vector_query)
+        self._vector_query_supports_include_user = _supports_parameter(
+            vector_query,
+            "include_user",
+        )
+        self._vector_query_supports_include_deep = _supports_parameter(
+            vector_query,
+            "include_deep",
+        )
         self._vector_timeout_ms = max(1, int(vector_timeout_ms))
         self._pending_prompt_preparations: dict[str, _PendingPromptPreparation] = {}
         self._accept_prompt_preparations = True
         self._current_conversation_id: str | None = None
         self._next_before_sequence: int | None = None
+        self._working_memory_snapshot: WorkingMemorySnapshot | None = None
         self._writable = False
         self._provider_name: str | None = None
         self._model_name: str | None = None
@@ -266,8 +350,16 @@ class LocalDataService(QObject):
         return self._memory_enabled
 
     @property
+    def deep_memory_enabled(self) -> bool:
+        return self._deep_memory_enabled
+
+    @property
     def current_conversation_id(self) -> str | None:
         return self._current_conversation_id
+
+    @property
+    def working_memory_snapshot(self) -> WorkingMemorySnapshot | None:
+        return self._working_memory_snapshot
 
     @property
     def is_writable(self) -> bool:
@@ -286,6 +378,12 @@ class LocalDataService(QObject):
             # prepared, even if the setting is enabled again before completion.
             self._memory_disable_epoch += 1
         self._memory_enabled = normalized
+
+    def set_deep_memory_enabled(self, enabled: bool) -> None:
+        normalized = bool(enabled)
+        if self._deep_memory_enabled and not normalized:
+            self._deep_memory_disable_epoch += 1
+        self._deep_memory_enabled = normalized
 
     def set_follow_user_language(self, enabled: bool) -> None:
         self._follow_user_language = bool(enabled)
@@ -346,8 +444,10 @@ class LocalDataService(QObject):
         if not self._accept_prompt_preparations or not self._writable or conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
+        deep_memory_enabled = self._deep_memory_enabled
         follow_user_language = self._follow_user_language
         memory_disable_epoch = self._memory_disable_epoch
+        deep_memory_disable_epoch = self._deep_memory_disable_epoch
 
         def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
             stored_attachments = tuple(
@@ -369,6 +469,7 @@ class LocalDataService(QObject):
                 conversation_id,
                 _effective_user_text(turn.user_message.content),
                 memory_enabled=memory_enabled,
+                deep_memory_enabled=deep_memory_enabled,
             )
 
         return (
@@ -380,6 +481,8 @@ class LocalDataService(QObject):
                     turn,
                     memory_enabled=memory_enabled,
                     memory_disable_epoch=memory_disable_epoch,
+                    deep_memory_enabled=deep_memory_enabled,
+                    deep_memory_disable_epoch=deep_memory_disable_epoch,
                     follow_user_language=follow_user_language,
                     on_success=on_success,
                     on_failure=on_failure,
@@ -394,8 +497,10 @@ class LocalDataService(QObject):
         if not self._accept_prompt_preparations or not self._writable or conversation_id is None:
             return False
         memory_enabled = self._memory_enabled
+        deep_memory_enabled = self._deep_memory_enabled
         follow_user_language = self._follow_user_language
         memory_disable_epoch = self._memory_disable_epoch
+        deep_memory_disable_epoch = self._deep_memory_disable_epoch
 
         def operation(stores: LocalDataStores) -> PromptRetrievalSeed:
             # A previous two-step preparation may have committed only the user
@@ -433,6 +538,7 @@ class LocalDataService(QObject):
                 conversation_id,
                 _effective_user_text(turn.user_message.content),
                 memory_enabled=memory_enabled,
+                deep_memory_enabled=deep_memory_enabled,
             )
 
         return (
@@ -444,6 +550,8 @@ class LocalDataService(QObject):
                     turn,
                     memory_enabled=memory_enabled,
                     memory_disable_epoch=memory_disable_epoch,
+                    deep_memory_enabled=deep_memory_enabled,
+                    deep_memory_disable_epoch=deep_memory_disable_epoch,
                     follow_user_language=follow_user_language,
                     on_success=on_success,
                     on_failure=on_failure,
@@ -460,6 +568,8 @@ class LocalDataService(QObject):
         *,
         memory_enabled: bool,
         memory_disable_epoch: int,
+        deep_memory_enabled: bool,
+        deep_memory_disable_epoch: int,
         follow_user_language: bool,
         on_success: Callable[[PreparedPrompt], None],
         on_failure: Callable[[str], None],
@@ -472,6 +582,8 @@ class LocalDataService(QObject):
             turn=turn,
             memory_enabled=memory_enabled,
             memory_disable_epoch=memory_disable_epoch,
+            deep_memory_enabled=deep_memory_enabled,
+            deep_memory_disable_epoch=deep_memory_disable_epoch,
             follow_user_language=follow_user_language,
             on_success=on_success,
             on_failure=on_failure,
@@ -483,10 +595,10 @@ class LocalDataService(QObject):
         try:
             include_user = self._user_memory_allowed(pending)
             if self._vector_query_supports_include_user:
-                future = self._vector_query(
-                    seed.retrieval_query,
-                    include_user=include_user,
-                )
+                keywords: dict[str, bool] = {"include_user": include_user}
+                if self._vector_query_supports_include_deep:
+                    keywords["include_deep"] = self._deep_memory_allowed(pending)
+                future = self._vector_query(seed.retrieval_query, **keywords)
             else:
                 # Compatibility for injected P5A/fake callbacks.  The final
                 # data-thread stage still discards any legacy user-vector hits.
@@ -528,6 +640,7 @@ class LocalDataService(QObject):
             # finish later, but its callback sees no pending token and is ignored.
             pending.vector_future.cancel()
         memory_enabled = self._user_memory_allowed(pending)
+        deep_memory_enabled = self._deep_memory_allowed(pending)
 
         def operation(stores: LocalDataStores) -> PreparedPrompt:
             try:
@@ -537,9 +650,11 @@ class LocalDataService(QObject):
                     turn_id=pending.turn.turn_id,
                     attempt=pending.turn.attempt,
                     memory_enabled=memory_enabled,
+                    deep_memory_enabled=deep_memory_enabled,
                     vector_result=vector_result,
                     prompt_service=self._prompt_service,
                     follow_user_language=pending.follow_user_language,
+                    message_id=pending.turn.user_message.message_id,
                 )
             except Exception:
                 # The user row already committed in stage one.  Keep the stable
@@ -561,6 +676,9 @@ class LocalDataService(QObject):
             # memory was disabled while final revalidation was queued in SQLite.
             if not self._user_memory_allowed(pending):
                 prepared = _without_user_memory(prepared)
+            elif not self._deep_memory_allowed(pending):
+                prepared = _without_deep_memory(prepared)
+            self._working_memory_snapshot = prepared.working_memory_snapshot
             self._turn_provider_metadata[pending.turn.turn_id] = (
                 (
                     self._multimodal_provider_name,
@@ -716,7 +834,9 @@ class LocalDataService(QObject):
         ticket_id = prepared.retrieval_ticket_id or f"{turn.turn_id}:{turn.attempt}"
         memory_enabled = self._memory_enabled
 
-        def operation(stores: LocalDataStores) -> tuple[int, int]:
+        deep_memory_enabled = self._deep_memory_enabled
+
+        def operation(stores: LocalDataStores) -> tuple[int, int, int, int]:
             user_message = stores.conversations.get_message(turn.user_message.message_id)
             user_count = stores.memories.record_successful_recall(
                 ticket_id,
@@ -738,7 +858,33 @@ class LocalDataService(QObject):
                 assistant_message_id=turn.assistant_message.message_id,
                 attempt=prepared.attempt,
             )
-            return user_count, persona_count
+            reflection_count = stores.deep_memories.record_successful_recall(
+                MemoryLayer.REFLECTION,
+                ticket_id,
+                prepared.reflection_version_ids if memory_enabled and deep_memory_enabled else (),
+                terminal_status=turn.terminal_reason.value,
+                first_chunk_received=True,
+                profile_id=DEFAULT_PROFILE_ID,
+                conversation_id=user_message.conversation_id,
+                assistant_message_id=turn.assistant_message.message_id,
+                attempt=prepared.attempt,
+            )
+            impression_count = stores.deep_memories.record_successful_recall(
+                MemoryLayer.PERSONA,
+                ticket_id,
+                (
+                    prepared.persona_impression_version_ids
+                    if memory_enabled and deep_memory_enabled
+                    else ()
+                ),
+                terminal_status=turn.terminal_reason.value,
+                first_chunk_received=True,
+                profile_id=DEFAULT_PROFILE_ID,
+                conversation_id=user_message.conversation_id,
+                assistant_message_id=turn.assistant_message.message_id,
+                attempt=prepared.attempt,
+            )
+            return user_count, reflection_count, impression_count, persona_count
 
         self.runtime.submit(
             operation,
@@ -752,13 +898,21 @@ class LocalDataService(QObject):
         if not self._writable or not self._memory_enabled:
             return
 
-        def completed(memory_ids: tuple[str, ...]) -> None:
-            if memory_ids:
+        def completed(result: tuple[tuple[str, ...], int]) -> None:
+            memory_ids, derived_count = result
+            if memory_ids or derived_count:
                 self.index_rebuild_requested.emit("user_memory")
                 self.refresh_memories()
 
         self.runtime.submit(
-            lambda stores: stores.memories.archive_decayed_events(profile_id=DEFAULT_PROFILE_ID),
+            lambda stores: (
+                stores.memories.archive_decayed_events(profile_id=DEFAULT_PROFILE_ID),
+                (
+                    stores.deep_memories.run_maintenance(profile_id=DEFAULT_PROFILE_ID)
+                    if self._deep_memory_enabled
+                    else 0
+                ),
+            ),
             priority=DataPriority.BACKGROUND,
             on_success=completed,
             on_failure=lambda category: self.operation_failed.emit("memory_maintenance", category),
@@ -1079,9 +1233,12 @@ class LocalDataService(QObject):
         if not isinstance(value, ConversationSnapshot):
             self.operation_failed.emit(failure_operation, "InvalidConversationSnapshot")
             return
-        self._current_conversation_id = (
+        next_conversation_id = (
             None if value.conversation is None else value.conversation.conversation_id
         )
+        if next_conversation_id != self._current_conversation_id:
+            self._working_memory_snapshot = None
+        self._current_conversation_id = next_conversation_id
         self._next_before_sequence = value.next_before_sequence
         self.conversation_loaded.emit(value)
 
@@ -1104,6 +1261,9 @@ class LocalDataService(QObject):
         *,
         pinned: bool | None = None,
     ) -> None:
+        working_snapshot = self._working_memory_snapshot
+        conversation_id = self._current_conversation_id
+
         def operation(stores: LocalDataStores) -> MemoryListSnapshot:
             if query.strip():
                 records = tuple(
@@ -1154,8 +1314,79 @@ class LocalDataService(QObject):
             rows = tuple(
                 _memory_view_row(record, recall_stats=stats[record.memory_id]) for record in ordered
             )
+            if query.strip():
+                reflections = tuple(
+                    record
+                    for record, _rank in stores.deep_memories.search(
+                        MemoryLayer.REFLECTION,
+                        query,
+                        include_inactive=True,
+                        limit=500,
+                    )
+                )
+                impressions = tuple(
+                    record
+                    for record, _rank in stores.deep_memories.search(
+                        MemoryLayer.PERSONA,
+                        query,
+                        include_inactive=True,
+                        limit=500,
+                    )
+                )
+            else:
+                reflections = stores.deep_memories.list_records(
+                    MemoryLayer.REFLECTION,
+                    limit=500,
+                )
+                impressions = stores.deep_memories.list_records(
+                    MemoryLayer.PERSONA,
+                    limit=500,
+                )
+            reflection_rows = tuple(_derived_view_row(record) for record in reflections)
+            persona_rows = tuple(_derived_view_row(record) for record in impressions)
+            static_documents = stores.personas.list_active_documents("kurisu", limit=500)
+            static_persona_rows = tuple(
+                _static_persona_view_row(document)
+                for document in static_documents
+                if not query.strip() or query.casefold() in document.content.casefold()
+            )
+            recent_rows = _recent_view_rows(stores, conversation_id)
+            timeline_rows = tuple(
+                _timeline_view_row(item) for item in stores.deep_memories.event_timeline(limit=500)
+            )
+            audit_rows = tuple(
+                _audit_view_row(item) for item in stores.deep_memories.list_audit_events(limit=500)
+            )
+            conflict_rows = tuple(
+                _conflict_view_row(item)
+                for item in stores.deep_memories.list_conflicts(
+                    include_resolved=True,
+                    limit=500,
+                )
+            )
+            working_rows = _working_view_rows(working_snapshot)
             failed = tuple(_job_view_row(job) for job in stores.jobs.list_failed())
-            return MemoryListSnapshot(rows, failed)
+            return MemoryListSnapshot(
+                rows,
+                failed,
+                working_rows=working_rows,
+                recent_rows=recent_rows,
+                reflection_rows=reflection_rows,
+                persona_rows=persona_rows,
+                static_persona_rows=static_persona_rows,
+                timeline_rows=timeline_rows,
+                audit_rows=audit_rows,
+                conflict_rows=conflict_rows,
+                layer_counts={
+                    "working": len(working_rows),
+                    "recent": len(recent_rows),
+                    "fact": len(rows),
+                    "reflection": len(reflection_rows),
+                    "persona": len(persona_rows),
+                    "timeline": len(timeline_rows),
+                    "audit": len(audit_rows),
+                },
+            )
 
         request_id = self.runtime.submit(
             operation,
@@ -1177,7 +1408,7 @@ class LocalDataService(QObject):
             self.refresh_memories()
 
         request_id = self.runtime.submit(
-            lambda stores: stores.memories.clear_all_memories(profile_id=DEFAULT_PROFILE_ID),
+            _clear_all_semantic_memory,
             priority=DataPriority.INTERACTIVE,
             on_success=completed,
             on_failure=lambda category: self.operation_failed.emit("clear_memories", category),
@@ -1211,10 +1442,98 @@ class LocalDataService(QObject):
         if request_id is None:
             self._on_persistence_submission_failed("memory_sources")
 
+    def load_layer_details(self, layer: str, memory_id: str) -> None:
+        """Load immutable versions and live provenance without blocking the UI thread."""
+
+        if layer not in {
+            MemoryLayer.FACT.value,
+            MemoryLayer.REFLECTION.value,
+            MemoryLayer.PERSONA.value,
+        }:
+            self.layer_sources_loaded.emit(layer, memory_id, ())
+            self.layer_versions_loaded.emit(layer, memory_id, ())
+            return
+
+        def operation(
+            stores: LocalDataStores,
+        ) -> tuple[tuple[dict[str, object], ...], tuple[object, ...]]:
+            if layer == MemoryLayer.FACT.value:
+                record = stores.memories.get(memory_id)
+                sources = tuple(
+                    _source_view_row(
+                        stores,
+                        source,
+                        version_number=record.current_version.version_number,
+                    )
+                    for source in stores.memories.list_sources(
+                        memory_id,
+                        version_id=record.current_version.version_id,
+                    )
+                )
+                versions: tuple[object, ...] = stores.memories.list_versions(memory_id)
+                return sources, versions
+            layer_value = MemoryLayer(layer)
+            record = stores.deep_memories.get(layer_value, memory_id)
+            sources = tuple(
+                _derived_source_view_row(
+                    stores,
+                    source,
+                    layer=layer_value,
+                    version_number=record.current_version.version_number,
+                )
+                for source in stores.deep_memories.list_sources(
+                    layer_value,
+                    memory_id,
+                    version_id=record.current_version.version_id,
+                )
+            )
+            return sources, stores.deep_memories.list_versions(layer_value, memory_id)
+
+        def completed(result: object) -> None:
+            sources, versions = result
+            self.layer_sources_loaded.emit(layer, memory_id, sources)
+            self.layer_versions_loaded.emit(layer, memory_id, versions)
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.INTERACTIVE,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit("memory_details", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("memory_details")
+
+    def load_deletion_impact(self, layer: str, memory_id: str) -> None:
+        if layer not in {
+            MemoryLayer.FACT.value,
+            MemoryLayer.REFLECTION.value,
+            MemoryLayer.PERSONA.value,
+        }:
+            self.operation_failed.emit("memory_delete_impact", "InvalidMemoryLayer")
+            return
+        request_id = self.runtime.submit(
+            lambda stores: stores.deep_memories.deletion_impact(
+                MemoryLayer(layer),
+                memory_id,
+            ),
+            priority=DataPriority.INTERACTIVE,
+            on_success=lambda impact: self.deletion_impact_loaded.emit(
+                layer,
+                memory_id,
+                impact,
+            ),
+            on_failure=lambda category: self.operation_failed.emit(
+                "memory_delete_impact",
+                category,
+            ),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("memory_delete_impact")
+
     def edit_memory(self, memory_id: str, content: str) -> None:
         self._memory_write(
             "edit_memory",
-            lambda stores: stores.memories.edit_memory(memory_id, content),
+            lambda stores: _edit_fact(stores, memory_id, content),
             index_changed=True,
         )
 
@@ -1227,22 +1546,143 @@ class LocalDataService(QObject):
     def archive_memory(self, memory_id: str) -> None:
         self._memory_write(
             "archive_memory",
-            lambda stores: stores.memories.archive(memory_id),
+            lambda stores: _archive_fact(stores, memory_id),
             index_changed=True,
         )
 
     def restore_memory(self, memory_id: str) -> None:
         self._memory_write(
             "restore_memory",
-            lambda stores: stores.memories.restore(memory_id),
+            lambda stores: _restore_fact(stores, memory_id),
             index_changed=True,
         )
 
     def delete_memory(self, memory_id: str) -> None:
         self._memory_write(
             "delete_memory",
-            lambda stores: stores.memories.delete_memory(memory_id),
+            lambda stores: stores.deep_memories.delete_cascade(
+                MemoryLayer.FACT,
+                memory_id,
+            ),
             index_changed=True,
+        )
+
+    def edit_derived_memory(self, layer: str, memory_id: str, content: str) -> None:
+        self._derived_memory_write(
+            "edit_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.add_version(
+                layer_value,
+                memory_id,
+                content,
+            ),
+        )
+
+    def set_derived_memory_pinned(
+        self,
+        layer: str,
+        memory_id: str,
+        pinned: bool,
+    ) -> None:
+        self._derived_memory_write(
+            "pin_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.set_pinned(
+                layer_value,
+                memory_id,
+                pinned,
+            ),
+            index_changed=False,
+        )
+
+    def archive_derived_memory(self, layer: str, memory_id: str) -> None:
+        self._derived_memory_write(
+            "archive_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.archive(layer_value, memory_id),
+        )
+
+    def restore_derived_memory(self, layer: str, memory_id: str) -> None:
+        self._derived_memory_write(
+            "restore_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.restore(layer_value, memory_id),
+        )
+
+    def delete_derived_memory(self, layer: str, memory_id: str) -> None:
+        self._derived_memory_write(
+            "delete_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.delete_cascade(
+                layer_value,
+                memory_id,
+            ),
+        )
+
+    def confirm_derived_memory(self, layer: str, memory_id: str) -> None:
+        self._derived_memory_write(
+            "confirm_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.confirm(layer_value, memory_id),
+        )
+
+    def deny_derived_memory(self, layer: str, memory_id: str) -> None:
+        self._derived_memory_write(
+            "deny_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.deny(layer_value, memory_id),
+        )
+
+    def rollback_memory(self, layer: str, memory_id: str, version_id: str) -> None:
+        if layer == MemoryLayer.FACT.value:
+            self._memory_write(
+                "rollback_memory",
+                lambda stores: _rollback_fact(stores, memory_id, version_id),
+                index_changed=True,
+            )
+            return
+        self._derived_memory_write(
+            "rollback_derived_memory",
+            layer,
+            lambda stores, layer_value: stores.deep_memories.rollback(
+                layer_value,
+                memory_id,
+                version_id,
+            ),
+        )
+
+    def resolve_memory_conflict(
+        self,
+        conflict_id: str,
+        resolution: str,
+        merged_content: str = "",
+    ) -> None:
+        self._memory_write(
+            "resolve_memory_conflict",
+            lambda stores: stores.deep_memories.resolve_fact_conflict(
+                conflict_id,
+                resolution,
+                merged_content=merged_content if resolution == "merge" else None,
+            ),
+            index_changed=True,
+        )
+
+    def _derived_memory_write(
+        self,
+        name: str,
+        layer: str,
+        operation,
+        *,
+        index_changed: bool = True,
+    ) -> None:
+        if layer not in {MemoryLayer.REFLECTION.value, MemoryLayer.PERSONA.value}:
+            self.operation_failed.emit(name, "InvalidMemoryLayer")
+            return
+        layer_value = MemoryLayer(layer)
+        self._memory_write(
+            name,
+            lambda stores: operation(stores, layer_value),
+            index_changed=index_changed,
         )
 
     def retry_failed_job(self, job_id: str) -> None:
@@ -1287,6 +1727,14 @@ class LocalDataService(QObject):
             and pending.memory_disable_epoch == self._memory_disable_epoch
         )
 
+    def _deep_memory_allowed(self, pending: _PendingPromptPreparation) -> bool:
+        return (
+            self._user_memory_allowed(pending)
+            and pending.deep_memory_enabled
+            and self._deep_memory_enabled
+            and pending.deep_memory_disable_epoch == self._deep_memory_disable_epoch
+        )
+
     def stop_prompt_preparations(self) -> None:
         """Reject new prompt work and cancel queued vector queries."""
 
@@ -1299,6 +1747,7 @@ class LocalDataService(QObject):
 
     def shutdown(self, wait_ms: int = 5_000) -> bool:
         self.stop_prompt_preparations()
+        self._working_memory_snapshot = None
         self._turn_provider_metadata.clear()
         self._finalized_provider_metadata.clear()
         return self.runtime.shutdown(wait_ms)
@@ -1316,6 +1765,64 @@ def _initialize_stores(stores: LocalDataStores) -> ConversationSnapshot:
         conversations = stores.conversations.list_conversations()
         conversation = conversations[0] if conversations else None
     return _conversation_snapshot(stores, conversation)
+
+
+def _edit_fact(stores: LocalDataStores, memory_id: str, content: str) -> MemoryRecord:
+    record = stores.memories.edit_memory(memory_id, content)
+    stores.deep_memories.suppress_fact_descendants(
+        memory_id,
+        reason_code="upstream_edited",
+    )
+    return record
+
+
+def _rollback_fact(
+    stores: LocalDataStores,
+    memory_id: str,
+    version_id: str,
+) -> MemoryRecord:
+    versions = stores.memories.list_versions(memory_id)
+    selected = next((item for item in versions if item.version_id == version_id), None)
+    if selected is None:
+        raise StorageNotFoundError("memory version does not exist")
+    record = stores.memories.add_version(
+        memory_id,
+        selected.content,
+        importance=selected.importance,
+        confidence=1.0,
+        operation=MemoryVersionOperation.MANUAL_EDIT,
+        source_message_ids=(),
+        origin=MemoryVersionOrigin.MANUAL,
+        event_started_at=selected.event_started_at,
+        event_ended_at=selected.event_ended_at,
+        time_confidence=selected.time_confidence,
+    )
+    stores.deep_memories.suppress_fact_descendants(
+        memory_id,
+        reason_code="upstream_rollback",
+    )
+    return record
+
+
+def _archive_fact(stores: LocalDataStores, memory_id: str) -> MemoryRecord:
+    record = stores.memories.archive(memory_id)
+    stores.deep_memories.suppress_fact_descendants(
+        memory_id,
+        reason_code="upstream_archived",
+    )
+    return record
+
+
+def _restore_fact(stores: LocalDataStores, memory_id: str) -> MemoryRecord:
+    record = stores.memories.restore(memory_id)
+    stores.deep_memories.reevaluate_fact_descendants(memory_id)
+    return record
+
+
+def _clear_all_semantic_memory(stores: LocalDataStores) -> int:
+    derived = stores.deep_memories.clear_all(profile_id=DEFAULT_PROFILE_ID)
+    facts = stores.memories.clear_all_memories(profile_id=DEFAULT_PROFILE_ID)
+    return facts + derived
 
 
 def _conversation_snapshot(
@@ -1621,7 +2128,11 @@ def _memory_view_row(
     version = record.current_version
     return {
         "memory_id": record.memory_id,
+        "group_id": record.memory_id,
+        "version_id": version.version_id,
+        "layer": MemoryLayer.FACT.value,
         "kind": record.kind.value,
+        "subject_scope": record.subject_scope.value,
         "status": record.status.value,
         "content": version.content,
         "topic_key": record.topic_key,
@@ -1629,6 +2140,10 @@ def _memory_view_row(
         "confidence": version.confidence,
         "pinned": record.pinned,
         "version_number": version.version_number,
+        "event_started_at": version.event_started_at,
+        "event_ended_at": version.event_ended_at,
+        "time_confidence": version.time_confidence,
+        "deep_memory_eligible": version.deep_memory_eligible,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "last_recalled_at": getattr(recall_stats, "last_recalled_at", None),
@@ -1637,6 +2152,187 @@ def _memory_view_row(
             "successful_recall_count",
             0,
         ),
+    }
+
+
+def _derived_view_row(record) -> dict[str, object]:
+    version = record.current_version
+    return {
+        "memory_id": record.group_id,
+        "group_id": record.group_id,
+        "version_id": version.version_id,
+        "layer": record.layer.value,
+        "kind": record.layer.value,
+        "subject_scope": record.subject_scope.value,
+        "status": record.status.value,
+        "content": version.content,
+        "topic_key": record.topic_key,
+        "importance": version.importance,
+        "confidence": version.confidence,
+        "evidence_score": record.evidence_score,
+        "conflicted": record.conflicted,
+        "pinned": record.pinned,
+        "version_number": version.version_number,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "last_recalled_at": None,
+        "successful_recall_count": 0,
+    }
+
+
+def _working_view_rows(
+    snapshot: WorkingMemorySnapshot | None,
+) -> tuple[dict[str, object], ...]:
+    if snapshot is None:
+        return ()
+    rows: list[dict[str, object]] = [
+        {
+            "memory_id": f"working:{snapshot.message_id}",
+            "group_id": f"working:{snapshot.message_id}",
+            "version_id": snapshot.message_id,
+            "layer": MemoryLayer.WORKING.value,
+            "kind": "current_message",
+            "status": "readonly",
+            "content": snapshot.query,
+            "topic_key": "",
+            "score": None,
+            "reason": "当前持久化用户消息",
+            "pinned": False,
+            "created_at": None,
+            "updated_at": None,
+        }
+    ]
+    rows.extend(
+        {
+            "memory_id": f"working:{item.layer.value}:{item.target_id}",
+            "group_id": item.target_id,
+            "version_id": item.version_id,
+            "layer": MemoryLayer.WORKING.value,
+            "source_layer": item.layer.value,
+            "kind": "retrieval",
+            "status": "readonly",
+            "content": "",
+            "topic_key": "",
+            "score": item.score,
+            "reason": item.reason,
+            "pinned": False,
+            "created_at": None,
+            "updated_at": None,
+        }
+        for item in snapshot.selected
+    )
+    return tuple(rows)
+
+
+def _recent_view_rows(
+    stores: LocalDataStores,
+    conversation_id: str | None,
+) -> tuple[dict[str, object], ...]:
+    if conversation_id is None:
+        return ()
+    rows: list[dict[str, object]] = []
+    summary = stores.conversations.latest_summary(conversation_id)
+    if summary is not None:
+        rows.append(
+            {
+                "memory_id": f"summary:{conversation_id}:{summary.covers_through_sequence}",
+                "group_id": f"summary:{conversation_id}",
+                "version_id": str(summary.covers_through_sequence),
+                "layer": MemoryLayer.RECENT.value,
+                "kind": "summary",
+                "status": "readonly",
+                "content": summary.content,
+                "topic_key": "滚动摘要",
+                "pinned": False,
+                "created_at": summary.created_at,
+                "updated_at": summary.created_at,
+            }
+        )
+    messages = stores.conversations.load_recent_valid_messages(conversation_id, limit=20)
+    rows.extend(
+        {
+            "memory_id": message.message_id,
+            "group_id": message.message_id,
+            "version_id": message.message_id,
+            "layer": MemoryLayer.RECENT.value,
+            "kind": message.role.value,
+            "status": "readonly",
+            "content": message.content,
+            "topic_key": "近期消息",
+            "pinned": False,
+            "created_at": message.created_at,
+            "updated_at": message.updated_at,
+        }
+        for message in messages
+    )
+    return tuple(rows)
+
+
+def _static_persona_view_row(document) -> dict[str, object]:
+    return {
+        "memory_id": document.knowledge_id,
+        "group_id": document.knowledge_id,
+        "version_id": document.knowledge_id,
+        "layer": MemoryLayer.STATIC_PERSONA.value,
+        "kind": "static_persona",
+        "status": "readonly",
+        "content": document.content,
+        "topic_key": " ".join(document.tags),
+        "pinned": False,
+        "created_at": document.created_at,
+        "updated_at": document.updated_at,
+    }
+
+
+def _timeline_view_row(item) -> dict[str, object]:
+    return {
+        "memory_id": item.memory_id,
+        "group_id": item.memory_id,
+        "version_id": item.version_id,
+        "layer": "timeline",
+        "kind": "event",
+        "status": "readonly",
+        "content": item.content,
+        "topic_key": "明确时间" if item.occurred_at_is_explicit else "创建时间投影",
+        "importance": item.importance,
+        "pinned": False,
+        "created_at": item.occurred_at,
+        "updated_at": item.occurred_at,
+    }
+
+
+def _audit_view_row(item) -> dict[str, object]:
+    return {
+        "memory_id": item.event_id,
+        "group_id": item.owner_group_id,
+        "version_id": item.version_id or "",
+        "layer": "audit",
+        "source_layer": item.owner_layer.value,
+        "kind": item.event_type,
+        "status": "readonly",
+        "content": "",
+        "topic_key": item.reason_code,
+        "reinforcement_delta": item.reinforcement_delta,
+        "disputation_delta": item.disputation_delta,
+        "metadata": item.metadata,
+        "pinned": False,
+        "created_at": item.occurred_at,
+        "updated_at": item.occurred_at,
+    }
+
+
+def _conflict_view_row(item) -> dict[str, object]:
+    return {
+        "conflict_id": item.conflict_id,
+        "target_layer": item.target_layer.value,
+        "target_group_id": item.target_group_id,
+        "incumbent_version_id": item.incumbent_version_id,
+        "challenger_version_id": item.challenger_version_id,
+        "status": item.status,
+        "resolution": None if item.resolution is None else item.resolution.value,
+        "source_message_id": item.source_message_id,
+        "created_at": item.created_at,
+        "resolved_at": item.resolved_at,
     }
 
 
@@ -1663,6 +2359,60 @@ def _source_view_row(
         "available": not source.is_manual and not source.source_deleted,
         "version_number": version_number,
         "current_version": True,
+    }
+
+
+def _derived_source_view_row(
+    stores: LocalDataStores,
+    source: object,
+    *,
+    layer: MemoryLayer,
+    version_number: int,
+) -> dict[str, object]:
+    live_message_id = getattr(source, "live_message_id", None)
+    extraction_method = str(getattr(source, "extraction_method", "automatic"))
+    content = ""
+    conversation_id = None
+    message_created_at = None
+    if live_message_id is not None:
+        message = stores.conversations.get_message(str(live_message_id))
+        content = message.content
+        conversation_id = message.conversation_id
+        message_created_at = message.created_at
+    source_deleted = extraction_method == "automatic" and live_message_id is None
+    parent_version_id = getattr(source, "parent_version_id", None)
+    parent_group_id = None
+    parent_layer = None
+    if parent_version_id is not None and layer is MemoryLayer.REFLECTION:
+        parent = stores.database.connection.execute(
+            "SELECT memory_id FROM memory_versions WHERE id = ?",
+            (parent_version_id,),
+        ).fetchone()
+        if parent is not None:
+            parent_group_id = str(parent["memory_id"])
+            parent_layer = MemoryLayer.FACT.value
+    elif parent_version_id is not None and layer is MemoryLayer.PERSONA:
+        parent = stores.database.connection.execute(
+            "SELECT reflection_id FROM memory_reflection_versions WHERE id = ?",
+            (parent_version_id,),
+        ).fetchone()
+        if parent is not None:
+            parent_group_id = str(parent["reflection_id"])
+            parent_layer = MemoryLayer.REFLECTION.value
+    return {
+        "conversation_id": conversation_id,
+        "message_id": live_message_id,
+        "source_message_id": str(getattr(source, "source_message_id", "")),
+        "content": content,
+        "message_created_at": message_created_at,
+        "method": extraction_method,
+        "source_deleted": source_deleted,
+        "available": extraction_method != "manual" and not source_deleted,
+        "version_number": version_number,
+        "current_version": True,
+        "parent_version_id": parent_version_id,
+        "parent_group_id": parent_group_id,
+        "parent_layer": parent_layer,
     }
 
 

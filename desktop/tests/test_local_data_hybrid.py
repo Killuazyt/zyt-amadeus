@@ -359,3 +359,163 @@ def test_memory_disable_epoch_removes_user_memory_before_provider_start(
     qtbot.waitUntil(lambda: bool(stats), timeout=2_000)
     assert stats == [0]
     assert service.shutdown(2_000)
+
+
+def test_deep_memory_disable_epoch_strips_derived_sections_but_keeps_facts(
+    qtbot,
+    tmp_path,
+) -> None:
+    pending_vector: Future[VectorRetrievalResult] = Future()
+    assert pending_vector.set_running_or_notify_cancel()
+    boundaries: list[tuple[bool, bool]] = []
+
+    def vector_query(
+        _query: str,
+        *,
+        include_user: bool,
+        include_deep: bool,
+    ) -> Future[VectorRetrievalResult]:
+        boundaries.append((include_user, include_deep))
+        return pending_vector
+
+    runtime = SerialDataThread(
+        lambda: create_local_data_stores(
+            tmp_path / "amadeus.sqlite3",
+            tmp_path / "backups",
+        ),
+        resource_close=lambda stores: stores.close(),
+    )
+    service = LocalDataService(runtime, vector_query=vector_query, vector_timeout_ms=2_000)
+    service.start()
+    qtbot.waitUntil(lambda: service.is_writable, timeout=2_000)
+    conversation_id = service.current_conversation_id
+    assert conversation_id is not None
+    seeded: list[tuple[str, str]] = []
+
+    def seed(stores) -> tuple[str, str]:
+        fact_ids: list[str] = []
+        for index in range(5):
+            message = stores.conversations.save_user_message(
+                conversation_id,
+                f"source-turn-{index}",
+                f"source-user-{index}",
+                f"我第 {index + 1} 次表示重视稳定互动",
+            )
+            fact = stores.memories.create_memory(
+                "relationship",
+                f"稳定互动:{index}",
+                f"用户第 {index + 1} 次表示重视稳定互动",
+                source_message_ids=(message.message_id,),
+            )
+            fact_ids.append(fact.current_version.version_id)
+        reflection = stores.deep_memories.create_reflection(
+            "用户重视稳定互动",
+            "稳定互动",
+            fact_version_ids=fact_ids,
+            importance=1.0,
+            confidence=0.9,
+        )
+        reflection = stores.deep_memories.confirm("reflection", reflection.group_id)
+        return fact_ids[0], reflection.current_version.version_id
+
+    assert runtime.submit(seed, priority=DataPriority.FOREGROUND, on_success=seeded.append)
+    qtbot.waitUntil(lambda: bool(seeded), timeout=2_000)
+
+    prompts: list[PreparedPrompt] = []
+    turn = _turn(
+        turn_id="turn-deep-toggle",
+        user_id="user-deep-toggle",
+        assistant_id="assistant-deep-toggle",
+        content="我是否重视稳定互动？",
+    )
+    assert service.prepare_new_turn(turn, prompts.append, lambda _category: None)
+    qtbot.waitUntil(lambda: boundaries == [(True, True)], timeout=2_000)
+    service.set_deep_memory_enabled(False)
+    service.set_deep_memory_enabled(True)
+    pending_vector.set_result(VectorRetrievalResult(threshold=0.5))
+    qtbot.waitUntil(lambda: bool(prompts), timeout=2_000)
+
+    assert prompts[0].reflection_version_ids == ()
+    assert all("[长期反思" not in message.content for message in prompts[0].messages)
+    assert prompts[0].user_memory_version_ids
+    assert any("[用户长期记忆" in message.content for message in prompts[0].messages)
+    assert service.shutdown(2_000)
+
+
+def test_deep_disabled_excludes_only_deep_vector_corpora(qtbot, tmp_path) -> None:
+    boundaries: list[tuple[bool, bool]] = []
+
+    def vector_query(
+        _query: str,
+        *,
+        include_user: bool,
+        include_deep: bool,
+    ) -> Future[VectorRetrievalResult]:
+        boundaries.append((include_user, include_deep))
+        completed: Future[VectorRetrievalResult] = Future()
+        completed.set_result(VectorRetrievalResult(threshold=0.5))
+        return completed
+
+    runtime = SerialDataThread(
+        lambda: create_local_data_stores(
+            tmp_path / "amadeus.sqlite3",
+            tmp_path / "backups",
+        ),
+        resource_close=lambda stores: stores.close(),
+    )
+    service = LocalDataService(
+        runtime,
+        deep_memory_enabled=False,
+        vector_query=vector_query,
+    )
+    prompts: list[PreparedPrompt] = []
+    service.start()
+    qtbot.waitUntil(lambda: service.is_writable, timeout=2_000)
+    assert service.prepare_new_turn(_turn(), prompts.append, lambda _category: None)
+    qtbot.waitUntil(lambda: bool(prompts), timeout=2_000)
+    assert boundaries == [(True, False)]
+    assert prompts[0].reflection_version_ids == ()
+    assert prompts[0].persona_impression_version_ids == ()
+    assert service.shutdown(2_000)
+
+
+def test_working_snapshot_is_process_only_and_clears_on_conversation_switch(
+    qtbot,
+    tmp_path,
+) -> None:
+    runtime = SerialDataThread(
+        lambda: create_local_data_stores(
+            tmp_path / "amadeus.sqlite3",
+            tmp_path / "backups",
+        ),
+        resource_close=lambda stores: stores.close(),
+    )
+    service = LocalDataService(runtime, memory_enabled=False)
+    prompts: list[PreparedPrompt] = []
+    switched: list[object] = []
+    service.conversation_loaded.connect(switched.append)
+    service.start()
+    qtbot.waitUntil(lambda: service.is_writable, timeout=2_000)
+    assert service.prepare_new_turn(_turn(), prompts.append, lambda _category: None)
+    qtbot.waitUntil(lambda: bool(prompts), timeout=2_000)
+    assert service.working_memory_snapshot is not None
+    assert service.working_memory_snapshot.query == _turn().user_message.content
+
+    persisted_tables: list[tuple[str, ...]] = []
+    assert runtime.submit(
+        lambda stores: tuple(
+            str(row[0])
+            for row in stores.database.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%working%'"
+            )
+        ),
+        priority=DataPriority.FOREGROUND,
+        on_success=persisted_tables.append,
+    )
+    qtbot.waitUntil(lambda: bool(persisted_tables), timeout=2_000)
+    assert persisted_tables == [()]
+
+    service.create_conversation()
+    qtbot.waitUntil(lambda: bool(switched), timeout=2_000)
+    assert service.working_memory_snapshot is None
+    assert service.shutdown(2_000)

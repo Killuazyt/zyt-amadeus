@@ -8,6 +8,48 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 
+class MemoryLayer(StrEnum):
+    """The five product layers plus the isolated static persona corpus."""
+
+    WORKING = "working"
+    RECENT = "recent"
+    FACT = "fact"
+    REFLECTION = "reflection"
+    PERSONA = "persona"
+    STATIC_PERSONA = "static_persona"
+
+
+class MemorySubjectScope(StrEnum):
+    USER = "user"
+    COMPANION = "companion"
+    RELATIONSHIP = "relationship"
+
+
+class DerivedMemoryStatus(StrEnum):
+    TENTATIVE = "tentative"
+    CONFIRMED = "confirmed"
+    PROMOTED = "promoted"
+    MERGED = "merged"
+    ACTIVE = "active"
+    DISPUTED = "disputed"
+    DENIED = "denied"
+    ARCHIVED = "archived"
+
+
+class EvidenceSignalKind(StrEnum):
+    INITIAL = "initial"
+    INDIRECT_SUPPORT = "indirect_support"
+    INDIRECT_REFUTE = "indirect_refute"
+    DIRECT_CONFIRM = "direct_confirm"
+    DIRECT_REBUT = "direct_rebut"
+
+
+class ConflictResolution(StrEnum):
+    KEEP = "keep"
+    ACCEPT = "accept"
+    MERGE = "merge"
+
+
 class MemoryKind(StrEnum):
     """Long-term user-memory categories supported by the MVP."""
 
@@ -52,6 +94,11 @@ class MemoryCandidate:
     importance: float
     confidence: float
     source_message_ids: tuple[str, ...]
+    subject_scope: MemorySubjectScope = MemorySubjectScope.USER
+    event_started_at: str | None = None
+    event_ended_at: str | None = None
+    time_confidence: float | None = None
+    correction_explicit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +123,43 @@ class PromptPersonaKnowledge:
     persona_id: str
     content: str
     active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class PromptDerivedMemory:
+    """A confirmed reflection or active persona impression for prompt injection."""
+
+    group_id: str
+    version_id: str
+    layer: MemoryLayer
+    subject_scope: MemorySubjectScope
+    content: str
+    topic_key: str
+    importance: float
+    confidence: float
+    evidence_score: float
+    pinned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingMemoryItem:
+    """Content-free identity and ranking explanation for one selected memory."""
+
+    layer: MemoryLayer
+    target_id: str
+    version_id: str
+    score: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingMemorySnapshot:
+    """Ephemeral prompt-assembly diagnostics; never persisted to SQLite."""
+
+    conversation_id: str
+    message_id: str
+    query: str
+    selected: tuple[WorkingMemoryItem, ...]
 
 
 @runtime_checkable

@@ -5,10 +5,13 @@ from dataclasses import dataclass
 
 import pytest
 
+from amadeus_desktop.conversation_store import ConversationStore
 from amadeus_desktop.data_runtime import SerialDataThread
 from amadeus_desktop.database import SQLiteDatabase
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
 from amadeus_desktop.embedding_backend import CPU_PROVIDER, EmbeddingUnavailableError
 from amadeus_desktop.embedding_model import PINNED_MODEL
+from amadeus_desktop.memory_models import MemoryLayer
 from amadeus_desktop.memory_store import MemoryStore
 from amadeus_desktop.persona_repository import PersonaRepository
 from amadeus_desktop.storage_models import MemoryVersionOrigin, PersonaKnowledgeDraft
@@ -32,6 +35,7 @@ class _Resource:
     memories: MemoryStore
     personas: PersonaRepository
     vectors: VectorStore
+    deep_memories: DeepMemoryStore
     owner_thread_id: int
 
     def close(self) -> None:
@@ -81,6 +85,7 @@ def _factory(path, *, seed_active: bool, memory_count: int = 2):
         memories = MemoryStore(database)
         personas = PersonaRepository(database)
         vectors = VectorStore(database)
+        deep_memories = DeepMemoryStore(database)
         records = tuple(
             memories.create_memory(
                 "fact",
@@ -115,6 +120,20 @@ def _factory(path, *, seed_active: bool, memory_count: int = 2):
                 model_sha256=PINNED_MODEL.onnx_sha256,
                 calibration_threshold=0.6,
             )
+            reflection_generation = vectors.begin_reflection_generation(
+                generation_id="reflection-old",
+                model_name=PINNED_MODEL.api_name,
+                model_commit=PINNED_MODEL.revision,
+                model_sha256=PINNED_MODEL.onnx_sha256,
+                calibration_threshold=0.6,
+            )
+            impression_generation = vectors.begin_persona_impression_generation(
+                generation_id="impression-old",
+                model_name=PINNED_MODEL.api_name,
+                model_commit=PINNED_MODEL.revision,
+                model_sha256=PINNED_MODEL.onnx_sha256,
+                calibration_threshold=0.6,
+            )
             vectors.activate_memory_generation(
                 user_generation.generation_id,
                 {record.current_version.version_id: _unit_vector() for record in records},
@@ -123,11 +142,17 @@ def _factory(path, *, seed_active: bool, memory_count: int = 2):
                 persona_generation.generation_id,
                 {knowledge.knowledge_id: _unit_vector()},
             )
+            vectors.activate_reflection_generation(reflection_generation.generation_id, {})
+            vectors.activate_persona_impression_generation(
+                impression_generation.generation_id,
+                {},
+            )
         return _Resource(
             database,
             memories,
             personas,
             vectors,
+            deep_memories,
             threading.get_ident(),
         )
 
@@ -136,7 +161,12 @@ def _factory(path, *, seed_active: bool, memory_count: int = 2):
 
 def _repositories(resource: object) -> VectorIndexRepositories:
     assert isinstance(resource, _Resource)
-    return VectorIndexRepositories(resource.memories, resource.personas, resource.vectors)
+    return VectorIndexRepositories(
+        resource.memories,
+        resource.personas,
+        resource.vectors,
+        resource.deep_memories,
+    )
 
 
 def _start_runtime(qtbot, tmp_path, *, seed_active: bool, memory_count: int = 2):
@@ -196,6 +226,10 @@ def test_start_loads_persisted_generations_then_queries_both_caches(qtbot, tmp_p
                 "user_count",
                 "persona_generation_id",
                 "persona_count",
+                "reflection_generation_id",
+                "reflection_count",
+                "persona_impression_generation_id",
+                "persona_impression_count",
             }
             for status in statuses
         )
@@ -660,6 +694,82 @@ def test_incremental_refresh_embeds_new_current_version_without_rebuilding(qtbot
         assert coordinator.status.user_generation_id == original_generation
         assert any(call.startswith("batch") for call in backend.calls)
         assert len(coordinator.query("迁居").result(timeout=2).user_hits) == 3
+    finally:
+        _shutdown(data, runtime, coordinator)
+
+
+def test_incremental_refresh_queries_reflection_and_impression_caches(qtbot, tmp_path) -> None:
+    data, runtime, _backend, coordinator, _resources = _start_runtime(
+        qtbot,
+        tmp_path,
+        seed_active=True,
+        memory_count=0,
+    )
+    seeded: list[tuple[str, str]] = []
+    try:
+        assert coordinator.start()
+        qtbot.waitUntil(lambda: coordinator.status.category == "ready")
+        reflection_generation = coordinator.status.reflection_generation_id
+        impression_generation = coordinator.status.persona_impression_generation_id
+
+        def seed_derived(resource: _Resource) -> tuple[str, str]:
+            conversations = ConversationStore(resource.database)
+            conversation = conversations.create_conversation()
+            fact_ids: list[str] = []
+            for index in range(5):
+                message = conversations.save_user_message(
+                    conversation.conversation_id,
+                    f"deep-turn-{index}",
+                    f"deep-user-{index}",
+                    f"我第 {index + 1} 次表示重视稳定互动",
+                )
+                fact = resource.memories.create_memory(
+                    "relationship",
+                    f"稳定互动:{index}",
+                    f"用户第 {index + 1} 次表示重视稳定互动",
+                    source_message_ids=(message.message_id,),
+                )
+                fact_ids.append(fact.current_version.version_id)
+            reflection = resource.deep_memories.create_reflection(
+                "用户重视稳定互动",
+                "稳定互动",
+                fact_version_ids=fact_ids,
+                importance=0.8,
+            )
+            reflection = resource.deep_memories.confirm(
+                MemoryLayer.REFLECTION,
+                reflection.group_id,
+            )
+            promotable = resource.deep_memories.create_reflection(
+                "关系信任来自稳定互动",
+                "关系信任",
+                fact_version_ids=fact_ids,
+                importance=1.0,
+            )
+            resource.deep_memories.confirm(MemoryLayer.REFLECTION, promotable.group_id)
+            resource.deep_memories.confirm(MemoryLayer.REFLECTION, promotable.group_id)
+            impression = resource.deep_memories.promote_reflection(promotable.group_id)
+            return (
+                reflection.current_version.version_id,
+                impression.current_version.version_id,
+            )
+
+        assert data.submit(seed_derived, on_success=seeded.append)
+        qtbot.waitUntil(lambda: bool(seeded), timeout=2_000)
+        assert coordinator.refresh_incremental()
+        qtbot.waitUntil(
+            lambda: (
+                coordinator.status.category == "ready"
+                and coordinator.status.reflection_count == 1
+                and coordinator.status.persona_impression_count == 1
+            ),
+            timeout=4_000,
+        )
+        assert coordinator.status.reflection_generation_id == reflection_generation
+        assert coordinator.status.persona_impression_generation_id == impression_generation
+        result = coordinator.query("稳定互动").result(timeout=2)
+        assert tuple(hit.target_id for hit in result.reflection_hits) == (seeded[0][0],)
+        assert tuple(hit.target_id for hit in result.persona_impression_hits) == (seeded[0][1],)
     finally:
         _shutdown(data, runtime, coordinator)
 

@@ -12,12 +12,13 @@ from amadeus_desktop.database import (
     SQLiteDatabase,
     table_names,
 )
+from amadeus_desktop.memory_store import MemoryStore
 
 
-def test_schema_v5_enables_required_pragmas_and_entities(tmp_path) -> None:
+def test_schema_v6_enables_required_pragmas_and_entities(tmp_path) -> None:
     path = tmp_path / "data" / "amadeus.sqlite3"
     with SQLiteDatabase(path, busy_timeout_ms=3_210) as database:
-        assert database.schema_version == SCHEMA_VERSION == 5
+        assert database.schema_version == SCHEMA_VERSION == 6
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert str(database.pragma_value("journal_mode")).lower() == "wal"
         assert database.pragma_value("foreign_keys") == 1
@@ -45,6 +46,14 @@ def test_schema_v5_enables_required_pragmas_and_entities(tmp_path) -> None:
             "proactive_events",
             "attachments",
             "message_attachments",
+            "memory_reflections",
+            "memory_reflection_versions",
+            "memory_persona_impressions",
+            "memory_persona_impression_versions",
+            "memory_evidence_signals",
+            "memory_conflicts",
+            "memory_audit_events",
+            "memory_pipeline_state",
         }.issubset(table_names(database.connection))
         message_columns = {
             row[1] for row in database.connection.execute("PRAGMA table_info(messages)")
@@ -55,7 +64,7 @@ def test_schema_v5_enables_required_pragmas_and_entities(tmp_path) -> None:
     assert path.parent.name == "data"
 
 
-def test_schema_v1_is_backed_up_and_migrated_to_v5_without_losing_data(tmp_path) -> None:
+def test_schema_v1_is_backed_up_and_migrated_to_v6_without_losing_data(tmp_path) -> None:
     path = tmp_path / "amadeus.sqlite3"
     legacy = sqlite3.connect(path)
     legacy.execute("PRAGMA foreign_keys = ON")
@@ -70,7 +79,7 @@ def test_schema_v1_is_backed_up_and_migrated_to_v5_without_losing_data(tmp_path)
     database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
     try:
         assert not database.read_only
-        assert database.schema_version == 5
+        assert database.schema_version == 6
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert database.last_backup_path is not None
         assert (
@@ -91,6 +100,11 @@ def test_schema_v1_is_backed_up_and_migrated_to_v5_without_losing_data(tmp_path)
             "proactive_events",
             "attachments",
             "message_attachments",
+            "memory_reflections",
+            "memory_persona_impressions",
+            "memory_evidence_signals",
+            "memory_conflicts",
+            "memory_audit_events",
         }.issubset(table_names(database.connection))
     finally:
         database.close()
@@ -144,7 +158,7 @@ def test_schema_v2_migrates_messages_and_application_identity_without_data_loss(
     backup_path = database.last_backup_path
     try:
         assert not database.read_only
-        assert database.schema_version == 5
+        assert database.schema_version == 6
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         row = database.connection.execute(
             "SELECT content, origin, input_modality FROM messages WHERE id = 'm'"
@@ -183,6 +197,105 @@ def test_schema_v2_migrates_messages_and_application_identity_without_data_loss(
         }
     finally:
         backup.close()
+
+
+def test_schema_v5_to_v6_keeps_history_out_of_deep_backfill_until_user_edit(tmp_path) -> None:
+    path = tmp_path / "amadeus.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.execute("PRAGMA foreign_keys = ON")
+    for migrate in (
+        database_module._migrate_to_v1,
+        database_module._migrate_to_v2,
+        database_module._migrate_to_v3,
+        database_module._migrate_to_v4,
+        database_module._migrate_to_v5,
+    ):
+        migrate(legacy)
+    legacy.execute("PRAGMA user_version = 5")
+    timestamp = "2026-08-01T00:00:00.000000Z"
+    legacy.execute("INSERT INTO profiles VALUES ('p', 'name', ?, ?)", (timestamp, timestamp))
+    legacy.execute(
+        """
+        INSERT INTO conversations(
+            id, profile_id, title, status, created_at, updated_at, last_activity_at
+        ) VALUES ('c', 'p', 'legacy', 'normal', ?, ?, ?)
+        """,
+        (timestamp, timestamp, timestamp),
+    )
+    legacy.execute(
+        """
+        INSERT INTO messages(
+            id, conversation_id, turn_id, role, content, status, attempt,
+            participates_in_memory, created_at, updated_at, completed_at, origin,
+            input_modality
+        ) VALUES ('m', 'c', 't', 'user', '我偏好红茶', 'completed', 1, 1,
+                  ?, ?, ?, 'conversation', 'text')
+        """,
+        (timestamp, timestamp, timestamp),
+    )
+    legacy.execute(
+        """
+        INSERT INTO memory_groups(
+            id, profile_id, kind, topic_key, status, pinned, current_version_id,
+            created_at, updated_at
+        ) VALUES ('fact', 'p', 'preference', '饮料', 'active', 0, NULL, ?, ?)
+        """,
+        (timestamp, timestamp),
+    )
+    legacy.execute(
+        """
+        INSERT INTO memory_versions(
+            id, memory_id, version_number, content, normalized_content, content_hash,
+            search_text, importance, confidence, origin, operation,
+            supersedes_version_id, created_at
+        ) VALUES ('fact-v1', 'fact', 1, '用户偏好红茶', '用户偏好红茶', ?,
+                  '饮料 用户偏好红茶', 0.7, 0.9, 'automatic', 'add', NULL, ?)
+        """,
+        ("a" * 64, timestamp),
+    )
+    legacy.execute("UPDATE memory_groups SET current_version_id = 'fact-v1' WHERE id = 'fact'")
+    legacy.execute(
+        """
+        INSERT INTO memory_sources(
+            id, version_id, source_message_id, source_conversation_id,
+            live_message_id, live_conversation_id, extraction_method, created_at
+        ) VALUES ('source', 'fact-v1', 'm', 'c', 'm', 'c', 'automatic', ?)
+        """,
+        (timestamp,),
+    )
+    legacy.commit()
+    legacy.close()
+
+    database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
+    try:
+        assert database.schema_version == 6
+        assert (
+            database.connection.execute(
+                "SELECT deep_memory_eligible FROM memory_versions WHERE id = 'fact-v1'"
+            ).fetchone()[0]
+            == 0
+        )
+        edited = MemoryStore(database).edit_memory("fact", "用户确认仍偏好红茶")
+        assert edited.current_version.deep_memory_eligible
+        source_ids = {
+            row[0]
+            for row in database.connection.execute(
+                "SELECT source_message_id FROM memory_sources WHERE version_id = ?",
+                (edited.current_version.version_id,),
+            )
+        }
+        assert "m" in source_ids
+        assert any(value.startswith("manual:") for value in source_ids)
+    finally:
+        backup_path = database.last_backup_path
+        database.close()
+
+    assert backup_path is not None
+    with sqlite3.connect(backup_path) as backup:
+        assert backup.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert "deep_memory_eligible" not in {
+            row[1] for row in backup.execute("PRAGMA table_info(memory_versions)")
+        }
 
 
 def test_migration_failure_rolls_back_and_reopens_read_only_with_consistent_backup(

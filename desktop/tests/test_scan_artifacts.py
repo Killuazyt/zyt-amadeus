@@ -199,6 +199,10 @@ def test_scanner_rejects_default_exports_and_local_persona_greetings(tmp_path) -
         json.dumps({"format": "amadeus-chat-export/v2", "conversations": []}),
         encoding="utf-8",
     )
+    (tmp_path / "renamed-memory-v2.json").write_text(
+        json.dumps({"format": "amadeus-memory-export/v2", "profiles": []}),
+        encoding="utf-8",
+    )
     greetings = tmp_path / "personas" / "kurisu" / "greetings.json"
     greetings.parent.mkdir(parents=True)
     greetings.write_text("{}", encoding="utf-8")
@@ -207,6 +211,6 @@ def test_scanner_rejects_default_exports_and_local_persona_greetings(tmp_path) -
 
     assert exit_code == 1
     assert result["violations_by_category"] == {
-        "local_data_export": 4,
+        "local_data_export": 5,
         "private_persona_data": 1,
     }

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeAlias
 
+from amadeus_desktop.memory_models import WorkingMemorySnapshot
+
 
 class ConversationState(StrEnum):
     """Observable lifecycle states for one conversation request."""
@@ -86,6 +88,9 @@ class GenerationPurpose(StrEnum):
     CONVERSATION_SUMMARY = "conversation_summary"
     MEMORY_EXTRACTION = "memory_extraction"
     STRUCTURE_REPAIR = "structure_repair"
+    MEMORY_EVIDENCE = "memory_evidence"
+    REFLECTION_SYNTHESIS = "reflection_synthesis"
+    PERSONA_PROMOTION = "persona_promotion"
     PROACTIVE_GREETING = "proactive_greeting"
 
 
@@ -226,8 +231,11 @@ class PreparedPrompt:
 
     messages: tuple[PromptMessage, ...]
     user_memory_version_ids: tuple[str, ...] = ()
+    reflection_version_ids: tuple[str, ...] = ()
+    persona_impression_version_ids: tuple[str, ...] = ()
     persona_knowledge_ids: tuple[str, ...] = ()
     retrieval_ticket_id: str = ""
     attempt: int = 1
     attachments: tuple[AttachmentSnapshot, ...] = ()
     provider_route: ProviderRoute = ProviderRoute.TEXT
+    working_memory_snapshot: WorkingMemorySnapshot | None = None

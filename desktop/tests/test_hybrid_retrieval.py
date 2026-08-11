@@ -50,7 +50,7 @@ def test_calibration_requires_fixed_samples_and_safe_gap() -> None:
         calibrate_threshold([0.72] * 24, [0.70] * 24)
 
 
-def test_rrf_gate_quality_decay_pin_and_success_weights() -> None:
+def test_rrf_gate_quality_decay_pin_and_no_success_feedback_weight() -> None:
     event = _item(
         "event",
         kind="event",
@@ -84,7 +84,7 @@ def test_rrf_gate_quality_decay_pin_and_success_weights() -> None:
     assert event_result.rrf_score == pytest.approx(expected_rrf)
     assert event_result.quality_weight == pytest.approx(0.7)
     assert event_result.decay_weight == pytest.approx(0.5)
-    assert event_result.success_weight == pytest.approx(1.05)
+    assert event_result.success_weight == 1.0
     assert by_id["pinned"].pinned_weight == PINNED_COEFFICIENT
 
 
@@ -112,7 +112,7 @@ def test_current_active_filter_and_separate_result_caps() -> None:
         now=NOW,
     )
 
-    assert len(bundle.user_memories) == 8
+    assert len(bundle.user_memories) == 6
     assert len(bundle.persona_knowledge) == 4
     assert set(bundle.memory_version_ids).isdisjoint(bundle.persona_knowledge_ids)
 
@@ -126,6 +126,28 @@ def test_current_active_filter_and_separate_result_caps() -> None:
         vector_threshold=0.75,
     )
     assert filtered == ()
+
+
+def test_recent_three_response_penalty_and_strong_relevance_bypass() -> None:
+    ordinary = _item("ordinary", topic_key="别的主题")
+    direct = _item("direct", topic_key="咖啡偏好")
+    vector_strong = _item("vector-strong", topic_key="其他")
+    results = fuse_hybrid_results(
+        fts_hits=(
+            RankedRetrievalHit("ordinary", 1),
+            RankedRetrievalHit("direct", 2),
+            RankedRetrievalHit("vector-strong", 3),
+        ),
+        vector_hits=(RankedRetrievalHit("vector-strong", 1, 0.9),),
+        items=(ordinary, direct, vector_strong),
+        vector_threshold=0.75,
+        query_text="继续聊咖啡偏好",
+        recently_recalled_ids=("ordinary", "direct", "vector-strong"),
+    )
+    by_id = {result.item.target_id: result for result in results}
+    assert by_id["ordinary"].repetition_weight == 0.70
+    assert by_id["direct"].repetition_weight == 1.0
+    assert by_id["vector-strong"].repetition_weight == 1.0
 
 
 def test_event_decay_exemptions_and_auto_archive() -> None:

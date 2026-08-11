@@ -68,6 +68,10 @@ from amadeus_desktop.data_management import (
 )
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
 from amadeus_desktop.database import SCHEMA_VERSION
+from amadeus_desktop.deep_memory_coordinator import (
+    DeepMemoryJobCoordinator,
+    DeepMemoryRepositoryBundle,
+)
 from amadeus_desktop.diagnostics import DiagnosticStatusService
 from amadeus_desktop.embedding_backend import FastEmbedEmbeddingBackend
 from amadeus_desktop.embedding_calibration import calibrate_backend
@@ -427,6 +431,7 @@ class ApplicationController:
                 resource.memories,
                 resource.personas,
                 resource.vectors,
+                resource.deep_memories,
             ),
             backend_calibrator=lambda backend: calibrate_backend(backend).calibration.threshold,
             parent=application,
@@ -434,6 +439,7 @@ class ApplicationController:
         self.data_service = LocalDataService(
             self.data_runtime,
             memory_enabled=bool(settings["memory"]["enabled"]),
+            deep_memory_enabled=bool(settings["memory"].get("deep_memory_enabled", True)),
             follow_user_language=bool(settings["persona"]["follow_user_language"]),
             vector_query=self.vector_index.query,
             parent=application,
@@ -458,15 +464,36 @@ class ApplicationController:
                 resource.conversations,
                 resource.jobs,
                 resource.memories,
+                resource.deep_memories,
             ),
             memory_enabled=bool(settings["memory"]["enabled"]),
             parent=application,
         )
+        self.deep_memory_jobs = DeepMemoryJobCoordinator(
+            self.data_runtime,
+            self.background_generation,
+            lambda resource: DeepMemoryRepositoryBundle(
+                resource.jobs,
+                resource.memories,
+                resource.deep_memories,
+            ),
+            memory_enabled=bool(settings["memory"]["enabled"]),
+            deep_memory_enabled=bool(settings["memory"].get("deep_memory_enabled", True)),
+            parent=application,
+        )
         self.data_service.jobs_enqueued.connect(self.memory_jobs.poll)
+        self.data_service.jobs_enqueued.connect(self.deep_memory_jobs.poll)
         self.memory_jobs.job_failed.connect(
             lambda _job_id, _kind, _category: self.data_service.refresh_memories()
         )
         self.memory_jobs.job_status_changed.connect(self._on_background_job_status_changed)
+        self.deep_memory_jobs.job_failed.connect(
+            lambda _job_id, _kind, _category: self.data_service.refresh_memories()
+        )
+        self.deep_memory_jobs.job_status_changed.connect(self._on_background_job_status_changed)
+        self.deep_memory_jobs.scheduler_error.connect(
+            lambda category: self.logger.warning("Deep memory scheduler error_type=%s", category)
+        )
         self.memory_jobs.scheduler_error.connect(
             lambda category: self.logger.warning(
                 "Background memory scheduler error_type=%s", category
@@ -618,6 +645,9 @@ class ApplicationController:
         self.diagnostics_page = self.settings_window.diagnostics_page
         self._sync_settings_pages()
         self.memory_page.set_memory_enabled(bool(settings["memory"]["enabled"]))
+        self.memory_page.set_deep_memory_enabled(
+            bool(settings["memory"].get("deep_memory_enabled", True))
+        )
         self._connect_settings_ui()
         self._connect_data_ui()
         self.diagnostic_service = DiagnosticStatusService(
@@ -1241,11 +1271,14 @@ class ApplicationController:
             or self._provider_switch_pending
             or self.conversation.state is not ConversationState.IDLE
             or self.memory_jobs.has_active_job
+            or self.deep_memory_jobs.has_active_job
             or self.background_generation.is_running
             or self.visual_background_generation.is_running
         ):
             return False
-        if not self.memory_jobs.pause(wait_ms=0):
+        deep_clean = self.deep_memory_jobs.pause(wait_ms=0)
+        if not deep_clean or not self.memory_jobs.pause(wait_ms=0):
+            self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
             return False
         self.background_generation.resume()
@@ -1253,6 +1286,7 @@ class ApplicationController:
 
     def _release_proactive_ai_lane(self) -> None:
         if not self._exiting and not self._provider_switch_pending:
+            self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
 
     def _database_diagnostic_status(self) -> str:
@@ -1686,8 +1720,9 @@ class ApplicationController:
         self.chat_panel.set_storage_availability(False, read_only=True)
         self.memory_maintenance_timer.stop()
         proactive_clean = self.proactive_interactions.stop(wait_ms=2_000)
+        deep_clean = self.deep_memory_jobs.pause(wait_ms=2_000)
         memory_clean = self.memory_jobs.pause(wait_ms=2_000)
-        if not proactive_clean or not memory_clean:
+        if not proactive_clean or not deep_clean or not memory_clean:
             self._resume_after_aborted_data_change()
             return False
         return True
@@ -1701,6 +1736,7 @@ class ApplicationController:
         self._sync_voice_availability()
         if self._data_writable:
             self.memory_maintenance_timer.start()
+            self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
             self.proactive_interactions.start()
 
@@ -1807,7 +1843,9 @@ class ApplicationController:
         if self._data_change_state != "idle":
             return
         self._start_data_operation("clear_memories")
-        if not self.memory_jobs.pause(wait_ms=2_000):
+        deep_clean = self.deep_memory_jobs.pause(wait_ms=2_000)
+        if not deep_clean or not self.memory_jobs.pause(wait_ms=2_000):
+            self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
             self._finish_data_operation()
             self.memory_page.set_status(
@@ -1817,11 +1855,13 @@ class ApplicationController:
             return
         clear = getattr(self.data_service, "clear_all_memories", None)
         if not callable(clear) or not clear():
+            self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
             self._finish_data_operation()
             self.memory_page.set_status("清空记忆请求未能提交。", error=True)
 
     def _on_memories_cleared(self, count: int) -> None:
+        self.deep_memory_jobs.resume()
         self.memory_jobs.resume()
         if self._data_change_state == "clear_memories":
             self._finish_data_operation()
@@ -1888,6 +1928,9 @@ class ApplicationController:
         self.data_service.memories_loaded.connect(self._on_memories_loaded)
         self.data_service.memories_cleared.connect(self._on_memories_cleared)
         self.data_service.memory_sources_loaded.connect(self.memory_page.set_sources)
+        self.data_service.layer_sources_loaded.connect(self.memory_page.set_layer_sources)
+        self.data_service.layer_versions_loaded.connect(self.memory_page.set_versions)
+        self.data_service.deletion_impact_loaded.connect(self.memory_page.confirm_delete_impact)
         self.data_service.source_context_loaded.connect(self._on_source_context_loaded)
         self.data_service.operation_failed.connect(self._on_data_operation_failed)
         self.data_service.index_rebuild_requested.connect(self._request_incremental_index_refresh)
@@ -1913,13 +1956,26 @@ class ApplicationController:
 
         self.memory_page.refresh_requested.connect(self.data_service.refresh_memories)
         self.memory_page.search_requested.connect(self._request_memory_search)
-        self.memory_page.memory_selected.connect(self.data_service.load_memory_sources)
+        self.memory_page.layer_memory_selected.connect(self.data_service.load_layer_details)
         self.memory_page.enabled_changed.connect(self._set_memory_enabled)
+        self.memory_page.deep_enabled_changed.connect(self._set_deep_memory_enabled)
         self.memory_page.edit_requested.connect(self.data_service.edit_memory)
         self.memory_page.pin_requested.connect(self.data_service.set_memory_pinned)
         self.memory_page.archive_requested.connect(self.data_service.archive_memory)
         self.memory_page.restore_requested.connect(self.data_service.restore_memory)
         self.memory_page.delete_requested.connect(self.data_service.delete_memory)
+        self.memory_page.delete_impact_requested.connect(self.data_service.load_deletion_impact)
+        self.memory_page.derived_edit_requested.connect(self.data_service.edit_derived_memory)
+        self.memory_page.derived_pin_requested.connect(self.data_service.set_derived_memory_pinned)
+        self.memory_page.derived_archive_requested.connect(self.data_service.archive_derived_memory)
+        self.memory_page.derived_restore_requested.connect(self.data_service.restore_derived_memory)
+        self.memory_page.derived_delete_requested.connect(self.data_service.delete_derived_memory)
+        self.memory_page.derived_confirm_requested.connect(self.data_service.confirm_derived_memory)
+        self.memory_page.derived_deny_requested.connect(self.data_service.deny_derived_memory)
+        self.memory_page.rollback_requested.connect(self.data_service.rollback_memory)
+        self.memory_page.conflict_resolution_requested.connect(
+            self.data_service.resolve_memory_conflict
+        )
         self.memory_page.source_requested.connect(self.data_service.load_source_context)
         self.memory_page.retry_task_requested.connect(self.data_service.retry_failed_job)
         self.memory_page.verify_model_requested.connect(self._verify_local_embedding_model)
@@ -1937,11 +1993,13 @@ class ApplicationController:
             read_only=not self._data_writable,
         )
         self.memory_page.set_memory_enabled(self.data_service.memory_enabled)
+        self.memory_page.set_deep_memory_enabled(self.data_service.deep_memory_enabled)
         self.data_service.refresh_memories()
         self._refresh_persona_summary()
         self._refresh_diagnostics()
         if self._background_jobs_enabled and self._data_writable:
             self.memory_jobs.start()
+            self.deep_memory_jobs.start()
         if self._data_writable:
             self.vector_index.start()
             self.data_service.run_memory_maintenance()
@@ -1974,6 +2032,7 @@ class ApplicationController:
             # persistence failure must not leave the scheduler polling writes
             # against a query-only/unavailable database.
             self.memory_jobs.shutdown(wait_ms=0)
+            self.deep_memory_jobs.shutdown(wait_ms=0)
         if self._data_initialized:
             self.chat_panel.set_storage_availability(writable, read_only=not writable)
             self._sync_voice_availability()
@@ -2160,9 +2219,25 @@ class ApplicationController:
             self.memory_page.set_status("记忆列表返回了无效数据。", error=True)
             return
         selected = self.memory_page.current_memory_id
-        self.memory_page.set_memories(snapshot_object.rows, selected)
+        self.memory_page.set_layer_data(
+            working=snapshot_object.working_rows,
+            recent=snapshot_object.recent_rows,
+            facts=snapshot_object.rows,
+            reflections=snapshot_object.reflection_rows,
+            personas=snapshot_object.persona_rows,
+            static_persona=snapshot_object.static_persona_rows,
+            timeline=snapshot_object.timeline_rows,
+            audit=snapshot_object.audit_rows,
+            conflicts=snapshot_object.conflict_rows,
+            selected_id=selected,
+        )
         self.memory_page.set_failed_tasks(snapshot_object.failed_jobs)
-        self.memory_page.set_status(f"已加载 {len(snapshot_object.rows)} 条本地记忆。")
+        persistent_count = (
+            len(snapshot_object.rows)
+            + len(snapshot_object.reflection_rows)
+            + len(snapshot_object.persona_rows)
+        )
+        self.memory_page.set_status(f"已加载 {persistent_count} 条持久语义记忆。")
 
     def _on_vector_index_status_changed(self, status: object) -> None:
         if self._exiting:
@@ -2249,6 +2324,10 @@ class ApplicationController:
     ) -> None:
         if kind == "memory_extraction" and status == "completed":
             self._request_incremental_index_refresh("user_memory")
+            self.deep_memory_jobs.poll()
+        elif kind in {"deep_memory_cycle", "persona_promotion"} and status == "completed":
+            self._request_incremental_index_refresh(kind)
+            self.data_service.refresh_memories()
 
     def _set_memory_enabled(self, enabled: bool) -> None:
         previous = bool(self.settings["memory"]["enabled"])
@@ -2269,10 +2348,39 @@ class ApplicationController:
         self.settings.update(candidate)
         self.data_service.set_memory_enabled(enabled)
         self.memory_jobs.set_memory_enabled(enabled)
+        self.deep_memory_jobs.set_memory_enabled(enabled)
         self.memory_page.set_memory_enabled(enabled)
         self.memory_page.set_status(
             "长期记忆已启用。" if enabled else "长期记忆已停用；聊天与摘要仍会保存。"
         )
+
+    def _set_deep_memory_enabled(self, enabled: bool) -> None:
+        previous = bool(self.settings["memory"].get("deep_memory_enabled", True))
+        if enabled == previous:
+            return
+        candidate = deepcopy(self.settings)
+        candidate["memory"]["deep_memory_enabled"] = enabled
+        try:
+            self.settings_repository.save(candidate)
+        except SettingsError as exc:
+            self.logger.warning(
+                "Deep-memory setting could not be saved error_type=%s",
+                type(exc).__name__,
+            )
+            self.memory_page.set_deep_memory_enabled(previous)
+            self.memory_page.set_status("深层记忆开关保存失败，设置未改变。", error=True)
+            return
+        self.settings.clear()
+        self.settings.update(candidate)
+        self.data_service.set_deep_memory_enabled(enabled)
+        self.deep_memory_jobs.set_deep_memory_enabled(enabled)
+        self.memory_page.set_deep_memory_enabled(enabled)
+        self.memory_page.set_status(
+            "证据、反思与人格印象已启用。"
+            if enabled
+            else "深层派生与召回已暂停；事实、近期和角色资料继续工作。"
+        )
+        self.data_service.refresh_memories()
 
     def _on_source_context_loaded(
         self,
@@ -2304,6 +2412,7 @@ class ApplicationController:
         self._last_safe_error_category = "storage_error"
         self.proactive_interactions.persistence_failed(operation)
         if operation == "clear_memories":
+            self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
             if self._data_change_state == "clear_memories":
                 self._finish_data_operation()
@@ -2803,7 +2912,8 @@ class ApplicationController:
                 resume_background=False,
             )
             return
-        if self.memory_jobs.pause(wait_ms=0):
+        deep_clean = self.deep_memory_jobs.pause(wait_ms=0)
+        if deep_clean and self.memory_jobs.pause(wait_ms=0):
             self._perform_provider_configuration_transaction(
                 config_object,
                 secret,
@@ -2857,6 +2967,7 @@ class ApplicationController:
         self.background_generation.resume()
         if self._data_writable and not self.memory_maintenance_timer.isActive():
             self.memory_maintenance_timer.start()
+        self.deep_memory_jobs.resume()
         self.memory_jobs.resume()
         self.model_settings_window.apply_save_result(
             success=False,
@@ -2881,6 +2992,7 @@ class ApplicationController:
             self._provider_switch_generation += 1
             self.background_generation.resume()
             if resume_background:
+                self.deep_memory_jobs.resume()
                 self.memory_jobs.resume()
 
     def _perform_provider_configuration_transaction_inner(
@@ -3649,6 +3761,7 @@ class ApplicationController:
 
     def _set_foreground_lane_active(self, active: bool) -> None:
         if self._background_jobs_enabled:
+            self.deep_memory_jobs.set_foreground_active(active)
             self.memory_jobs.set_foreground_active(active)
         elif active:
             self.background_generation.pause(wait_ms=0)
@@ -3926,6 +4039,7 @@ class ApplicationController:
             overlay.close()
             self._region_screenshot_overlay = None
         attachment_clean = self.attachment_runtime.shutdown(wait_ms=slice_ms(0.05))
+        deep_background_clean = self.deep_memory_jobs.shutdown(wait_ms=0)
         background_clean = self.memory_jobs.shutdown(wait_ms=slice_ms(0.15))
         # Start cancellation for the connection test before waiting on conversation cleanup.
         self.model_settings_window.cancel_test()
@@ -3977,6 +4091,7 @@ class ApplicationController:
             and visual_generation_clean
             and voice_clean
             and attachment_clean
+            and deep_background_clean
             and background_clean
             and conversation_clean
             and vector_clean

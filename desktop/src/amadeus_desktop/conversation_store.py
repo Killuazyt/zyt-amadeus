@@ -1244,6 +1244,127 @@ class BackgroundJobStore:
         assert row is not None
         return _job_from_row(row)
 
+    def schedule_deep_memory_cycle(
+        self,
+        *,
+        completed_turn_count: int,
+        source_message_ids: Sequence[str],
+        profile_id: str,
+        conversation_id: str | None,
+        message_id: str | None,
+        run_after: datetime,
+        trigger: str,
+    ) -> BackgroundJob:
+        """Coalesce a pending deep cycle and move its idle deadline after each turn."""
+
+        if completed_turn_count < 1:
+            raise StorageValidationError("completed_turn_count must be positive")
+        profile_id = _required_identifier(profile_id, "profile_id")
+        if trigger not in {"idle", "turn"}:
+            raise StorageValidationError("deep-memory trigger must be idle or turn")
+        source_ids = tuple(
+            dict.fromkeys(
+                _required_identifier(value, "source_message_id") for value in source_message_ids
+            )
+        )
+        now = encode_utc(self._clock())
+        ready = encode_utc(run_after)
+        with self._database.transaction() as connection:
+            pending_rows = connection.execute(
+                """
+                SELECT * FROM background_jobs
+                WHERE kind = 'deep_memory_cycle' AND profile_id = ? AND status = 'pending'
+                ORDER BY created_at, id
+                """,
+                (profile_id,),
+            ).fetchall()
+            pending = None
+            previous_payload = None
+            for row in pending_rows:
+                candidate_payload = json.loads(str(row["payload_json"]))
+                if not isinstance(candidate_payload, dict):
+                    raise StorageValidationError("deep-memory job payload is invalid")
+                if candidate_payload.get("trigger") in {"idle", "turn"}:
+                    pending = row
+                    previous_payload = candidate_payload
+                    break
+            if pending is not None:
+                assert previous_payload is not None
+                previous_sources = previous_payload.get("source_message_ids", [])
+                if not isinstance(previous_sources, list):
+                    raise StorageValidationError("deep-memory job source list is invalid")
+                merged_sources = tuple(
+                    dict.fromkeys(
+                        [
+                            *(
+                                _required_identifier(value, "source_message_id")
+                                for value in previous_sources
+                            ),
+                            *source_ids,
+                        ]
+                    )
+                )
+                previous_trigger = previous_payload.get("trigger")
+                effective_trigger = (
+                    "turn" if trigger == "turn" or previous_trigger == "turn" else "idle"
+                )
+                effective_ready = str(pending["run_after"]) if previous_trigger == "turn" else ready
+                payload_json = json.dumps(
+                    {
+                        "source_message_ids": list(merged_sources),
+                        "trigger": effective_trigger,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                connection.execute(
+                    """
+                    UPDATE background_jobs
+                    SET payload_json = ?, conversation_id = ?, message_id = ?,
+                        run_after = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (
+                        payload_json,
+                        conversation_id,
+                        message_id,
+                        effective_ready,
+                        now,
+                        pending["id"],
+                    ),
+                )
+                job_id = str(pending["id"])
+            else:
+                job_id = self._id_factory()
+                payload_json = json.dumps(
+                    {"source_message_ids": list(source_ids), "trigger": trigger},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO background_jobs(
+                        id, kind, dedupe_key, status, payload_json, profile_id,
+                        conversation_id, message_id, attempt_count, run_after,
+                        created_at, updated_at
+                    ) VALUES (?, 'deep_memory_cycle', ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        f"deep-memory:{profile_id}:{completed_turn_count}",
+                        payload_json,
+                        profile_id,
+                        conversation_id,
+                        message_id,
+                        ready,
+                        now,
+                        now,
+                    ),
+                )
+        return self.get(job_id)
+
     def recover_interrupted(self) -> int:
         now = encode_utc(self._clock())
         with self._database.transaction() as connection:

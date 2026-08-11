@@ -8,7 +8,7 @@ from amadeus_desktop.chat_models import PromptMessage, PromptRole
 from amadeus_desktop.memory_models import MemoryKind, PromptMemory, PromptPersonaKnowledge
 from amadeus_desktop.prompt_context import (
     DEFAULT_CHARACTER_BUDGET,
-    MAX_PROMPT_MEMORIES,
+    MAX_PROMPT_FACTS,
     MAX_PROMPT_PERSONA_KNOWLEDGE,
     MAX_RECENT_MESSAGES,
     DefaultPromptContextService,
@@ -85,16 +85,16 @@ def test_default_service_satisfies_protocol_and_builds_fixed_order() -> None:
     assert result.selected_persona_knowledge_ids == ("knowledge-1",)
 
 
-def test_memory_selection_is_max_eight_and_at_most_twenty_percent() -> None:
+def test_fact_selection_is_max_six_and_at_most_twenty_percent() -> None:
     result = DefaultPromptContextService().build(
         build_input(memories=tuple(memory(index) for index in range(12)))
     )
 
-    assert len(result.selected_memory_ids) == MAX_PROMPT_MEMORIES
-    assert result.selected_memory_ids == tuple(f"memory-{index}" for index in range(8))
-    assert result.selected_memory_version_ids == tuple(f"version-{index}" for index in range(8))
+    assert len(result.selected_memory_ids) == MAX_PROMPT_FACTS
+    assert result.selected_memory_ids == tuple(f"memory-{index}" for index in range(6))
+    assert result.selected_memory_version_ids == tuple(f"version-{index}" for index in range(6))
     assert result.memory_character_count <= int(DEFAULT_CHARACTER_BUDGET * 0.20)
-    assert result.omitted_memory_count == 4
+    assert result.omitted_memory_count == 6
 
 
 def test_persona_knowledge_is_separate_limited_and_never_counted_as_user_memory() -> None:

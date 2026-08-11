@@ -218,12 +218,165 @@ def test_sources_show_body_or_tombstone_and_only_live_source_can_jump(qtbot) -> 
     assert not page.open_source_button.isEnabled()
 
 
+def test_five_layer_boundaries_static_isolation_and_lineage_jump(qtbot) -> None:
+    page = make_page(qtbot)
+    reflection = {
+        "memory_id": "reflection-1",
+        "version_id": "reflection-v1",
+        "layer": "reflection",
+        "kind": "reflection",
+        "subject_scope": "relationship",
+        "status": "tentative",
+        "content": "用户可能通过稳定互动建立信任",
+        "topic_key": "稳定互动",
+        "importance": 0.8,
+        "confidence": 0.8,
+        "evidence_score": 0.6,
+        "pinned": False,
+        "version_number": 1,
+    }
+    impression = {
+        **reflection,
+        "memory_id": "persona-1",
+        "version_id": "persona-v1",
+        "layer": "persona",
+        "kind": "persona",
+        "status": "active",
+        "content": "关系互动通常偏向稳定与可预期",
+    }
+    static = {
+        **impression,
+        "memory_id": "static-1",
+        "version_id": "static-1",
+        "layer": "static_persona",
+        "kind": "static_persona",
+        "status": "readonly",
+        "content": "静态角色资料绝不能被派生流程修改",
+    }
+    page.set_layer_data(
+        working=(
+            {
+                "memory_id": "working-1",
+                "layer": "working",
+                "kind": "current_message",
+                "status": "readonly",
+                "content": "当前消息",
+            },
+        ),
+        facts=(sample_memory(),),
+        reflections=(reflection,),
+        personas=(impression,),
+        static_persona=(static,),
+    )
+
+    page.layer_combo.setCurrentIndex(page.layer_combo.findData("working"))
+    assert page.detail_edit.isReadOnly()
+    assert not page.save_edit_button.isEnabled()
+
+    page.layer_combo.setCurrentIndex(page.layer_combo.findData("reflection"))
+    assert not page.detail_edit.isReadOnly()
+    assert not page.confirm_button.isHidden()
+    assert "证据分：0.60" in page.detail_meta_label.text()
+    page.set_layer_sources(
+        "reflection",
+        "reflection-1",
+        (
+            {
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+                "content": "我重视稳定互动",
+                "method": "automatic",
+                "parent_layer": "fact",
+                "parent_group_id": "memory-1",
+                "parent_version_id": "fact-v1",
+            },
+        ),
+    )
+    assert page.open_lineage_button.isEnabled()
+    page.open_lineage_button.click()
+    assert page.current_layer == "fact"
+    assert page.current_memory_id == "memory-1"
+
+    page.layer_combo.setCurrentIndex(page.layer_combo.findData("persona"))
+    assert page.memory_table.rowCount() == 2
+    assert page.select_memory("static-1")
+    assert page.detail_edit.isReadOnly()
+    assert not page.delete_button.isEnabled()
+
+
+def test_fact_conflict_and_version_rollback_actions_are_explicit(qtbot) -> None:
+    page = make_page(qtbot)
+    fact = {
+        "memory_id": "fact-1",
+        "version_id": "fact-v2",
+        "layer": "fact",
+        "kind": "fact",
+        "status": "active",
+        "content": "当前事实",
+        "topic_key": "主题",
+        "importance": 0.7,
+        "confidence": 1.0,
+        "pinned": False,
+        "version_number": 2,
+    }
+    page.set_layer_data(
+        facts=(fact,),
+        conflicts=(
+            {
+                "conflict_id": "conflict-1",
+                "target_layer": "fact",
+                "target_group_id": "fact-1",
+                "incumbent_version_id": "fact-v2",
+                "challenger_version_id": "fact-v3",
+                "status": "open",
+            },
+        ),
+    )
+    page.set_versions(
+        "fact",
+        "fact-1",
+        (
+            {
+                "version_id": "fact-v1",
+                "version_number": 1,
+                "content": "旧事实",
+                "operation": "add",
+                "created_at": "2026-08-01",
+            },
+            {
+                "version_id": "fact-v2",
+                "version_number": 2,
+                "content": "当前事实",
+                "operation": "manual_edit",
+                "created_at": "2026-08-02",
+            },
+        ),
+    )
+    resolutions: list[tuple[str, str, str]] = []
+    rollbacks: list[tuple[str, str, str]] = []
+    page.conflict_resolution_requested.connect(lambda *args: resolutions.append(args))
+    page.rollback_requested.connect(lambda *args: rollbacks.append(args))
+    assert "停止召回" in page.conflict_notice.text()
+    page.keep_conflict_button.click()
+    assert resolutions == [("conflict-1", "keep", "")]
+
+    old_index = page.rollback_combo.findData("fact-v1")
+    page.rollback_combo.setCurrentIndex(old_index)
+    assert page.rollback_button.isEnabled()
+    page.rollback_button.click()
+    assert rollbacks == [("fact", "fact-1", "fact-v1")]
+
+
 def test_permanent_memory_delete_requires_confirmation(monkeypatch, qtbot) -> None:
     page = make_page(qtbot)
     page.set_memories([sample_memory()])
     deleted: list[str] = []
+    impact_requests: list[tuple[str, str]] = []
     prompts: list[str] = []
     page.delete_requested.connect(deleted.append)
+    page.delete_impact_requested.connect(
+        lambda layer, memory_id: impact_requests.append((layer, memory_id))
+    )
 
     def decline(*args, **kwargs):
         prompts.append(str(args[2]))
@@ -231,6 +384,12 @@ def test_permanent_memory_delete_requires_confirmation(monkeypatch, qtbot) -> No
 
     monkeypatch.setattr(QMessageBox, "question", decline)
     page.delete_button.click()
+    assert impact_requests == [("fact", "memory-1")]
+    page.confirm_delete_impact(
+        "fact",
+        "memory-1",
+        {"facts": 1, "reflections": 2, "personas": 1},
+    )
     assert deleted == []
 
     monkeypatch.setattr(
@@ -238,9 +397,13 @@ def test_permanent_memory_delete_requires_confirmation(monkeypatch, qtbot) -> No
         "question",
         lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
     )
-    page.delete_button.click()
+    page.confirm_delete_impact(
+        "fact",
+        "memory-1",
+        {"facts": 1, "reflections": 2, "personas": 1},
+    )
     assert deleted == ["memory-1"]
-    assert "全部版本" in prompts[0]
+    assert "反思 2" in prompts[0]
     assert "原始聊天不会" in prompts[0]
 
 

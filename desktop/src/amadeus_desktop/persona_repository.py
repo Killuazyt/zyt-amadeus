@@ -317,6 +317,33 @@ class PersonaRepository:
         ).fetchall()
         return tuple(_recall_stats_from_row(row) for row in rows)
 
+    def recent_recalled_knowledge_ids(
+        self,
+        persona_id: str,
+        *,
+        response_limit: int = 3,
+    ) -> tuple[str, ...]:
+        if response_limit < 1:
+            return ()
+        rows = self._database.connection.execute(
+            """
+            WITH recent_tickets AS (
+                SELECT retrieval_ticket_id, MAX(recalled_at) AS latest
+                FROM persona_recall_events
+                WHERE persona_id = ?
+                GROUP BY retrieval_ticket_id
+                ORDER BY latest DESC, retrieval_ticket_id DESC
+                LIMIT ?
+            )
+            SELECT DISTINCT e.knowledge_id
+            FROM persona_recall_events AS e
+            JOIN recent_tickets AS r USING (retrieval_ticket_id)
+            ORDER BY e.knowledge_id
+            """,
+            (_identifier(persona_id, "persona_id"), response_limit),
+        ).fetchall()
+        return tuple(str(row["knowledge_id"]) for row in rows)
+
     def _upsert_with_connection(
         self,
         connection: sqlite3.Connection,

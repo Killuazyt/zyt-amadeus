@@ -23,7 +23,7 @@ from amadeus_desktop.provider_config import (
     ProviderPreset,
 )
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -77,6 +77,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "memory": {
         "enabled": True,
+        "deep_memory_enabled": True,
     },
     "persona": {
         "follow_user_language": True,
@@ -218,6 +219,16 @@ def _migrate_v7_to_v8(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v8_to_v9(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 9
+    memory = migrated.setdefault("memory", deepcopy(DEFAULT_SETTINGS["memory"]))
+    if not isinstance(memory, dict):
+        raise InvalidSettingsError("The memory settings section must be an object.")
+    memory.setdefault("deep_memory_enabled", True)
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
@@ -227,6 +238,7 @@ _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     5: _migrate_v5_to_v6,
     6: _migrate_v6_to_v7,
     7: _migrate_v7_to_v8,
+    8: _migrate_v8_to_v9,
 }
 
 
@@ -506,6 +518,8 @@ class SettingsRepository:
         cls._require_exact_fields(memory, _MEMORY_FIELDS, "The memory settings section")
         if not isinstance(memory.get("enabled"), bool):
             raise InvalidSettingsError("memory.enabled must be a boolean.")
+        if not isinstance(memory.get("deep_memory_enabled"), bool):
+            raise InvalidSettingsError("memory.deep_memory_enabled must be a boolean.")
 
         persona = settings.get("persona")
         if not isinstance(persona, Mapping):

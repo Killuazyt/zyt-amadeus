@@ -19,6 +19,8 @@ class VectorCorpus(StrEnum):
     """Physically and logically separate vector cache regions."""
 
     USER_MEMORY = "user_memory"
+    MEMORY_REFLECTION = "memory_reflection"
+    MEMORY_PERSONA_IMPRESSION = "memory_persona_impression"
     PERSONA_KNOWLEDGE = "persona_knowledge"
 
 

@@ -1,4 +1,4 @@
-"""SQLite schema v5, consistent migration backups, and fail-closed opening."""
+"""SQLite schema v6, consistent migration backups, and fail-closed opening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 AMADEUS_APPLICATION_ID = int.from_bytes(b"AMDS", "big")
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
@@ -477,12 +477,454 @@ def _migrate_to_v5(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+_SCHEMA_V6: tuple[str, ...] = (
+    """
+    ALTER TABLE memory_groups
+    ADD COLUMN subject_scope TEXT NOT NULL DEFAULT 'user'
+        CHECK (subject_scope IN ('user', 'relationship'))
+    """,
+    """
+    ALTER TABLE memory_versions
+    ADD COLUMN event_started_at TEXT
+    """,
+    """
+    ALTER TABLE memory_versions
+    ADD COLUMN event_ended_at TEXT
+    """,
+    """
+    ALTER TABLE memory_versions
+    ADD COLUMN time_confidence REAL
+        CHECK (time_confidence IS NULL OR (time_confidence >= 0.0 AND time_confidence <= 1.0))
+    """,
+    """
+    ALTER TABLE memory_versions
+    ADD COLUMN deep_memory_eligible INTEGER NOT NULL DEFAULT 0
+        CHECK (deep_memory_eligible IN (0, 1))
+    """,
+    """
+    CREATE TABLE memory_reflections (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        subject_scope TEXT NOT NULL
+            CHECK (subject_scope IN ('user', 'companion', 'relationship')),
+        topic_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'tentative'
+            CHECK (status IN (
+                'tentative', 'confirmed', 'promoted', 'merged',
+                'disputed', 'denied', 'archived'
+            )),
+        pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+        current_version_id TEXT,
+        archive_candidate_since TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (current_version_id) REFERENCES memory_reflection_versions(id)
+            ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED
+    )
+    """,
+    """
+    CREATE INDEX memory_reflections_profile_state_idx
+    ON memory_reflections(profile_id, status, pinned DESC, updated_at DESC)
+    """,
+    """
+    CREATE INDEX memory_reflections_topic_idx
+    ON memory_reflections(profile_id, subject_scope, topic_key)
+    """,
+    """
+    CREATE TABLE memory_reflection_versions (
+        id TEXT PRIMARY KEY,
+        reflection_id TEXT NOT NULL REFERENCES memory_reflections(id) ON DELETE CASCADE,
+        version_number INTEGER NOT NULL CHECK (version_number >= 1),
+        content TEXT NOT NULL,
+        normalized_content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        search_text TEXT NOT NULL,
+        importance REAL NOT NULL CHECK (importance >= 0.0 AND importance <= 1.0),
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        origin TEXT NOT NULL CHECK (origin IN ('automatic', 'manual')),
+        operation TEXT NOT NULL
+            CHECK (operation IN ('add', 'merge', 'correct', 'manual_edit', 'rollback')),
+        supersedes_version_id TEXT REFERENCES memory_reflection_versions(id)
+            DEFERRABLE INITIALLY DEFERRED,
+        created_at TEXT NOT NULL,
+        UNIQUE (reflection_id, version_number)
+    )
+    """,
+    """
+    CREATE INDEX memory_reflection_versions_hash_idx
+    ON memory_reflection_versions(content_hash)
+    """,
+    """
+    CREATE TRIGGER memory_reflection_versions_are_immutable
+    BEFORE UPDATE ON memory_reflection_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'reflection versions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER memory_reflection_versions_no_individual_delete
+    BEFORE DELETE ON memory_reflection_versions
+    WHEN EXISTS (SELECT 1 FROM memory_reflections WHERE id = OLD.reflection_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'reflection versions can only be deleted with their group');
+    END
+    """,
+    """
+    CREATE TABLE memory_reflection_sources (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES memory_reflection_versions(id) ON DELETE CASCADE,
+        fact_version_id TEXT REFERENCES memory_versions(id) ON DELETE CASCADE,
+        source_message_id TEXT NOT NULL,
+        live_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        extraction_method TEXT NOT NULL CHECK (extraction_method IN ('automatic', 'manual')),
+        created_at TEXT NOT NULL,
+        UNIQUE (version_id, fact_version_id, source_message_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_reflection_sources_fact_idx
+    ON memory_reflection_sources(fact_version_id)
+    """,
+    """
+    CREATE INDEX memory_reflection_sources_message_idx
+    ON memory_reflection_sources(live_message_id)
+    """,
+    """
+    CREATE VIRTUAL TABLE memory_reflection_fts USING fts5(
+        version_id UNINDEXED,
+        reflection_id UNINDEXED,
+        profile_id UNINDEXED,
+        search_text,
+        tokenize = 'unicode61 remove_diacritics 2'
+    )
+    """,
+    """
+    CREATE TABLE memory_reflection_embedding_generations (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        model_name TEXT NOT NULL,
+        model_commit TEXT NOT NULL,
+        dimension INTEGER NOT NULL CHECK (dimension > 0),
+        model_sha256 TEXT NOT NULL,
+        calibration_threshold REAL NOT NULL
+            CHECK (calibration_threshold >= -1.0 AND calibration_threshold <= 1.0),
+        status TEXT NOT NULL
+            CHECK (status IN ('building', 'active', 'retired', 'failed')),
+        item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        activated_at TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX memory_reflection_embedding_one_active_idx
+    ON memory_reflection_embedding_generations(profile_id)
+    WHERE status = 'active'
+    """,
+    """
+    CREATE TABLE memory_reflection_vectors (
+        generation_id TEXT NOT NULL
+            REFERENCES memory_reflection_embedding_generations(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES memory_reflection_versions(id) ON DELETE CASCADE,
+        vector_blob BLOB NOT NULL CHECK (length(vector_blob) > 0),
+        vector_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (generation_id, version_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_reflection_vectors_version_idx
+    ON memory_reflection_vectors(version_id)
+    """,
+    """
+    CREATE TABLE memory_reflection_recall_events (
+        id TEXT PRIMARY KEY,
+        retrieval_ticket_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES memory_reflection_versions(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+        terminal_status TEXT NOT NULL CHECK (terminal_status IN ('completed', 'user_stopped')),
+        recalled_at TEXT NOT NULL,
+        UNIQUE (retrieval_ticket_id, version_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_reflection_recall_version_time_idx
+    ON memory_reflection_recall_events(version_id, recalled_at DESC)
+    """,
+    """
+    CREATE TABLE memory_persona_impressions (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        subject_scope TEXT NOT NULL
+            CHECK (subject_scope IN ('user', 'companion', 'relationship')),
+        topic_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active', 'disputed', 'denied', 'archived')),
+        pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+        current_version_id TEXT,
+        archive_candidate_since TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (current_version_id) REFERENCES memory_persona_impression_versions(id)
+            ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED
+    )
+    """,
+    """
+    CREATE INDEX memory_persona_impressions_profile_state_idx
+    ON memory_persona_impressions(profile_id, status, pinned DESC, updated_at DESC)
+    """,
+    """
+    CREATE INDEX memory_persona_impressions_topic_idx
+    ON memory_persona_impressions(profile_id, subject_scope, topic_key)
+    """,
+    """
+    CREATE TABLE memory_persona_impression_versions (
+        id TEXT PRIMARY KEY,
+        impression_id TEXT NOT NULL
+            REFERENCES memory_persona_impressions(id) ON DELETE CASCADE,
+        version_number INTEGER NOT NULL CHECK (version_number >= 1),
+        content TEXT NOT NULL,
+        normalized_content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        search_text TEXT NOT NULL,
+        importance REAL NOT NULL CHECK (importance >= 0.0 AND importance <= 1.0),
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        origin TEXT NOT NULL CHECK (origin IN ('automatic', 'manual')),
+        operation TEXT NOT NULL
+            CHECK (operation IN ('add', 'merge', 'correct', 'manual_edit', 'rollback')),
+        supersedes_version_id TEXT REFERENCES memory_persona_impression_versions(id)
+            DEFERRABLE INITIALLY DEFERRED,
+        created_at TEXT NOT NULL,
+        UNIQUE (impression_id, version_number)
+    )
+    """,
+    """
+    CREATE INDEX memory_persona_impression_versions_hash_idx
+    ON memory_persona_impression_versions(content_hash)
+    """,
+    """
+    CREATE TRIGGER memory_persona_impression_versions_are_immutable
+    BEFORE UPDATE ON memory_persona_impression_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'persona impression versions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER memory_persona_impression_versions_no_individual_delete
+    BEFORE DELETE ON memory_persona_impression_versions
+    WHEN EXISTS (
+        SELECT 1 FROM memory_persona_impressions WHERE id = OLD.impression_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'persona impression versions can only be deleted with their group');
+    END
+    """,
+    """
+    CREATE TABLE memory_persona_impression_sources (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL
+            REFERENCES memory_persona_impression_versions(id) ON DELETE CASCADE,
+        reflection_version_id TEXT
+            REFERENCES memory_reflection_versions(id) ON DELETE CASCADE,
+        source_message_id TEXT NOT NULL,
+        live_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        extraction_method TEXT NOT NULL CHECK (extraction_method IN ('automatic', 'manual')),
+        created_at TEXT NOT NULL,
+        UNIQUE (version_id, reflection_version_id, source_message_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_persona_impression_sources_reflection_idx
+    ON memory_persona_impression_sources(reflection_version_id)
+    """,
+    """
+    CREATE INDEX memory_persona_impression_sources_message_idx
+    ON memory_persona_impression_sources(live_message_id)
+    """,
+    """
+    CREATE VIRTUAL TABLE memory_persona_impression_fts USING fts5(
+        version_id UNINDEXED,
+        impression_id UNINDEXED,
+        profile_id UNINDEXED,
+        search_text,
+        tokenize = 'unicode61 remove_diacritics 2'
+    )
+    """,
+    """
+    CREATE TABLE memory_persona_impression_embedding_generations (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        model_name TEXT NOT NULL,
+        model_commit TEXT NOT NULL,
+        dimension INTEGER NOT NULL CHECK (dimension > 0),
+        model_sha256 TEXT NOT NULL,
+        calibration_threshold REAL NOT NULL
+            CHECK (calibration_threshold >= -1.0 AND calibration_threshold <= 1.0),
+        status TEXT NOT NULL
+            CHECK (status IN ('building', 'active', 'retired', 'failed')),
+        item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        activated_at TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX memory_persona_impression_embedding_one_active_idx
+    ON memory_persona_impression_embedding_generations(profile_id)
+    WHERE status = 'active'
+    """,
+    """
+    CREATE TABLE memory_persona_impression_vectors (
+        generation_id TEXT NOT NULL
+            REFERENCES memory_persona_impression_embedding_generations(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL
+            REFERENCES memory_persona_impression_versions(id) ON DELETE CASCADE,
+        vector_blob BLOB NOT NULL CHECK (length(vector_blob) > 0),
+        vector_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (generation_id, version_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_persona_impression_vectors_version_idx
+    ON memory_persona_impression_vectors(version_id)
+    """,
+    """
+    CREATE TABLE memory_persona_impression_recall_events (
+        id TEXT PRIMARY KEY,
+        retrieval_ticket_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL
+            REFERENCES memory_persona_impression_versions(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+        terminal_status TEXT NOT NULL CHECK (terminal_status IN ('completed', 'user_stopped')),
+        recalled_at TEXT NOT NULL,
+        UNIQUE (retrieval_ticket_id, version_id)
+    )
+    """,
+    """
+    CREATE INDEX memory_persona_impression_recall_version_time_idx
+    ON memory_persona_impression_recall_events(version_id, recalled_at DESC)
+    """,
+    """
+    CREATE TABLE memory_evidence_signals (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        target_layer TEXT NOT NULL CHECK (target_layer IN ('fact', 'reflection', 'persona')),
+        target_group_id TEXT NOT NULL,
+        target_version_id TEXT NOT NULL,
+        source_message_id TEXT,
+        source_fact_version_id TEXT REFERENCES memory_versions(id) ON DELETE CASCADE,
+        signal_kind TEXT NOT NULL CHECK (signal_kind IN (
+            'initial', 'indirect_support', 'indirect_refute',
+            'direct_confirm', 'direct_rebut'
+        )),
+        reinforcement_delta REAL NOT NULL DEFAULT 0.0,
+        disputation_delta REAL NOT NULL DEFAULT 0.0 CHECK (disputation_delta >= 0.0),
+        correlation_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX memory_evidence_target_idx
+    ON memory_evidence_signals(target_layer, target_version_id, created_at)
+    """,
+    """
+    CREATE TRIGGER memory_evidence_signals_are_immutable
+    BEFORE UPDATE ON memory_evidence_signals
+    BEGIN
+        SELECT RAISE(ABORT, 'memory evidence signals are immutable');
+    END
+    """,
+    """
+    CREATE TABLE memory_conflicts (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        target_layer TEXT NOT NULL CHECK (target_layer IN ('fact', 'reflection', 'persona')),
+        target_group_id TEXT NOT NULL,
+        incumbent_version_id TEXT NOT NULL,
+        challenger_version_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+        resolution TEXT CHECK (resolution IN ('keep', 'accept', 'merge')),
+        source_message_id TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+    )
+    """,
+    """
+    CREATE INDEX memory_conflicts_open_idx
+    ON memory_conflicts(profile_id, target_layer, status, created_at DESC)
+    """,
+    """
+    CREATE UNIQUE INDEX memory_conflicts_one_open_idx
+    ON memory_conflicts(target_layer, target_group_id)
+    WHERE status = 'open'
+    """,
+    """
+    CREATE TABLE memory_audit_events (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        owner_layer TEXT NOT NULL CHECK (owner_layer IN ('fact', 'reflection', 'persona')),
+        owner_group_id TEXT NOT NULL,
+        version_id TEXT,
+        source_message_id TEXT,
+        event_type TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        reinforcement_delta REAL NOT NULL DEFAULT 0.0,
+        disputation_delta REAL NOT NULL DEFAULT 0.0,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        occurred_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX memory_audit_owner_time_idx
+    ON memory_audit_events(owner_layer, owner_group_id, occurred_at DESC)
+    """,
+    """
+    CREATE INDEX memory_audit_profile_time_idx
+    ON memory_audit_events(profile_id, occurred_at DESC)
+    """,
+    """
+    CREATE TRIGGER memory_audit_events_are_immutable
+    BEFORE UPDATE ON memory_audit_events
+    BEGIN
+        SELECT RAISE(ABORT, 'memory audit events are immutable');
+    END
+    """,
+    """
+    CREATE TABLE memory_pipeline_state (
+        profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+        completed_turn_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_turn_count >= 0),
+        last_signal_message_sequence INTEGER NOT NULL DEFAULT 0
+            CHECK (last_signal_message_sequence >= 0),
+        last_signal_at TEXT,
+        last_maintenance_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+)
+
+
+def _migrate_to_v6(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V6:
+        connection.execute(statement)
+
+
 _DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
     3: _migrate_to_v3,
     4: _migrate_to_v4,
     5: _migrate_to_v5,
+    6: _migrate_to_v6,
 }
 _REQUIRED_TABLES = {
     "profiles",
@@ -505,6 +947,24 @@ _REQUIRED_TABLES = {
     "proactive_events",
     "attachments",
     "message_attachments",
+    "memory_reflections",
+    "memory_reflection_versions",
+    "memory_reflection_sources",
+    "memory_reflection_fts",
+    "memory_reflection_embedding_generations",
+    "memory_reflection_vectors",
+    "memory_reflection_recall_events",
+    "memory_persona_impressions",
+    "memory_persona_impression_versions",
+    "memory_persona_impression_sources",
+    "memory_persona_impression_fts",
+    "memory_persona_impression_embedding_generations",
+    "memory_persona_impression_vectors",
+    "memory_persona_impression_recall_events",
+    "memory_evidence_signals",
+    "memory_conflicts",
+    "memory_audit_events",
+    "memory_pipeline_state",
 }
 _REQUIRED_TRIGGER_SQL_MARKERS = {
     "memory_versions_are_immutable": (
@@ -515,6 +975,30 @@ _REQUIRED_TRIGGER_SQL_MARKERS = {
         "before delete on memory_versions",
         "when exists (select 1 from memory_groups where id = old.memory_id)",
         "raise(abort, 'memory versions can only be deleted with their group')",
+    ),
+    "memory_reflection_versions_are_immutable": (
+        "before update on memory_reflection_versions",
+        "raise(abort, 'reflection versions are immutable')",
+    ),
+    "memory_reflection_versions_no_individual_delete": (
+        "before delete on memory_reflection_versions",
+        "raise(abort, 'reflection versions can only be deleted with their group')",
+    ),
+    "memory_persona_impression_versions_are_immutable": (
+        "before update on memory_persona_impression_versions",
+        "raise(abort, 'persona impression versions are immutable')",
+    ),
+    "memory_persona_impression_versions_no_individual_delete": (
+        "before delete on memory_persona_impression_versions",
+        "raise(abort, 'persona impression versions can only be deleted with their group')",
+    ),
+    "memory_evidence_signals_are_immutable": (
+        "before update on memory_evidence_signals",
+        "raise(abort, 'memory evidence signals are immutable')",
+    ),
+    "memory_audit_events_are_immutable": (
+        "before update on memory_audit_events",
+        "raise(abort, 'memory audit events are immutable')",
     ),
 }
 _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
@@ -527,6 +1011,21 @@ _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
         "create unique index",
         "on persona_embedding_generations(persona_id)",
         "where status = 'active'",
+    ),
+    "memory_reflection_embedding_one_active_idx": (
+        "create unique index",
+        "on memory_reflection_embedding_generations(profile_id)",
+        "where status = 'active'",
+    ),
+    "memory_persona_impression_embedding_one_active_idx": (
+        "create unique index",
+        "on memory_persona_impression_embedding_generations(profile_id)",
+        "where status = 'active'",
+    ),
+    "memory_conflicts_one_open_idx": (
+        "create unique index",
+        "on memory_conflicts(target_layer, target_group_id)",
+        "where status = 'open'",
     ),
 }
 _REQUIRED_INDEX_SQL_MARKERS = {
@@ -659,10 +1158,241 @@ _REQUIRED_COLUMNS = {
         "disposition",
         "message_id",
     },
+    "memory_groups": {
+        "id",
+        "profile_id",
+        "kind",
+        "topic_key",
+        "status",
+        "pinned",
+        "current_version_id",
+        "created_at",
+        "updated_at",
+        "subject_scope",
+    },
+    "memory_versions": {
+        "id",
+        "memory_id",
+        "version_number",
+        "content",
+        "normalized_content",
+        "content_hash",
+        "search_text",
+        "importance",
+        "confidence",
+        "origin",
+        "operation",
+        "supersedes_version_id",
+        "created_at",
+        "event_started_at",
+        "event_ended_at",
+        "time_confidence",
+        "deep_memory_eligible",
+    },
+    "memory_reflections": {
+        "id",
+        "profile_id",
+        "subject_scope",
+        "topic_key",
+        "status",
+        "pinned",
+        "current_version_id",
+        "archive_candidate_since",
+        "created_at",
+        "updated_at",
+    },
+    "memory_reflection_versions": {
+        "id",
+        "reflection_id",
+        "version_number",
+        "content",
+        "normalized_content",
+        "content_hash",
+        "search_text",
+        "importance",
+        "confidence",
+        "origin",
+        "operation",
+        "supersedes_version_id",
+        "created_at",
+    },
+    "memory_reflection_sources": {
+        "id",
+        "version_id",
+        "fact_version_id",
+        "source_message_id",
+        "live_message_id",
+        "extraction_method",
+        "created_at",
+    },
+    "memory_reflection_embedding_generations": {
+        "id",
+        "profile_id",
+        "model_name",
+        "model_commit",
+        "dimension",
+        "model_sha256",
+        "calibration_threshold",
+        "status",
+        "item_count",
+        "failure_code",
+        "created_at",
+        "updated_at",
+        "activated_at",
+    },
+    "memory_reflection_vectors": {
+        "generation_id",
+        "version_id",
+        "vector_blob",
+        "vector_hash",
+        "created_at",
+    },
+    "memory_reflection_recall_events": {
+        "id",
+        "retrieval_ticket_id",
+        "profile_id",
+        "version_id",
+        "conversation_id",
+        "assistant_message_id",
+        "attempt",
+        "terminal_status",
+        "recalled_at",
+    },
+    "memory_persona_impressions": {
+        "id",
+        "profile_id",
+        "subject_scope",
+        "topic_key",
+        "status",
+        "pinned",
+        "current_version_id",
+        "archive_candidate_since",
+        "created_at",
+        "updated_at",
+    },
+    "memory_persona_impression_versions": {
+        "id",
+        "impression_id",
+        "version_number",
+        "content",
+        "normalized_content",
+        "content_hash",
+        "search_text",
+        "importance",
+        "confidence",
+        "origin",
+        "operation",
+        "supersedes_version_id",
+        "created_at",
+    },
+    "memory_persona_impression_sources": {
+        "id",
+        "version_id",
+        "reflection_version_id",
+        "source_message_id",
+        "live_message_id",
+        "extraction_method",
+        "created_at",
+    },
+    "memory_persona_impression_embedding_generations": {
+        "id",
+        "profile_id",
+        "model_name",
+        "model_commit",
+        "dimension",
+        "model_sha256",
+        "calibration_threshold",
+        "status",
+        "item_count",
+        "failure_code",
+        "created_at",
+        "updated_at",
+        "activated_at",
+    },
+    "memory_persona_impression_vectors": {
+        "generation_id",
+        "version_id",
+        "vector_blob",
+        "vector_hash",
+        "created_at",
+    },
+    "memory_persona_impression_recall_events": {
+        "id",
+        "retrieval_ticket_id",
+        "profile_id",
+        "version_id",
+        "conversation_id",
+        "assistant_message_id",
+        "attempt",
+        "terminal_status",
+        "recalled_at",
+    },
+    "memory_evidence_signals": {
+        "id",
+        "profile_id",
+        "target_layer",
+        "target_group_id",
+        "target_version_id",
+        "source_message_id",
+        "source_fact_version_id",
+        "signal_kind",
+        "reinforcement_delta",
+        "disputation_delta",
+        "correlation_key",
+        "created_at",
+    },
+    "memory_conflicts": {
+        "id",
+        "profile_id",
+        "target_layer",
+        "target_group_id",
+        "incumbent_version_id",
+        "challenger_version_id",
+        "status",
+        "resolution",
+        "source_message_id",
+        "created_at",
+        "resolved_at",
+    },
+    "memory_audit_events": {
+        "id",
+        "profile_id",
+        "owner_layer",
+        "owner_group_id",
+        "version_id",
+        "source_message_id",
+        "event_type",
+        "reason_code",
+        "reinforcement_delta",
+        "disputation_delta",
+        "metadata_json",
+        "occurred_at",
+    },
+    "memory_pipeline_state": {
+        "profile_id",
+        "completed_turn_count",
+        "last_signal_message_sequence",
+        "last_signal_at",
+        "last_maintenance_at",
+        "created_at",
+        "updated_at",
+    },
 }
 _REQUIRED_FTS_COLUMNS = {
     "memory_fts": {"version_id", "memory_id", "profile_id", "search_text"},
     "persona_fts": {"knowledge_id", "persona_id", "search_text"},
+    "memory_reflection_fts": {
+        "version_id",
+        "reflection_id",
+        "profile_id",
+        "search_text",
+    },
+    "memory_persona_impression_fts": {
+        "version_id",
+        "impression_id",
+        "profile_id",
+        "search_text",
+    },
 }
 _REQUIRED_FTS_SQL_MARKERS = (
     "virtual table",

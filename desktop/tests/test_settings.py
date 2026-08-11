@@ -87,6 +87,25 @@ def test_unversioned_settings_migrate_and_persist(tmp_path: Path) -> None:
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
 
+def test_schema_v8_to_v9_enables_deep_memory_without_changing_total_switch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy["schema_version"] = 8
+    legacy["memory"] = {"enabled": False}
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["schema_version"] == 9
+    assert loaded["memory"] == {
+        "enabled": False,
+        "deep_memory_enabled": True,
+    }
+    assert json.loads(path.read_text(encoding="utf-8")) == loaded
+
+
 def test_schema_v1_migrates_to_pet_defaults(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text(
@@ -154,7 +173,7 @@ def test_schema_v4_migrates_through_p7e_defaults_without_losing_existing_data(
     }
     assert loaded["provider_enabled"] is True
     assert loaded["provider"] == legacy["provider"]
-    assert loaded["memory"] == {"enabled": False}
+    assert loaded["memory"] == {"enabled": False, "deep_memory_enabled": True}
     assert loaded["general"] == DEFAULT_SETTINGS["general"]
     assert loaded["persona"] == DEFAULT_SETTINGS["persona"]
     assert loaded["proactive"] == DEFAULT_SETTINGS["proactive"]

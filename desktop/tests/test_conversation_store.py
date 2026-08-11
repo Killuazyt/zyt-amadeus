@@ -343,3 +343,85 @@ def test_jobs_are_idempotent_filterable_recoverable_and_manually_retryable(store
 
     with pytest.raises(StorageConflictError):
         jobs.retry_failed(extraction.job_id)
+
+
+def test_deep_cycle_coalesces_true_idle_deadline_turn_trigger_and_crash_recovery(
+    tmp_path,
+) -> None:
+    current = [datetime(2026, 8, 11, tzinfo=UTC)]
+
+    def clock() -> datetime:
+        return current[0]
+
+    database = SQLiteDatabase(tmp_path / "deep-schedule.sqlite3").open()
+    ConversationStore(database, clock=clock).ensure_default_profile()
+    jobs = BackgroundJobStore(database, clock=clock)
+    try:
+        first = jobs.schedule_deep_memory_cycle(
+            completed_turn_count=1,
+            source_message_ids=("user-1",),
+            profile_id="default",
+            conversation_id=None,
+            message_id=None,
+            run_after=current[0] + timedelta(minutes=5),
+            trigger="idle",
+        )
+        current[0] += timedelta(minutes=4)
+        coalesced = jobs.schedule_deep_memory_cycle(
+            completed_turn_count=2,
+            source_message_ids=("user-2",),
+            profile_id="default",
+            conversation_id=None,
+            message_id=None,
+            run_after=current[0] + timedelta(minutes=5),
+            trigger="idle",
+        )
+        assert coalesced.job_id == first.job_id
+        assert coalesced.run_after == current[0] + timedelta(minutes=5)
+        assert coalesced.payload == {
+            "source_message_ids": ["user-1", "user-2"],
+            "trigger": "idle",
+        }
+
+        current[0] += timedelta(minutes=1)
+        assert jobs.claim_ready(kinds=("deep_memory_cycle",)) == ()
+        current[0] += timedelta(minutes=4)
+        running = jobs.claim_ready(kinds=("deep_memory_cycle",))[0]
+        assert running.job_id == first.job_id
+        assert jobs.recover_interrupted() == 1
+        recovered = jobs.claim_ready(kinds=("deep_memory_cycle",))[0]
+        assert recovered.job_id == first.job_id
+        assert recovered.attempt_count == 2
+        jobs.mark_completed(recovered.job_id)
+
+        followup = jobs.enqueue(
+            "deep_memory_cycle",
+            "deep-synthesis:separate-followup",
+            payload={"source_message_ids": [], "trigger": "evidence_followup"},
+            profile_id="default",
+            run_after=current[0] + timedelta(minutes=10),
+        )
+        pending = jobs.schedule_deep_memory_cycle(
+            completed_turn_count=9,
+            source_message_ids=("user-9",),
+            profile_id="default",
+            conversation_id=None,
+            message_id=None,
+            run_after=current[0] + timedelta(minutes=5),
+            trigger="idle",
+        )
+        assert pending.job_id != followup.job_id
+        immediate = jobs.schedule_deep_memory_cycle(
+            completed_turn_count=10,
+            source_message_ids=("user-10",),
+            profile_id="default",
+            conversation_id=None,
+            message_id=None,
+            run_after=current[0],
+            trigger="turn",
+        )
+        assert immediate.job_id == pending.job_id
+        assert immediate.payload["trigger"] == "turn"
+        assert jobs.claim_ready(kinds=("deep_memory_cycle",))[0].job_id == pending.job_id
+    finally:
+        database.close()

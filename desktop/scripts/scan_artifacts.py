@@ -238,6 +238,7 @@ def _is_local_data_export(payload: bytes) -> bool:
         "amadeus-chat-export/v1",
         "amadeus-chat-export/v2",
         "amadeus-memory-export/v1",
+        "amadeus-memory-export/v2",
     }
 
 

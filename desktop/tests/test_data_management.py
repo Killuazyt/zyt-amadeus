@@ -14,6 +14,7 @@ import pytest
 from PIL import Image
 
 import amadeus_desktop.data_management as data_management
+import amadeus_desktop.database as database_module
 from amadeus_desktop import __version__
 from amadeus_desktop.attachments import AttachmentStore
 from amadeus_desktop.conversation_store import ConversationStore
@@ -42,10 +43,16 @@ from amadeus_desktop.data_management import (
     validate_backup_archive,
 )
 from amadeus_desktop.database import AMADEUS_APPLICATION_ID, SCHEMA_VERSION, SQLiteDatabase
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
+from amadeus_desktop.memory_models import MemoryLayer
 from amadeus_desktop.memory_store import MemoryStore
 from amadeus_desktop.paths import AppDirectory, AppPaths
 from amadeus_desktop.persona_repository import PersonaRepository
-from amadeus_desktop.settings import CURRENT_SCHEMA_VERSION, DEFAULT_SETTINGS
+from amadeus_desktop.settings import (
+    CURRENT_SCHEMA_VERSION,
+    DEFAULT_SETTINGS,
+    SettingsRepository,
+)
 from amadeus_desktop.storage_models import (
     StoredAttachment,
     StoredAttachmentKind,
@@ -304,14 +311,100 @@ def test_versioned_exports_are_atomic_utf8_and_do_not_read_settings_or_credentia
         "format",
         "exported_at",
         "database_schema",
-        "groups",
-        "versions",
-        "sources",
+        "layers",
+        "evidence_signals",
+        "conflicts",
+        "audit_events",
     }
+    assert set(memory["layers"]) == {
+        "recent",
+        "facts",
+        "reflections",
+        "persona_impressions",
+    }
+    assert "content" not in memory["layers"]["recent"]["message_refs"][0]
+    assert "vector_blob" not in json.dumps(memory, ensure_ascii=False)
     combined = chat_path.read_text(encoding="utf-8") + memory_path.read_text(encoding="utf-8")
     assert "provider_enabled" not in combined
     assert "credential" not in combined.casefold()
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_memory_export_v2_contains_lineage_evidence_conflicts_and_bodyless_audit(
+    tmp_path: Path,
+) -> None:
+    database = _seed_database(tmp_path)
+    conversations = ConversationStore(database, clock=lambda: FIXED_TIME)
+    memories = MemoryStore(database, clock=lambda: FIXED_TIME)
+    deep = DeepMemoryStore(database, clock=lambda: FIXED_TIME)
+    try:
+        conversation = conversations.list_conversations()[0]
+        fact_ids = [memories.get("memory-1").current_version.version_id]
+        for index in range(4):
+            message = conversations.save_user_message(
+                conversation.conversation_id,
+                f"deep-export-turn-{index}",
+                f"deep-export-user-{index}",
+                f"我第 {index + 1} 次表示重视稳定互动",
+            )
+            fact = memories.create_memory(
+                "relationship",
+                f"稳定互动:{index}",
+                f"用户第 {index + 1} 次表示重视稳定互动",
+                source_message_ids=(message.message_id,),
+            )
+            fact_ids.append(fact.current_version.version_id)
+        reflection = deep.create_reflection(
+            "用户通过稳定互动建立信任",
+            "稳定互动 信任",
+            fact_version_ids=fact_ids,
+            importance=1.0,
+        )
+        deep.confirm(MemoryLayer.REFLECTION, reflection.group_id)
+        deep.confirm(MemoryLayer.REFLECTION, reflection.group_id)
+        impression = deep.promote_reflection(reflection.group_id)
+        challenger = conversations.save_user_message(
+            conversation.conversation_id,
+            "deep-export-conflict-turn",
+            "deep-export-conflict-user",
+            "我对稳定互动的看法似乎有变化",
+        )
+        deep.open_fact_conflict(
+            memories.list_memories(kind="relationship")[0].memory_id,
+            "用户可能不再重视稳定互动",
+            source_message_id=challenger.message_id,
+            importance=0.7,
+            confidence=0.6,
+        )
+        destination = export_memory_json(
+            tmp_path / "deep-memory.json",
+            lambda: SQLiteExportRepository(database.connection).load_memory_bundle(),
+            exported_at=FIXED_TIME,
+        )
+    finally:
+        database.close()
+
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert payload["format"] == "amadeus-memory-export/v2"
+    reflection_layer = payload["layers"]["reflections"]
+    persona_layer = payload["layers"]["persona_impressions"]
+    assert reflection_layer["groups"][0]["id"] == reflection.group_id
+    assert reflection_layer["sources"][0]["fact_version_id"] in fact_ids
+    assert persona_layer["groups"][0]["id"] == impression.group_id
+    assert persona_layer["sources"][0]["reflection_version_id"] == (
+        reflection.current_version.version_id
+    )
+    assert payload["evidence_signals"]
+    assert payload["conflicts"][0]["status"] == "open"
+    assert payload["audit_events"]
+    serialized_audit = json.dumps(payload["audit_events"], ensure_ascii=False)
+    assert "用户通过稳定互动建立信任" not in serialized_audit
+    assert all(
+        "content" not in reference for reference in payload["layers"]["recent"]["message_refs"]
+    )
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "vector_blob" not in serialized
+    assert "角色在公开研究机构工作" not in serialized
 
 
 def test_export_failure_preserves_existing_destination(monkeypatch, tmp_path: Path) -> None:
@@ -686,7 +779,20 @@ def test_staged_restore_replaces_database_and_settings_and_drops_sidecars(
                 restored.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0] == 1
             )
             assert restored.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0] == 2
-            assert restored.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 2
+            assert restored.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] == 3
+            assert (
+                restored.execute(
+                    "SELECT COUNT(*) FROM memory_sources WHERE live_message_id = ?",
+                    ("user-1",),
+                ).fetchone()[0]
+                == 2
+            )
+            assert (
+                restored.execute(
+                    "SELECT COUNT(*) FROM memory_sources WHERE extraction_method = 'manual'"
+                ).fetchone()[0]
+                == 1
+            )
             assert restored.execute("SELECT COUNT(*) FROM memory_vectors").fetchone()[0] == 1
             assert restored.execute("SELECT COUNT(*) FROM persona_vectors").fetchone()[0] == 1
             assert (
@@ -701,6 +807,58 @@ def test_staged_restore_replaces_database_and_settings_and_drops_sidecars(
                 ).fetchone()[0]
                 == "persona-p6"
             )
+    finally:
+        discard_staged_restore(payload)
+
+
+def test_old_v5_database_and_v8_settings_backup_restores_then_migrates_to_p7f(
+    tmp_path: Path,
+) -> None:
+    legacy_database = tmp_path / "legacy-v5.sqlite3"
+    with sqlite3.connect(legacy_database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        for migrate in (
+            database_module._migrate_to_v1,
+            database_module._migrate_to_v2,
+            database_module._migrate_to_v3,
+            database_module._migrate_to_v4,
+            database_module._migrate_to_v5,
+        ):
+            migrate(connection)
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+    legacy_settings = deepcopy(DEFAULT_SETTINGS)
+    legacy_settings["schema_version"] = 8
+    legacy_settings["memory"] = {"enabled": True}
+    archive = _manual_archive(
+        tmp_path / "legacy.amadeus-backup",
+        legacy_database,
+        legacy_settings,
+    )
+    payload = stage_backup_for_restore(archive, tmp_path / "legacy-stage")
+    paths = AppPaths.for_current_user(tmp_path / "legacy-restored")
+    try:
+        apply_validated_restore(payload, paths)
+        migrated_database = SQLiteDatabase(
+            paths.database_file,
+            backup_dir=paths.directory(AppDirectory.BACKUPS),
+        ).open()
+        try:
+            assert migrated_database.schema_version == 6
+            assert "memory_reflections" in {
+                row[0]
+                for row in migrated_database.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            migrated_database.close()
+        settings = SettingsRepository(paths.settings_file).load()
+        assert settings["schema_version"] == 9
+        assert settings["memory"] == {
+            "enabled": True,
+            "deep_memory_enabled": True,
+        }
     finally:
         discard_staged_restore(payload)
 

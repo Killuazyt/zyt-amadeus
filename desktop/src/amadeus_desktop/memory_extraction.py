@@ -9,6 +9,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -17,6 +18,7 @@ from amadeus_desktop.memory_models import (
     MemoryCandidate,
     MemoryKind,
     MemoryOperation,
+    MemorySubjectScope,
     SourceRole,
 )
 from amadeus_desktop.memory_search import normalize_topic_key
@@ -28,7 +30,7 @@ MAX_TOPIC_KEY_CHARS = 200
 MAX_SOURCE_IDS = 20
 
 _ROOT_FIELDS = frozenset({"candidates"})
-_CANDIDATE_FIELDS = frozenset(
+_LEGACY_CANDIDATE_FIELDS = frozenset(
     {
         "type",
         "operation",
@@ -39,6 +41,13 @@ _CANDIDATE_FIELDS = frozenset(
         "source_message_ids",
     }
 )
+_CANDIDATE_FIELDS = _LEGACY_CANDIDATE_FIELDS | {
+    "subject_scope",
+    "event_started_at",
+    "event_ended_at",
+    "time_confidence",
+    "correction_explicit",
+}
 
 _DO_NOT_REMEMBER_PATTERNS = (
     re.compile(r"(?:不要|别|不用|不必|不准)(?:帮我)?(?:记住|记录|记下来|保存|存储)"),
@@ -319,7 +328,10 @@ def _contains_high_entropy_token(text: str) -> bool:
 
 
 def _parse_candidate(value: Any) -> MemoryCandidate:
-    if not isinstance(value, dict) or frozenset(value) != _CANDIDATE_FIELDS:
+    if not isinstance(value, dict) or frozenset(value) not in {
+        _LEGACY_CANDIDATE_FIELDS,
+        _CANDIDATE_FIELDS,
+    }:
         raise ExtractionPayloadError(ExtractionPayloadErrorCode.CANDIDATE_SCHEMA)
 
     try:
@@ -337,6 +349,29 @@ def _parse_candidate(value: Any) -> MemoryCandidate:
     importance = _unit_number(value["importance"])
     confidence = _unit_number(value["confidence"])
     source_message_ids = _source_ids(value["source_message_ids"])
+    subject_scope = MemorySubjectScope.USER
+    event_started_at = None
+    event_ended_at = None
+    time_confidence = None
+    correction_explicit = False
+    if frozenset(value) == _CANDIDATE_FIELDS:
+        try:
+            subject_scope = MemorySubjectScope(_required_text(value["subject_scope"], 32))
+        except ValueError as exc:
+            raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE) from exc
+        if subject_scope is MemorySubjectScope.COMPANION:
+            raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
+        event_started_at = _optional_timestamp(value["event_started_at"])
+        event_ended_at = _optional_timestamp(value["event_ended_at"])
+        raw_time_confidence = value["time_confidence"]
+        time_confidence = None if raw_time_confidence is None else _unit_number(raw_time_confidence)
+        if not isinstance(value["correction_explicit"], bool):
+            raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
+        correction_explicit = bool(value["correction_explicit"])
+        if kind is not MemoryKind.EVENT and any(
+            item is not None for item in (event_started_at, event_ended_at, time_confidence)
+        ):
+            raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
     return MemoryCandidate(
         kind=kind,
         operation=operation,
@@ -345,6 +380,11 @@ def _parse_candidate(value: Any) -> MemoryCandidate:
         importance=importance,
         confidence=confidence,
         source_message_ids=source_message_ids,
+        subject_scope=subject_scope,
+        event_started_at=event_started_at,
+        event_ended_at=event_ended_at,
+        time_confidence=time_confidence,
+        correction_explicit=correction_explicit,
     )
 
 
@@ -367,6 +407,19 @@ def _unit_number(value: Any) -> float:
     if not math.isfinite(number) or not 0.0 <= number <= 1.0:
         raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
     return number
+
+
+def _optional_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = _required_text(value, 64)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE) from exc
+    if parsed.tzinfo is None:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _source_ids(value: Any) -> tuple[str, ...]:

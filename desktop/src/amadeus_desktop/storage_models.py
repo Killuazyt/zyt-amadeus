@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
 
-from amadeus_desktop.memory_models import MemoryKind
+from amadeus_desktop.memory_models import MemoryKind, MemorySubjectScope
 
 DEFAULT_PROFILE_ID = "default"
 
@@ -108,6 +108,8 @@ class MemoryVersionOperation(StrEnum):
 
 class EmbeddingCorpus(StrEnum):
     MEMORY = "memory"
+    REFLECTION = "reflection"
+    PERSONA_IMPRESSION = "persona_impression"
     PERSONA = "persona"
 
 
@@ -240,6 +242,10 @@ class MemoryVersion:
     operation: MemoryVersionOperation
     supersedes_version_id: str | None
     created_at: datetime
+    event_started_at: datetime | None = None
+    event_ended_at: datetime | None = None
+    time_confidence: float | None = None
+    deep_memory_eligible: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +259,7 @@ class MemoryRecord:
     current_version: MemoryVersion
     created_at: datetime
     updated_at: datetime
+    subject_scope: MemorySubjectScope = MemorySubjectScope.USER
 
 
 @dataclass(frozen=True, slots=True)

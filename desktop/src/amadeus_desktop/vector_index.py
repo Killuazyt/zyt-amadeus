@@ -12,6 +12,7 @@ from typing import Protocol, TypeVar
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
 from amadeus_desktop.embedding_backend import (
     CPU_PROVIDER,
     EmbeddingBackend,
@@ -19,6 +20,7 @@ from amadeus_desktop.embedding_backend import (
 )
 from amadeus_desktop.embedding_model import PINNED_MODEL
 from amadeus_desktop.hybrid_retrieval import RankedRetrievalHit
+from amadeus_desktop.memory_models import MemoryLayer
 from amadeus_desktop.memory_store import MemoryStore
 from amadeus_desktop.persona_repository import PersonaRepository
 from amadeus_desktop.retrieval_pipeline import VectorRetrievalResult
@@ -54,6 +56,7 @@ class VectorIndexRepositories:
     memories: MemoryStore
     personas: PersonaRepository
     vectors: VectorStore
+    deep_memories: DeepMemoryStore | None = None
 
 
 RepositoryResolver = Callable[[object], VectorIndexRepositories]
@@ -71,6 +74,10 @@ class VectorIndexStatus:
     user_count: int
     persona_generation_id: str | None
     persona_count: int
+    reflection_generation_id: str | None = None
+    reflection_count: int = 0
+    persona_impression_generation_id: str | None = None
+    persona_impression_count: int = 0
 
     @property
     def model_status(self) -> str:
@@ -138,6 +145,8 @@ class _LoadedCorpus:
 @dataclass(frozen=True, slots=True)
 class _LoadedState:
     user: _LoadedCorpus | None
+    reflection: _LoadedCorpus | None
+    persona_impression: _LoadedCorpus | None
     persona: _LoadedCorpus | None
 
 
@@ -151,6 +160,8 @@ class _Document:
 @dataclass(frozen=True, slots=True)
 class _RebuildSeed:
     user_generation_id: str
+    reflection_generation_id: str
+    persona_impression_generation_id: str
     persona_generation_id: str
     documents: tuple[_Document, ...]
 
@@ -160,8 +171,12 @@ class _RebuildContext:
     seed: _RebuildSeed
     offset: int = 0
     user_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    reflection_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    persona_impression_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
     persona_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
     user_snapshot: VectorCacheSnapshot | None = None
+    reflection_snapshot: VectorCacheSnapshot | None = None
+    persona_impression_snapshot: VectorCacheSnapshot | None = None
     persona_snapshot: VectorCacheSnapshot | None = None
 
 
@@ -183,6 +198,8 @@ class _PersonaRebuildContext:
 class _IncrementalSeed:
     requires_rebuild: bool
     user_generation_id: str | None = None
+    reflection_generation_id: str | None = None
+    persona_impression_generation_id: str | None = None
     persona_generation_id: str | None = None
     documents: tuple[_Document, ...] = ()
 
@@ -192,6 +209,8 @@ class _IncrementalContext:
     seed: _IncrementalSeed
     offset: int = 0
     user_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    reflection_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    persona_impression_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
     persona_vectors: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
 
@@ -241,6 +260,8 @@ class VectorIndexCoordinator(QObject):
         self._operation_epoch = 0
         self._thresholds = {
             VectorCorpus.USER_MEMORY: self._calibration_threshold,
+            VectorCorpus.MEMORY_REFLECTION: self._calibration_threshold,
+            VectorCorpus.MEMORY_PERSONA_IMPRESSION: self._calibration_threshold,
             VectorCorpus.PERSONA_KNOWLEDGE: self._calibration_threshold,
         }
         self._state_lock = threading.Lock()
@@ -369,6 +390,7 @@ class VectorIndexCoordinator(QObject):
         user_limit: int = 30,
         persona_limit: int = 30,
         include_user: bool = True,
+        include_deep: bool = True,
     ) -> Future[VectorQueryResult]:
         """Embed and scan both immutable caches at foreground priority."""
 
@@ -388,6 +410,8 @@ class VectorIndexCoordinator(QObject):
                 with self._state_lock:
                     user_threshold = self._thresholds[VectorCorpus.USER_MEMORY]
                     persona_threshold = self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE]
+                    reflection_threshold = self._thresholds[VectorCorpus.MEMORY_REFLECTION]
+                    impression_threshold = self._thresholds[VectorCorpus.MEMORY_PERSONA_IMPRESSION]
                 user_hits = (
                     self._caches.search(
                         VectorCorpus.USER_MEMORY,
@@ -396,6 +420,26 @@ class VectorIndexCoordinator(QObject):
                         minimum_score=user_threshold,
                     )
                     if include_user
+                    else ()
+                )
+                reflection_hits = (
+                    self._caches.search(
+                        VectorCorpus.MEMORY_REFLECTION,
+                        vector,
+                        limit=user_limit,
+                        minimum_score=reflection_threshold,
+                    )
+                    if include_user and include_deep
+                    else ()
+                )
+                impression_hits = (
+                    self._caches.search(
+                        VectorCorpus.MEMORY_PERSONA_IMPRESSION,
+                        vector,
+                        limit=user_limit,
+                        minimum_score=impression_threshold,
+                    )
+                    if include_user and include_deep
                     else ()
                 )
                 persona_hits = self._caches.search(
@@ -408,11 +452,24 @@ class VectorIndexCoordinator(QObject):
                     user_hits=tuple(
                         RankedRetrievalHit(hit.target_id, hit.rank, hit.score) for hit in user_hits
                     ),
+                    reflection_hits=tuple(
+                        RankedRetrievalHit(hit.target_id, hit.rank, hit.score)
+                        for hit in reflection_hits
+                    ),
+                    persona_impression_hits=tuple(
+                        RankedRetrievalHit(hit.target_id, hit.rank, hit.score)
+                        for hit in impression_hits
+                    ),
                     persona_hits=tuple(
                         RankedRetrievalHit(hit.target_id, hit.rank, hit.score)
                         for hit in persona_hits
                     ),
-                    threshold=min(user_threshold, persona_threshold),
+                    threshold=min(
+                        user_threshold,
+                        reflection_threshold,
+                        impression_threshold,
+                        persona_threshold,
+                    ),
                 )
             except Exception as error:
                 self._disable_backend(error)
@@ -497,6 +554,8 @@ class VectorIndexCoordinator(QObject):
             if backend is not None:
                 backend.close()
             self._caches.clear(VectorCorpus.USER_MEMORY)
+            self._caches.clear(VectorCorpus.MEMORY_REFLECTION)
+            self._caches.clear(VectorCorpus.MEMORY_PERSONA_IMPRESSION)
             self._caches.clear(VectorCorpus.PERSONA_KNOWLEDGE)
 
         try:
@@ -510,12 +569,30 @@ class VectorIndexCoordinator(QObject):
         repositories = self._repository_resolver(resource)
         repositories.vectors.recover_interrupted_generations()
         user_generation = repositories.vectors.get_active_memory_generation()
+        reflection_generation = repositories.vectors.get_active_reflection_generation()
+        impression_generation = repositories.vectors.get_active_persona_impression_generation()
         persona_generation = repositories.vectors.get_active_persona_generation(self._persona_id)
         return _LoadedState(
             user=(
                 None
                 if user_generation is None
                 else _LoadedCorpus(user_generation, repositories.vectors.load_memory_vectors())
+            ),
+            reflection=(
+                None
+                if reflection_generation is None
+                else _LoadedCorpus(
+                    reflection_generation,
+                    repositories.vectors.load_reflection_vectors(),
+                )
+            ),
+            persona_impression=(
+                None
+                if impression_generation is None
+                else _LoadedCorpus(
+                    impression_generation,
+                    repositories.vectors.load_persona_impression_vectors(),
+                )
             ),
             persona=(
                 None
@@ -534,10 +611,17 @@ class VectorIndexCoordinator(QObject):
         loaded = value
         assert isinstance(loaded, _LoadedState)
 
-        def operation() -> tuple[VectorCacheSnapshot | None, VectorCacheSnapshot | None]:
+        def operation() -> tuple[
+            VectorCacheSnapshot | None,
+            VectorCacheSnapshot | None,
+            VectorCacheSnapshot | None,
+            VectorCacheSnapshot | None,
+        ]:
             self._require_backend()
             return (
                 self._snapshot_from_loaded(loaded.user),
+                self._snapshot_from_loaded(loaded.reflection),
+                self._snapshot_from_loaded(loaded.persona_impression),
                 self._snapshot_from_loaded(loaded.persona),
             )
 
@@ -548,10 +632,22 @@ class VectorIndexCoordinator(QObject):
             return
 
         def completed(
-            result: Future[tuple[VectorCacheSnapshot | None, VectorCacheSnapshot | None]],
+            result: Future[
+                tuple[
+                    VectorCacheSnapshot | None,
+                    VectorCacheSnapshot | None,
+                    VectorCacheSnapshot | None,
+                    VectorCacheSnapshot | None,
+                ]
+            ],
         ) -> None:
             try:
-                user_snapshot, persona_snapshot = result.result()
+                (
+                    user_snapshot,
+                    reflection_snapshot,
+                    impression_snapshot,
+                    persona_snapshot,
+                ) = result.result()
             except Exception as error:
                 if _safe_embedding_category(error) == "generation_model_mismatch":
                     if self._finish_persisted_load_failure(
@@ -573,7 +669,12 @@ class VectorIndexCoordinator(QObject):
             with self._state_lock:
                 if self._closed or not self._load_in_progress or epoch != self._operation_epoch:
                     return
-                self._replace_caches(user_snapshot, persona_snapshot)
+                self._replace_caches(
+                    user_snapshot,
+                    reflection_snapshot,
+                    impression_snapshot,
+                    persona_snapshot,
+                )
                 if loaded.user is not None:
                     self._thresholds[VectorCorpus.USER_MEMORY] = (
                         loaded.user.generation.calibration_threshold
@@ -581,6 +682,14 @@ class VectorIndexCoordinator(QObject):
                 if loaded.persona is not None:
                     self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE] = (
                         loaded.persona.generation.calibration_threshold
+                    )
+                if loaded.reflection is not None:
+                    self._thresholds[VectorCorpus.MEMORY_REFLECTION] = (
+                        loaded.reflection.generation.calibration_threshold
+                    )
+                if loaded.persona_impression is not None:
+                    self._thresholds[VectorCorpus.MEMORY_PERSONA_IMPRESSION] = (
+                        loaded.persona_impression.generation.calibration_threshold
                     )
                 self._load_in_progress = False
                 persona_pending = self._persona_rebuild_pending
@@ -629,8 +738,15 @@ class VectorIndexCoordinator(QObject):
     def _begin_incremental(self, resource: object) -> _IncrementalSeed:
         repositories = self._repository_resolver(resource)
         user_generation = repositories.vectors.get_active_memory_generation()
+        reflection_generation = repositories.vectors.get_active_reflection_generation()
+        impression_generation = repositories.vectors.get_active_persona_impression_generation()
         persona_generation = repositories.vectors.get_active_persona_generation(self._persona_id)
-        if user_generation is None or persona_generation is None:
+        if (
+            user_generation is None
+            or reflection_generation is None
+            or impression_generation is None
+            or persona_generation is None
+        ):
             return _IncrementalSeed(requires_rebuild=True)
 
         user_documents = repositories.memories.list_active_documents(limit=MAX_INDEX_DOCUMENTS)
@@ -638,12 +754,36 @@ class VectorIndexCoordinator(QObject):
             self._persona_id,
             limit=MAX_INDEX_DOCUMENTS,
         )
+        reflection_documents = (
+            ()
+            if repositories.deep_memories is None
+            else repositories.deep_memories.list_active_documents(
+                MemoryLayer.REFLECTION,
+                limit=MAX_INDEX_DOCUMENTS,
+            )
+        )
+        impression_documents = (
+            ()
+            if repositories.deep_memories is None
+            else repositories.deep_memories.list_active_documents(
+                MemoryLayer.PERSONA,
+                limit=MAX_INDEX_DOCUMENTS,
+            )
+        )
         current_user = {
             document.current_version.version_id: document.current_version.content
             for document in user_documents
         }
         current_persona = {
             document.knowledge_id: document.content for document in persona_documents
+        }
+        current_reflection = {
+            document.current_version.version_id: document.current_version.content
+            for document in reflection_documents
+        }
+        current_impression = {
+            document.current_version.version_id: document.current_version.content
+            for document in impression_documents
         }
         try:
             stored_user = {
@@ -653,23 +793,50 @@ class VectorIndexCoordinator(QObject):
                 vector.target_id
                 for vector in repositories.vectors.load_persona_vectors(self._persona_id)
             }
+            stored_reflection = {
+                vector.target_id for vector in repositories.vectors.load_reflection_vectors()
+            }
+            stored_impression = {
+                vector.target_id
+                for vector in repositories.vectors.load_persona_impression_vectors()
+            }
         except Exception:
             return _IncrementalSeed(requires_rebuild=True)
-        if stored_user - set(current_user) or stored_persona - set(current_persona):
+        if (
+            stored_user - set(current_user)
+            or stored_reflection - set(current_reflection)
+            or stored_impression - set(current_impression)
+            or stored_persona - set(current_persona)
+        ):
             return _IncrementalSeed(requires_rebuild=True)
 
-        documents = tuple(
-            _Document(VectorCorpus.USER_MEMORY, target_id, content)
-            for target_id, content in current_user.items()
-            if target_id not in stored_user
-        ) + tuple(
-            _Document(VectorCorpus.PERSONA_KNOWLEDGE, target_id, content)
-            for target_id, content in current_persona.items()
-            if target_id not in stored_persona
+        documents = (
+            tuple(
+                _Document(VectorCorpus.USER_MEMORY, target_id, content)
+                for target_id, content in current_user.items()
+                if target_id not in stored_user
+            )
+            + tuple(
+                _Document(VectorCorpus.MEMORY_REFLECTION, target_id, content)
+                for target_id, content in current_reflection.items()
+                if target_id not in stored_reflection
+            )
+            + tuple(
+                _Document(VectorCorpus.MEMORY_PERSONA_IMPRESSION, target_id, content)
+                for target_id, content in current_impression.items()
+                if target_id not in stored_impression
+            )
+            + tuple(
+                _Document(VectorCorpus.PERSONA_KNOWLEDGE, target_id, content)
+                for target_id, content in current_persona.items()
+                if target_id not in stored_persona
+            )
         )
         return _IncrementalSeed(
             requires_rebuild=False,
             user_generation_id=user_generation.generation_id,
+            reflection_generation_id=reflection_generation.generation_id,
+            persona_impression_generation_id=impression_generation.generation_id,
             persona_generation_id=persona_generation.generation_id,
             documents=documents,
         )
@@ -716,11 +883,7 @@ class VectorIndexCoordinator(QObject):
             try:
                 vectors = result.result()
                 for document, vector in zip(batch, vectors, strict=True):
-                    target = (
-                        context.user_vectors
-                        if document.corpus is VectorCorpus.USER_MEMORY
-                        else context.persona_vectors
-                    )
+                    target = _context_vectors(context, document.corpus)
                     target[document.target_id] = vector
                 context.offset += len(batch)
                 self._submit_incremental_batch(context)
@@ -732,6 +895,8 @@ class VectorIndexCoordinator(QObject):
 
     def _persist_incremental(self, context: _IncrementalContext) -> None:
         assert context.seed.user_generation_id is not None
+        assert context.seed.reflection_generation_id is not None
+        assert context.seed.persona_impression_generation_id is not None
         assert context.seed.persona_generation_id is not None
 
         def operation(resource: object) -> _LoadedState:
@@ -745,6 +910,18 @@ class VectorIndexCoordinator(QObject):
             for target_id, vector in context.persona_vectors.items():
                 repositories.vectors.upsert_persona_vector(
                     context.seed.persona_generation_id,
+                    target_id,
+                    vector,
+                )
+            for target_id, vector in context.reflection_vectors.items():
+                repositories.vectors.upsert_reflection_vector(
+                    context.seed.reflection_generation_id,
+                    target_id,
+                    vector,
+                )
+            for target_id, vector in context.persona_impression_vectors.items():
+                repositories.vectors.upsert_persona_impression_vector(
+                    context.seed.persona_impression_generation_id,
                     target_id,
                     vector,
                 )
@@ -773,9 +950,16 @@ class VectorIndexCoordinator(QObject):
         loaded = value
         assert isinstance(loaded, _LoadedState)
 
-        def operation() -> tuple[VectorCacheSnapshot | None, VectorCacheSnapshot | None]:
+        def operation() -> tuple[
+            VectorCacheSnapshot | None,
+            VectorCacheSnapshot | None,
+            VectorCacheSnapshot | None,
+            VectorCacheSnapshot | None,
+        ]:
             return (
                 self._snapshot_from_loaded(loaded.user),
+                self._snapshot_from_loaded(loaded.reflection),
+                self._snapshot_from_loaded(loaded.persona_impression),
                 self._snapshot_from_loaded(loaded.persona),
             )
 
@@ -789,14 +973,21 @@ class VectorIndexCoordinator(QObject):
             return
 
         def completed(
-            result: Future[tuple[VectorCacheSnapshot | None, VectorCacheSnapshot | None]],
+            result: Future[
+                tuple[
+                    VectorCacheSnapshot | None,
+                    VectorCacheSnapshot | None,
+                    VectorCacheSnapshot | None,
+                    VectorCacheSnapshot | None,
+                ]
+            ],
         ) -> None:
             try:
-                user, persona = result.result()
+                user, reflection, impression, persona = result.result()
             except Exception:
                 self._finish_incremental_failure("invalid_vector")
                 return
-            self._replace_caches(user, persona)
+            self._replace_caches(user, reflection, impression, persona)
             self._finish_incremental_success()
 
         future.add_done_callback(completed)
@@ -980,10 +1171,42 @@ class VectorIndexCoordinator(QObject):
         persona_documents = repositories.personas.list_active_documents(
             self._persona_id, limit=MAX_INDEX_DOCUMENTS
         )
+        reflection_documents = (
+            ()
+            if repositories.deep_memories is None
+            else repositories.deep_memories.list_active_documents(
+                MemoryLayer.REFLECTION,
+                limit=MAX_INDEX_DOCUMENTS,
+            )
+        )
+        impression_documents = (
+            ()
+            if repositories.deep_memories is None
+            else repositories.deep_memories.list_active_documents(
+                MemoryLayer.PERSONA,
+                limit=MAX_INDEX_DOCUMENTS,
+            )
+        )
         user_generation: EmbeddingGeneration | None = None
+        reflection_generation: EmbeddingGeneration | None = None
+        impression_generation: EmbeddingGeneration | None = None
         persona_generation: EmbeddingGeneration | None = None
         try:
             user_generation = repositories.vectors.begin_memory_generation(
+                model_name=PINNED_MODEL.api_name,
+                model_commit=PINNED_MODEL.revision,
+                model_sha256=PINNED_MODEL.onnx_sha256,
+                calibration_threshold=self._calibration_threshold,
+                dimension=PINNED_MODEL.dimension,
+            )
+            reflection_generation = repositories.vectors.begin_reflection_generation(
+                model_name=PINNED_MODEL.api_name,
+                model_commit=PINNED_MODEL.revision,
+                model_sha256=PINNED_MODEL.onnx_sha256,
+                calibration_threshold=self._calibration_threshold,
+                dimension=PINNED_MODEL.dimension,
+            )
+            impression_generation = repositories.vectors.begin_persona_impression_generation(
                 model_name=PINNED_MODEL.api_name,
                 model_commit=PINNED_MODEL.revision,
                 model_sha256=PINNED_MODEL.onnx_sha256,
@@ -1007,24 +1230,55 @@ class VectorIndexCoordinator(QObject):
                 repositories.vectors.fail_persona_generation(
                     persona_generation.generation_id, "rebuild_begin_failed"
                 )
+            if reflection_generation is not None:
+                repositories.vectors.fail_reflection_generation(
+                    reflection_generation.generation_id,
+                    "rebuild_begin_failed",
+                )
+            if impression_generation is not None:
+                repositories.vectors.fail_persona_impression_generation(
+                    impression_generation.generation_id,
+                    "rebuild_begin_failed",
+                )
             raise
-        documents = tuple(
-            _Document(
-                VectorCorpus.USER_MEMORY,
-                document.current_version.version_id,
-                document.current_version.content,
+        documents = (
+            tuple(
+                _Document(
+                    VectorCorpus.USER_MEMORY,
+                    document.current_version.version_id,
+                    document.current_version.content,
+                )
+                for document in user_documents
             )
-            for document in user_documents
-        ) + tuple(
-            _Document(
-                VectorCorpus.PERSONA_KNOWLEDGE,
-                document.knowledge_id,
-                document.content,
+            + tuple(
+                _Document(
+                    VectorCorpus.MEMORY_REFLECTION,
+                    document.current_version.version_id,
+                    document.current_version.content,
+                )
+                for document in reflection_documents
             )
-            for document in persona_documents
+            + tuple(
+                _Document(
+                    VectorCorpus.MEMORY_PERSONA_IMPRESSION,
+                    document.current_version.version_id,
+                    document.current_version.content,
+                )
+                for document in impression_documents
+            )
+            + tuple(
+                _Document(
+                    VectorCorpus.PERSONA_KNOWLEDGE,
+                    document.knowledge_id,
+                    document.content,
+                )
+                for document in persona_documents
+            )
         )
         return _RebuildSeed(
             user_generation_id=user_generation.generation_id,
+            reflection_generation_id=reflection_generation.generation_id,
+            persona_impression_generation_id=impression_generation.generation_id,
             persona_generation_id=persona_generation.generation_id,
             documents=documents,
         )
@@ -1057,11 +1311,7 @@ class VectorIndexCoordinator(QObject):
             try:
                 vectors = result.result()
                 for document, vector in zip(batch, vectors, strict=True):
-                    target = (
-                        context.user_vectors
-                        if document.corpus is VectorCorpus.USER_MEMORY
-                        else context.persona_vectors
-                    )
+                    target = _context_vectors(context, document.corpus)
                     target[document.target_id] = vector
                 context.offset += len(batch)
                 self._submit_rebuild_batch(context)
@@ -1080,6 +1330,20 @@ class VectorIndexCoordinator(QObject):
                     for target_id, vector in context.user_vectors.items()
                 ),
             )
+            context.reflection_snapshot = VectorCacheSnapshot.build(
+                context.seed.reflection_generation_id,
+                (
+                    VectorRecord(target_id, vector)
+                    for target_id, vector in context.reflection_vectors.items()
+                ),
+            )
+            context.persona_impression_snapshot = VectorCacheSnapshot.build(
+                context.seed.persona_impression_generation_id,
+                (
+                    VectorRecord(target_id, vector)
+                    for target_id, vector in context.persona_impression_vectors.items()
+                ),
+            )
             context.persona_snapshot = VectorCacheSnapshot.build(
                 context.seed.persona_generation_id,
                 (
@@ -1092,7 +1356,7 @@ class VectorIndexCoordinator(QObject):
             self._mark_rebuild_failed(context.seed, "embedding_unavailable")
             return
 
-        def activate(resource: object) -> tuple[str, str]:
+        def activate(resource: object) -> tuple[str, str, str, str]:
             repositories = self._repository_resolver(resource)
             current_user = {
                 document.current_version.version_id
@@ -1106,17 +1370,55 @@ class VectorIndexCoordinator(QObject):
                     self._persona_id, limit=MAX_INDEX_DOCUMENTS
                 )
             }
-            if current_user != set(context.user_vectors) or current_persona != set(
-                context.persona_vectors
+            current_reflections = (
+                set()
+                if repositories.deep_memories is None
+                else {
+                    document.current_version.version_id
+                    for document in repositories.deep_memories.list_active_documents(
+                        MemoryLayer.REFLECTION,
+                        limit=MAX_INDEX_DOCUMENTS,
+                    )
+                }
+            )
+            current_impressions = (
+                set()
+                if repositories.deep_memories is None
+                else {
+                    document.current_version.version_id
+                    for document in repositories.deep_memories.list_active_documents(
+                        MemoryLayer.PERSONA,
+                        limit=MAX_INDEX_DOCUMENTS,
+                    )
+                }
+            )
+            if (
+                current_user != set(context.user_vectors)
+                or current_reflections != set(context.reflection_vectors)
+                or current_impressions != set(context.persona_impression_vectors)
+                or current_persona != set(context.persona_vectors)
             ):
                 raise ValueError("rebuild_documents_changed")
+            reflection = repositories.vectors.activate_reflection_generation(
+                context.seed.reflection_generation_id,
+                context.reflection_vectors,
+            )
+            impression = repositories.vectors.activate_persona_impression_generation(
+                context.seed.persona_impression_generation_id,
+                context.persona_impression_vectors,
+            )
             user, persona = repositories.vectors.activate_generations_atomically(
                 context.seed.user_generation_id,
                 context.user_vectors,
                 context.seed.persona_generation_id,
                 context.persona_vectors,
             )
-            return user.generation_id, persona.generation_id
+            return (
+                user.generation_id,
+                reflection.generation_id,
+                impression.generation_id,
+                persona.generation_id,
+            )
 
         request_id = self._data_thread.submit(
             activate,
@@ -1129,10 +1431,19 @@ class VectorIndexCoordinator(QObject):
 
     def _finish_rebuild_success(self, context: _RebuildContext) -> None:
         assert context.user_snapshot is not None
+        assert context.reflection_snapshot is not None
+        assert context.persona_impression_snapshot is not None
         assert context.persona_snapshot is not None
-        self._replace_caches(context.user_snapshot, context.persona_snapshot)
+        self._replace_caches(
+            context.user_snapshot,
+            context.reflection_snapshot,
+            context.persona_impression_snapshot,
+            context.persona_snapshot,
+        )
         with self._state_lock:
             self._thresholds[VectorCorpus.USER_MEMORY] = self._calibration_threshold
+            self._thresholds[VectorCorpus.MEMORY_REFLECTION] = self._calibration_threshold
+            self._thresholds[VectorCorpus.MEMORY_PERSONA_IMPRESSION] = self._calibration_threshold
             self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE] = self._calibration_threshold
             self._rebuild_in_progress = False
             persona_pending = self._persona_rebuild_pending
@@ -1156,6 +1467,16 @@ class VectorIndexCoordinator(QObject):
             with suppress(Exception):
                 repositories.vectors.fail_persona_generation(
                     seed.persona_generation_id, "rebuild_failed"
+                )
+            with suppress(Exception):
+                repositories.vectors.fail_reflection_generation(
+                    seed.reflection_generation_id,
+                    "rebuild_failed",
+                )
+            with suppress(Exception):
+                repositories.vectors.fail_persona_impression_generation(
+                    seed.persona_impression_generation_id,
+                    "rebuild_failed",
                 )
 
         request_id = self._data_thread.submit(
@@ -1232,8 +1553,8 @@ class VectorIndexCoordinator(QObject):
                 raise
             with self._state_lock:
                 self._calibration_threshold = threshold
-                self._thresholds[VectorCorpus.USER_MEMORY] = threshold
-                self._thresholds[VectorCorpus.PERSONA_KNOWLEDGE] = threshold
+                for corpus in VectorCorpus:
+                    self._thresholds[corpus] = threshold
         return backend
 
     def _disable_backend(self, error: BaseException, *, publish: bool = True) -> None:
@@ -1249,12 +1570,25 @@ class VectorIndexCoordinator(QObject):
     def _replace_caches(
         self,
         user: VectorCacheSnapshot | None,
+        reflection: VectorCacheSnapshot | None,
+        persona_impression: VectorCacheSnapshot | None,
         persona: VectorCacheSnapshot | None,
     ) -> None:
         if user is None:
             self._caches.clear(VectorCorpus.USER_MEMORY)
         else:
             self._caches.swap(VectorCorpus.USER_MEMORY, user)
+        if reflection is None:
+            self._caches.clear(VectorCorpus.MEMORY_REFLECTION)
+        else:
+            self._caches.swap(VectorCorpus.MEMORY_REFLECTION, reflection)
+        if persona_impression is None:
+            self._caches.clear(VectorCorpus.MEMORY_PERSONA_IMPRESSION)
+        else:
+            self._caches.swap(
+                VectorCorpus.MEMORY_PERSONA_IMPRESSION,
+                persona_impression,
+            )
         if persona is None:
             self._caches.clear(VectorCorpus.PERSONA_KNOWLEDGE)
         else:
@@ -1262,6 +1596,8 @@ class VectorIndexCoordinator(QObject):
 
     def _publish_status(self, category: str) -> None:
         user = self._caches.snapshot(VectorCorpus.USER_MEMORY)
+        reflection = self._caches.snapshot(VectorCorpus.MEMORY_REFLECTION)
+        impression = self._caches.snapshot(VectorCorpus.MEMORY_PERSONA_IMPRESSION)
         persona = self._caches.snapshot(VectorCorpus.PERSONA_KNOWLEDGE)
         with self._state_lock:
             available = (
@@ -1274,12 +1610,34 @@ class VectorIndexCoordinator(QObject):
                 user_count=0 if user is None else user.count,
                 persona_generation_id=None if persona is None else persona.generation_id,
                 persona_count=0 if persona is None else persona.count,
+                reflection_generation_id=(None if reflection is None else reflection.generation_id),
+                reflection_count=0 if reflection is None else reflection.count,
+                persona_impression_generation_id=(
+                    None if impression is None else impression.generation_id
+                ),
+                persona_impression_count=0 if impression is None else impression.count,
             )
             self._status = status
         self.status_changed.emit(status)
 
 
 T = TypeVar("T")
+
+
+def _context_vectors(
+    context: _IncrementalContext | _RebuildContext,
+    corpus: VectorCorpus,
+) -> dict[str, tuple[float, ...]]:
+    if corpus is VectorCorpus.USER_MEMORY:
+        return context.user_vectors
+    if corpus is VectorCorpus.MEMORY_REFLECTION:
+        return context.reflection_vectors
+    if corpus is VectorCorpus.MEMORY_PERSONA_IMPRESSION:
+        return context.persona_impression_vectors
+    if corpus is VectorCorpus.PERSONA_KNOWLEDGE:
+        return context.persona_vectors
+    raise ValueError("unknown vector corpus")
+
 
 _SAFE_EMBEDDING_CATEGORIES = frozenset(
     {

@@ -149,8 +149,10 @@ def test_production_benchmark_runs_sqlite_vector_fusion_and_prompt_chain(tmp_pat
     assert result["status"] == "passed"
     assert result["memory_items"] == 8
     assert result["persona_items"] == 4
+    assert result["reflection_items"] == 20
+    assert result["persona_impression_items"] == 10
     assert result["memory_matrix_bytes"] == 8 * 512 * 4
-    assert result["total_cache_bytes"] == 12 * 512 * 4
+    assert result["total_cache_bytes"] == 42 * 512 * 4
     assert result["warmup_count"] == 1
     assert result["query_count"] == 2
     assert result["correct_recall_count"] == 2
@@ -162,10 +164,12 @@ def test_user_query_isolation_counts_every_injected_persona_row() -> None:
     prompt = PreparedPrompt(
         messages=(),
         user_memory_version_ids=("benchmark-version-00000",),
+        reflection_version_ids=("reflection-leak",),
+        persona_impression_version_ids=("impression-leak",),
         persona_knowledge_ids=("benchmark-persona-00000",),
     )
 
-    assert embedding_acceptance._user_query_cross_library_mis_hits(prompt) == 1
+    assert embedding_acceptance._user_query_cross_library_mis_hits(prompt) == 3
 
 
 def test_cli_failure_json_never_contains_model_path_or_exception(

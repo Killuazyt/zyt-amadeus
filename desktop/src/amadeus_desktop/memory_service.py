@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from amadeus_desktop.memory_models import MemoryKind, MemoryOperation
+from amadeus_desktop.memory_models import MemoryKind, MemoryOperation, MemorySubjectScope
 from amadeus_desktop.storage_models import (
     DEFAULT_PROFILE_ID,
     MemoryRecord,
@@ -34,6 +35,10 @@ class MemoryService(Protocol):
         confidence: float = 1.0,
         source_message_ids: Sequence[str] = (),
         origin: MemoryVersionOrigin | str = MemoryVersionOrigin.AUTOMATIC,
+        subject_scope: MemorySubjectScope | str = MemorySubjectScope.USER,
+        event_started_at: datetime | None = None,
+        event_ended_at: datetime | None = None,
+        time_confidence: float | None = None,
         memory_id: str | None = None,
     ) -> MemoryRecord: ...
 
@@ -47,6 +52,10 @@ class MemoryService(Protocol):
         importance: float = 0.5,
         confidence: float = 1.0,
         source_message_ids: Sequence[str],
+        subject_scope: MemorySubjectScope | str = MemorySubjectScope.USER,
+        event_started_at: datetime | None = None,
+        event_ended_at: datetime | None = None,
+        time_confidence: float | None = None,
     ) -> MemoryUpsertResult: ...
 
     def add_version(
@@ -59,6 +68,9 @@ class MemoryService(Protocol):
         operation: MemoryOperation | MemoryVersionOperation | str,
         source_message_ids: Sequence[str],
         origin: MemoryVersionOrigin | str = MemoryVersionOrigin.AUTOMATIC,
+        event_started_at: datetime | None = None,
+        event_ended_at: datetime | None = None,
+        time_confidence: float | None = None,
     ) -> MemoryRecord: ...
 
     def edit_memory(
@@ -89,6 +101,13 @@ class MemoryService(Protocol):
         limit: int = 30,
         include_archived: bool = False,
     ) -> tuple[MemorySearchResult, ...]: ...
+
+    def get_active_by_version_ids(
+        self,
+        version_ids: Iterable[str],
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> tuple[MemoryRecord, ...]: ...
 
     def archive(self, memory_id: str) -> MemoryRecord: ...
 

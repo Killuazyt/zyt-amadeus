@@ -103,7 +103,7 @@ class VectorStore:
         self._clock = clock
         self._id_factory = id_factory or (lambda: uuid4().hex)
 
-    def recover_interrupted_generations(self) -> tuple[int, int]:
+    def recover_interrupted_generations(self) -> tuple[int, int, int, int]:
         """Fail stale building generations while preserving every active one."""
 
         now = encode_utc(self._clock())
@@ -124,7 +124,28 @@ class VectorStore:
                 """,
                 (now,),
             )
-        return max(0, memory.rowcount), max(0, persona.rowcount)
+            reflection = connection.execute(
+                """
+                UPDATE memory_reflection_embedding_generations
+                SET status = 'failed', failure_code = 'interrupted', updated_at = ?
+                WHERE status = 'building'
+                """,
+                (now,),
+            )
+            impression = connection.execute(
+                """
+                UPDATE memory_persona_impression_embedding_generations
+                SET status = 'failed', failure_code = 'interrupted', updated_at = ?
+                WHERE status = 'building'
+                """,
+                (now,),
+            )
+        return (
+            max(0, memory.rowcount),
+            max(0, reflection.rowcount),
+            max(0, impression.rowcount),
+            max(0, persona.rowcount),
+        )
 
     def begin_memory_generation(
         self,
@@ -193,6 +214,88 @@ class VectorStore:
             )
         return self.get_persona_generation(generation_id)
 
+    def begin_reflection_generation(
+        self,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        model_name: str,
+        model_commit: str,
+        model_sha256: str,
+        calibration_threshold: float,
+        dimension: int = VECTOR_DIMENSION,
+        generation_id: str | None = None,
+    ) -> EmbeddingGeneration:
+        return self._begin_derived_generation(
+            "memory_reflection_embedding_generations",
+            EmbeddingCorpus.REFLECTION,
+            profile_id=profile_id,
+            model_name=model_name,
+            model_commit=model_commit,
+            model_sha256=model_sha256,
+            calibration_threshold=calibration_threshold,
+            dimension=dimension,
+            generation_id=generation_id,
+        )
+
+    def begin_persona_impression_generation(
+        self,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        model_name: str,
+        model_commit: str,
+        model_sha256: str,
+        calibration_threshold: float,
+        dimension: int = VECTOR_DIMENSION,
+        generation_id: str | None = None,
+    ) -> EmbeddingGeneration:
+        return self._begin_derived_generation(
+            "memory_persona_impression_embedding_generations",
+            EmbeddingCorpus.PERSONA_IMPRESSION,
+            profile_id=profile_id,
+            model_name=model_name,
+            model_commit=model_commit,
+            model_sha256=model_sha256,
+            calibration_threshold=calibration_threshold,
+            dimension=dimension,
+            generation_id=generation_id,
+        )
+
+    def _begin_derived_generation(
+        self,
+        table: str,
+        corpus: EmbeddingCorpus,
+        *,
+        profile_id: str,
+        model_name: str,
+        model_commit: str,
+        model_sha256: str,
+        calibration_threshold: float,
+        dimension: int,
+        generation_id: str | None,
+    ) -> EmbeddingGeneration:
+        profile_id = _identifier(profile_id, "profile_id")
+        generation_id = _identifier(generation_id or self._id_factory(), "generation_id")
+        values = _generation_values(
+            model_name,
+            model_commit,
+            model_sha256,
+            calibration_threshold,
+            dimension,
+        )
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            _ensure_profile(connection, profile_id, now)
+            connection.execute(
+                f"""
+                INSERT INTO {table}(
+                    id, profile_id, model_name, model_commit, dimension, model_sha256,
+                    calibration_threshold, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'building', ?, ?)
+                """,
+                (generation_id, profile_id, *values, now, now),
+            )
+        return self._get_derived_generation(table, corpus, generation_id)
+
     def activate_memory_generation(
         self,
         generation_id: str,
@@ -240,6 +343,51 @@ class VectorStore:
                 now=now,
             )
         return self.get_persona_generation(generation_id)
+
+    def activate_reflection_generation(
+        self,
+        generation_id: str,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> EmbeddingGeneration:
+        return self._activate_derived_generation(
+            EmbeddingCorpus.REFLECTION,
+            generation_id,
+            vectors,
+        )
+
+    def activate_persona_impression_generation(
+        self,
+        generation_id: str,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> EmbeddingGeneration:
+        return self._activate_derived_generation(
+            EmbeddingCorpus.PERSONA_IMPRESSION,
+            generation_id,
+            vectors,
+        )
+
+    def _activate_derived_generation(
+        self,
+        corpus: EmbeddingCorpus,
+        generation_id: str,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> EmbeddingGeneration:
+        table, _groups, _versions, _vectors, _group_fk, _statuses = _derived_vector_spec(corpus)
+        generation = self._get_derived_generation(table, corpus, generation_id)
+        encoded = _encode_vectors(vectors, generation.dimension)
+        now = encode_utc(self._clock())
+        with self._database.transaction() as connection:
+            current = _generation_row(connection, table, generation_id)
+            _require_building(current)
+            _activate_derived_with_connection(
+                connection,
+                corpus=corpus,
+                current=current,
+                generation_id=generation_id,
+                encoded=encoded,
+                now=now,
+            )
+        return self._get_derived_generation(table, corpus, generation_id)
 
     def activate_generations_atomically(
         self,
@@ -295,6 +443,24 @@ class VectorStore:
         self._fail_generation("persona_embedding_generations", generation_id, failure_code)
         return self.get_persona_generation(generation_id)
 
+    def fail_reflection_generation(
+        self, generation_id: str, failure_code: str
+    ) -> EmbeddingGeneration:
+        table = "memory_reflection_embedding_generations"
+        self._fail_generation(table, generation_id, failure_code)
+        return self._get_derived_generation(table, EmbeddingCorpus.REFLECTION, generation_id)
+
+    def fail_persona_impression_generation(
+        self, generation_id: str, failure_code: str
+    ) -> EmbeddingGeneration:
+        table = "memory_persona_impression_embedding_generations"
+        self._fail_generation(table, generation_id, failure_code)
+        return self._get_derived_generation(
+            table,
+            EmbeddingCorpus.PERSONA_IMPRESSION,
+            generation_id,
+        )
+
     def get_memory_generation(self, generation_id: str) -> EmbeddingGeneration:
         row = _generation_row(
             self._database.connection,
@@ -310,6 +476,33 @@ class VectorStore:
             _identifier(generation_id, "generation_id"),
         )
         return _generation_from_row(row, EmbeddingCorpus.PERSONA)
+
+    def get_reflection_generation(self, generation_id: str) -> EmbeddingGeneration:
+        return self._get_derived_generation(
+            "memory_reflection_embedding_generations",
+            EmbeddingCorpus.REFLECTION,
+            generation_id,
+        )
+
+    def get_persona_impression_generation(self, generation_id: str) -> EmbeddingGeneration:
+        return self._get_derived_generation(
+            "memory_persona_impression_embedding_generations",
+            EmbeddingCorpus.PERSONA_IMPRESSION,
+            generation_id,
+        )
+
+    def _get_derived_generation(
+        self,
+        table: str,
+        corpus: EmbeddingCorpus,
+        generation_id: str,
+    ) -> EmbeddingGeneration:
+        row = _generation_row(
+            self._database.connection,
+            table,
+            _identifier(generation_id, "generation_id"),
+        )
+        return _generation_from_row(row, corpus)
 
     def get_active_memory_generation(
         self, profile_id: str = DEFAULT_PROFILE_ID
@@ -334,6 +527,39 @@ class VectorStore:
             (_identifier(persona_id, "persona_id"),),
         ).fetchone()
         return None if row is None else _generation_from_row(row, EmbeddingCorpus.PERSONA)
+
+    def get_active_reflection_generation(
+        self, profile_id: str = DEFAULT_PROFILE_ID
+    ) -> EmbeddingGeneration | None:
+        return self._get_active_derived_generation(
+            "memory_reflection_embedding_generations",
+            EmbeddingCorpus.REFLECTION,
+            profile_id,
+        )
+
+    def get_active_persona_impression_generation(
+        self, profile_id: str = DEFAULT_PROFILE_ID
+    ) -> EmbeddingGeneration | None:
+        return self._get_active_derived_generation(
+            "memory_persona_impression_embedding_generations",
+            EmbeddingCorpus.PERSONA_IMPRESSION,
+            profile_id,
+        )
+
+    def _get_active_derived_generation(
+        self,
+        table: str,
+        corpus: EmbeddingCorpus,
+        profile_id: str,
+    ) -> EmbeddingGeneration | None:
+        row = self._database.connection.execute(
+            f"""
+            SELECT *, profile_id AS scope_id FROM {table}
+            WHERE profile_id = ? AND status = 'active'
+            """,
+            (_identifier(profile_id, "profile_id"),),
+        ).fetchone()
+        return None if row is None else _generation_from_row(row, corpus)
 
     def upsert_memory_vector(
         self,
@@ -434,6 +660,94 @@ class VectorStore:
             created_at=now_value,
         )
 
+    def upsert_reflection_vector(
+        self,
+        generation_id: str,
+        version_id: str,
+        vector: Sequence[float],
+    ) -> StoredVector:
+        return self._upsert_derived_vector(
+            EmbeddingCorpus.REFLECTION,
+            generation_id,
+            version_id,
+            vector,
+        )
+
+    def upsert_persona_impression_vector(
+        self,
+        generation_id: str,
+        version_id: str,
+        vector: Sequence[float],
+    ) -> StoredVector:
+        return self._upsert_derived_vector(
+            EmbeddingCorpus.PERSONA_IMPRESSION,
+            generation_id,
+            version_id,
+            vector,
+        )
+
+    def _upsert_derived_vector(
+        self,
+        corpus: EmbeddingCorpus,
+        generation_id: str,
+        version_id: str,
+        vector: Sequence[float],
+    ) -> StoredVector:
+        table, groups, versions, vectors, group_fk, statuses = _derived_vector_spec(corpus)
+        generation = self._get_derived_generation(table, corpus, generation_id)
+        blob, vector_hash = encode_vector(vector, dimension=generation.dimension)
+        now_value = self._clock()
+        now = encode_utc(now_value)
+        status_placeholders = ",".join("?" for _ in statuses)
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                f"""
+                SELECT g.id AS group_id
+                FROM {table} AS eg
+                JOIN {groups} AS g ON g.profile_id = eg.profile_id
+                JOIN {versions} AS v ON v.id = g.current_version_id AND v.id = ?
+                WHERE eg.id = ? AND eg.status IN ('building', 'active')
+                  AND g.status IN ({status_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM memory_conflicts AS c
+                      WHERE c.target_layer = ? AND c.target_group_id = g.id
+                        AND c.status = 'open'
+                  )
+                """,
+                (version_id, generation_id, *statuses, _derived_layer_value(corpus)),
+            ).fetchone()
+            if row is None:
+                raise StorageConflictError("vector target is not current derived memory")
+            connection.execute(
+                f"""
+                DELETE FROM {vectors}
+                WHERE generation_id = ? AND version_id IN (
+                    SELECT id FROM {versions} WHERE {group_fk} = ? AND id <> ?
+                )
+                """,
+                (generation_id, row["group_id"], version_id),
+            )
+            connection.execute(
+                f"""
+                INSERT INTO {vectors}(
+                    generation_id, version_id, vector_blob, vector_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(generation_id, version_id) DO UPDATE SET
+                    vector_blob = excluded.vector_blob,
+                    vector_hash = excluded.vector_hash,
+                    created_at = excluded.created_at
+                """,
+                (generation_id, version_id, blob, vector_hash, now),
+            )
+            self._refresh_count(connection, corpus.value, generation_id, now)
+        return StoredVector(
+            generation_id=generation_id,
+            target_id=version_id,
+            vector=decode_vector(blob, vector_hash, dimension=generation.dimension),
+            vector_hash=vector_hash,
+            created_at=now_value,
+        )
+
     def load_memory_vectors(self, profile_id: str = DEFAULT_PROFILE_ID) -> tuple[StoredVector, ...]:
         rows = self._database.connection.execute(
             """
@@ -466,6 +780,48 @@ class VectorStore:
         ).fetchall()
         return tuple(_stored_vector_from_row(row) for row in rows)
 
+    def load_reflection_vectors(
+        self, profile_id: str = DEFAULT_PROFILE_ID
+    ) -> tuple[StoredVector, ...]:
+        return self._load_derived_vectors(EmbeddingCorpus.REFLECTION, profile_id)
+
+    def load_persona_impression_vectors(
+        self, profile_id: str = DEFAULT_PROFILE_ID
+    ) -> tuple[StoredVector, ...]:
+        return self._load_derived_vectors(EmbeddingCorpus.PERSONA_IMPRESSION, profile_id)
+
+    def _load_derived_vectors(
+        self,
+        corpus: EmbeddingCorpus,
+        profile_id: str,
+    ) -> tuple[StoredVector, ...]:
+        table, groups, _versions, vectors, _group_fk, statuses = _derived_vector_spec(corpus)
+        status_placeholders = ",".join("?" for _ in statuses)
+        rows = self._database.connection.execute(
+            f"""
+            SELECT dv.generation_id, dv.version_id AS target_id, dv.vector_blob,
+                   dv.vector_hash, dv.created_at, eg.dimension
+            FROM {table} AS eg
+            JOIN {vectors} AS dv ON dv.generation_id = eg.id
+            JOIN {groups} AS g
+              ON g.current_version_id = dv.version_id AND g.profile_id = eg.profile_id
+            WHERE eg.profile_id = ? AND eg.status = 'active'
+              AND g.status IN ({status_placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_conflicts AS c
+                  WHERE c.target_layer = ? AND c.target_group_id = g.id
+                    AND c.status = 'open'
+              )
+            ORDER BY dv.version_id
+            """,
+            (
+                _identifier(profile_id, "profile_id"),
+                *statuses,
+                _derived_layer_value(corpus),
+            ),
+        ).fetchall()
+        return tuple(_stored_vector_from_row(row) for row in rows)
+
     def _fail_generation(self, table: str, generation_id: str, failure_code: str) -> None:
         generation_id = _identifier(generation_id, "generation_id")
         safe_code = _safe_code(failure_code)
@@ -489,10 +845,22 @@ class VectorStore:
     def _refresh_count(
         connection: sqlite3.Connection, corpus: str, generation_id: str, now: str
     ) -> None:
-        if corpus == "memory":
-            table, vectors = "memory_embedding_generations", "memory_vectors"
-        else:
-            table, vectors = "persona_embedding_generations", "persona_vectors"
+        mapping = {
+            "memory": ("memory_embedding_generations", "memory_vectors"),
+            "reflection": (
+                "memory_reflection_embedding_generations",
+                "memory_reflection_vectors",
+            ),
+            "persona_impression": (
+                "memory_persona_impression_embedding_generations",
+                "memory_persona_impression_vectors",
+            ),
+            "persona": ("persona_embedding_generations", "persona_vectors"),
+        }
+        try:
+            table, vectors = mapping[corpus]
+        except KeyError as exc:
+            raise StorageValidationError("unknown vector corpus") from exc
         connection.execute(
             f"""
             UPDATE {table}
@@ -649,6 +1017,69 @@ def _activate_persona_with_connection(
     )
 
 
+def _activate_derived_with_connection(
+    connection: sqlite3.Connection,
+    *,
+    corpus: EmbeddingCorpus,
+    current: sqlite3.Row,
+    generation_id: str,
+    encoded: Mapping[str, tuple[bytes, str]],
+    now: str,
+) -> None:
+    table, groups, versions, vectors, group_fk, statuses = _derived_vector_spec(corpus)
+    status_placeholders = ",".join("?" for _ in statuses)
+    layer = _derived_layer_value(corpus)
+    valid_targets = {
+        str(row["id"])
+        for row in connection.execute(
+            f"""
+            SELECT v.id
+            FROM {groups} AS g
+            JOIN {versions} AS v ON v.id = g.current_version_id
+            WHERE g.profile_id = ? AND g.status IN ({status_placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_conflicts AS c
+                  WHERE c.target_layer = ? AND c.target_group_id = g.id
+                    AND c.status = 'open'
+              )
+            ORDER BY g.updated_at DESC, g.id
+            LIMIT ?
+            """,
+            (current["scope_id"], *statuses, layer, MAX_INDEX_DOCUMENTS),
+        ).fetchall()
+    }
+    _require_exact_targets(encoded, valid_targets)
+    connection.execute(f"DELETE FROM {vectors} WHERE generation_id = ?", (generation_id,))
+    connection.executemany(
+        f"""
+        INSERT INTO {vectors}(
+            generation_id, version_id, vector_blob, vector_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            (generation_id, target_id, blob, vector_hash, now)
+            for target_id, (blob, vector_hash) in encoded.items()
+        ),
+    )
+    connection.execute(
+        f"""
+        UPDATE {table}
+        SET status = 'retired', updated_at = ?
+        WHERE profile_id = ? AND status = 'active' AND id <> ?
+        """,
+        (now, current["scope_id"], generation_id),
+    )
+    connection.execute(
+        f"""
+        UPDATE {table}
+        SET status = 'active', item_count = ?, failure_code = NULL,
+            updated_at = ?, activated_at = ?
+        WHERE id = ?
+        """,
+        (len(encoded), now, now, generation_id),
+    )
+
+
 def _require_exact_targets(
     encoded: Mapping[str, tuple[bytes, str]], valid_targets: set[str]
 ) -> None:
@@ -658,7 +1089,7 @@ def _require_exact_targets(
 
 
 def _generation_row(connection: sqlite3.Connection, table: str, generation_id: str) -> sqlite3.Row:
-    scope_column = "profile_id" if table == "memory_embedding_generations" else "persona_id"
+    scope_column = "persona_id" if table == "persona_embedding_generations" else "profile_id"
     row = connection.execute(
         f"SELECT *, {scope_column} AS scope_id FROM {table} WHERE id = ?",
         (generation_id,),
@@ -666,6 +1097,38 @@ def _generation_row(connection: sqlite3.Connection, table: str, generation_id: s
     if row is None:
         raise StorageNotFoundError("embedding generation does not exist")
     return row
+
+
+def _derived_vector_spec(
+    corpus: EmbeddingCorpus,
+) -> tuple[str, str, str, str, str, tuple[str, ...]]:
+    if corpus is EmbeddingCorpus.REFLECTION:
+        return (
+            "memory_reflection_embedding_generations",
+            "memory_reflections",
+            "memory_reflection_versions",
+            "memory_reflection_vectors",
+            "reflection_id",
+            ("confirmed",),
+        )
+    if corpus is EmbeddingCorpus.PERSONA_IMPRESSION:
+        return (
+            "memory_persona_impression_embedding_generations",
+            "memory_persona_impressions",
+            "memory_persona_impression_versions",
+            "memory_persona_impression_vectors",
+            "impression_id",
+            ("active",),
+        )
+    raise StorageValidationError("corpus is not a derived memory corpus")
+
+
+def _derived_layer_value(corpus: EmbeddingCorpus) -> str:
+    if corpus is EmbeddingCorpus.REFLECTION:
+        return "reflection"
+    if corpus is EmbeddingCorpus.PERSONA_IMPRESSION:
+        return "persona"
+    raise StorageValidationError("corpus is not a derived memory corpus")
 
 
 def _require_building(row: sqlite3.Row) -> None:

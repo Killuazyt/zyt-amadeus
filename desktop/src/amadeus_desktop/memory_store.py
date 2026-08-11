@@ -8,7 +8,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from amadeus_desktop.database import SQLiteDatabase
-from amadeus_desktop.memory_models import MemoryKind, MemoryOperation
+from amadeus_desktop.memory_models import MemoryKind, MemoryOperation, MemorySubjectScope
 from amadeus_desktop.memory_search import (
     EmptySearchQuery,
     build_fts_match_query,
@@ -44,10 +44,13 @@ MAX_INDEX_DOCUMENTS = 10_000
 
 _MEMORY_SELECT = """
 SELECT g.id AS memory_id, g.profile_id, g.kind, g.topic_key, g.status, g.pinned,
-       g.created_at AS group_created_at, g.updated_at AS group_updated_at,
+       g.subject_scope, g.created_at AS group_created_at,
+       g.updated_at AS group_updated_at,
        v.id AS version_id, v.version_number, v.content, v.normalized_content,
        v.content_hash, v.importance, v.confidence, v.origin, v.operation,
-       v.supersedes_version_id, v.created_at AS version_created_at
+       v.supersedes_version_id, v.created_at AS version_created_at,
+       v.event_started_at, v.event_ended_at, v.time_confidence,
+       v.deep_memory_eligible
 FROM memory_groups AS g
 JOIN memory_versions AS v ON v.id = g.current_version_id
 """
@@ -79,6 +82,10 @@ class MemoryStore:
         source_message_ids: Sequence[str] = (),
         origin: MemoryVersionOrigin | str = MemoryVersionOrigin.AUTOMATIC,
         memory_id: str | None = None,
+        subject_scope: MemorySubjectScope | str = MemorySubjectScope.USER,
+        event_started_at: datetime | None = None,
+        event_ended_at: datetime | None = None,
+        time_confidence: float | None = None,
     ) -> MemoryRecord:
         """Create a distinct logical memory; use ``upsert_memory`` for extraction."""
 
@@ -93,6 +100,13 @@ class MemoryStore:
             else _unit_interval(confidence, "confidence")
         )
         memory_id = _identifier(memory_id or self._id_factory(), "memory_id")
+        scope = _fact_subject_scope(subject_scope)
+        event_start, event_end, temporal_confidence = _temporal_fields(
+            kind_value,
+            event_started_at,
+            event_ended_at,
+            time_confidence,
+        )
         version_id = self._id_factory()
         now = encode_utc(self._clock())
 
@@ -108,10 +122,10 @@ class MemoryStore:
                 """
                 INSERT INTO memory_groups(
                     id, profile_id, kind, topic_key, status, pinned,
-                    current_version_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'active', 0, NULL, ?, ?)
+                    current_version_id, created_at, updated_at, subject_scope
+                ) VALUES (?, ?, ?, ?, 'active', 0, NULL, ?, ?, ?)
                 """,
-                (memory_id, profile_id, kind_value.value, topic, now, now),
+                (memory_id, profile_id, kind_value.value, topic, now, now, scope.value),
             )
             operation = (
                 MemoryVersionOperation.MANUAL_EDIT
@@ -133,6 +147,10 @@ class MemoryStore:
                 operation=operation,
                 supersedes_version_id=None,
                 created_at=now,
+                event_started_at=event_start,
+                event_ended_at=event_end,
+                time_confidence=temporal_confidence,
+                deep_memory_eligible=origin_value is MemoryVersionOrigin.AUTOMATIC,
             )
             connection.execute(
                 "UPDATE memory_groups SET current_version_id = ? WHERE id = ?",
@@ -164,6 +182,10 @@ class MemoryStore:
         importance: float = 0.5,
         confidence: float = 1.0,
         source_message_ids: Sequence[str],
+        subject_scope: MemorySubjectScope | str = MemorySubjectScope.USER,
+        event_started_at: datetime | None = None,
+        event_ended_at: datetime | None = None,
+        time_confidence: float | None = None,
     ) -> MemoryUpsertResult:
         """Deduplicate exact normalized content and only add new provenance."""
 
@@ -223,6 +245,10 @@ class MemoryStore:
             importance=importance,
             confidence=confidence,
             source_message_ids=source_message_ids,
+            subject_scope=subject_scope,
+            event_started_at=event_started_at,
+            event_ended_at=event_ended_at,
+            time_confidence=time_confidence,
         )
         return MemoryUpsertResult(
             memory=memory,
@@ -241,6 +267,9 @@ class MemoryStore:
         operation: MemoryOperation | MemoryVersionOperation | str,
         source_message_ids: Sequence[str],
         origin: MemoryVersionOrigin | str = MemoryVersionOrigin.AUTOMATIC,
+        event_started_at: datetime | None = None,
+        event_ended_at: datetime | None = None,
+        time_confidence: float | None = None,
     ) -> MemoryRecord:
         """Supplement/correct by atomically switching to a new immutable version."""
 
@@ -258,7 +287,10 @@ class MemoryStore:
         with self._database.transaction() as connection:
             current = connection.execute(
                 """
-                SELECT g.profile_id, g.current_version_id, v.version_number,
+                SELECT g.profile_id, g.kind, g.current_version_id, v.version_number,
+                       (SELECT MAX(all_v.version_number)
+                        FROM memory_versions AS all_v
+                        WHERE all_v.memory_id = g.id) AS max_version_number,
                        v.normalized_content, v.origin,
                        v.created_at AS version_created_at
                 FROM memory_groups AS g
@@ -269,6 +301,12 @@ class MemoryStore:
             ).fetchone()
             if current is None:
                 raise StorageNotFoundError("memory does not exist")
+            event_start, event_end, temporal_confidence = _temporal_fields(
+                MemoryKind(str(current["kind"])),
+                event_started_at,
+                event_ended_at,
+                time_confidence,
+            )
             if (
                 current["origin"] == MemoryVersionOrigin.MANUAL.value
                 and origin_value is MemoryVersionOrigin.AUTOMATIC
@@ -334,11 +372,19 @@ class MemoryStore:
                     created_at=now,
                 )
                 return self._get_with_connection(connection, memory_id)
+            inherited_sources = (
+                self._live_sources_for_version(
+                    connection,
+                    str(current["current_version_id"]),
+                )
+                if origin_value is MemoryVersionOrigin.MANUAL
+                else ()
+            )
             self._insert_version(
                 connection,
                 version_id=new_version_id,
                 memory_id=memory_id,
-                version_number=int(current["version_number"]) + 1,
+                version_number=int(current["max_version_number"]) + 1,
                 content=content,
                 normalized_content=normalized,
                 content_hash=content_hash,
@@ -349,6 +395,12 @@ class MemoryStore:
                 operation=operation_value,
                 supersedes_version_id=str(current["current_version_id"]),
                 created_at=now,
+                event_started_at=event_start,
+                event_ended_at=event_end,
+                time_confidence=temporal_confidence,
+                deep_memory_eligible=(
+                    origin_value is MemoryVersionOrigin.AUTOMATIC or bool(inherited_sources)
+                ),
             )
             self._insert_sources(
                 connection,
@@ -357,6 +409,13 @@ class MemoryStore:
                 sources=sources,
                 created_at=now,
             )
+            if inherited_sources:
+                self._insert_inherited_sources(
+                    connection,
+                    version_id=new_version_id,
+                    sources=inherited_sources,
+                    created_at=now,
+                )
             connection.execute(
                 """
                 UPDATE memory_groups
@@ -390,6 +449,9 @@ class MemoryStore:
             operation=MemoryVersionOperation.MANUAL_EDIT,
             source_message_ids=(),
             origin=MemoryVersionOrigin.MANUAL,
+            event_started_at=current.current_version.event_started_at,
+            event_ended_at=current.current_version.event_ended_at,
+            time_confidence=current.current_version.time_confidence,
         )
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -448,7 +510,14 @@ class MemoryStore:
             WHERE memory_fts MATCH ? AND memory_fts.profile_id = ?
             """
             + status_clause
-            + " ORDER BY fts_rank, g.pinned DESC, g.updated_at DESC LIMIT ?",
+            + """
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_conflicts AS c
+                  WHERE c.target_layer = 'fact'
+                    AND c.target_group_id = g.id AND c.status = 'open'
+              )
+              ORDER BY fts_rank, g.pinned DESC, g.updated_at DESC LIMIT ?
+              """,
             (*match.parameters, profile_id, limit),
         ).fetchall()
         return tuple(
@@ -472,6 +541,11 @@ class MemoryStore:
             _MEMORY_SELECT
             + """
             WHERE g.profile_id = ? AND g.status = 'active'
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_conflicts AS c
+                  WHERE c.target_layer = 'fact'
+                    AND c.target_group_id = g.id AND c.status = 'open'
+              )
             ORDER BY g.updated_at DESC, g.id
             LIMIT ?
             """,
@@ -496,6 +570,11 @@ class MemoryStore:
             + f"""
             WHERE g.profile_id = ? AND g.status = 'active'
               AND g.current_version_id IN ({placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_conflicts AS c
+                  WHERE c.target_layer = 'fact'
+                    AND c.target_group_id = g.id AND c.status = 'open'
+              )
             """,
             (_identifier(profile_id, "profile_id"), *ids),
         ).fetchall()
@@ -605,6 +684,35 @@ class MemoryStore:
             for row in rows
         )
 
+    def recent_recalled_version_ids(
+        self,
+        *,
+        profile_id: str = DEFAULT_PROFILE_ID,
+        response_limit: int = 3,
+    ) -> tuple[str, ...]:
+        """Return versions injected by the latest distinct successful responses."""
+
+        if response_limit < 1:
+            return ()
+        rows = self._database.connection.execute(
+            """
+            WITH recent_tickets AS (
+                SELECT retrieval_ticket_id, MAX(recalled_at) AS latest
+                FROM memory_recall_events
+                WHERE profile_id = ?
+                GROUP BY retrieval_ticket_id
+                ORDER BY latest DESC, retrieval_ticket_id DESC
+                LIMIT ?
+            )
+            SELECT DISTINCT e.version_id
+            FROM memory_recall_events AS e
+            JOIN recent_tickets AS r USING (retrieval_ticket_id)
+            ORDER BY e.version_id
+            """,
+            (_identifier(profile_id, "profile_id"), response_limit),
+        ).fetchall()
+        return tuple(str(row["version_id"]) for row in rows)
+
     def archive_decayed_events(
         self,
         *,
@@ -702,6 +810,7 @@ class MemoryStore:
                 JOIN memory_groups AS g
                   ON g.id = v.memory_id AND g.current_version_id = v.id
                 WHERE c.profile_id = ?
+                  AND v.origin = 'automatic'
                   AND prior.role = 'user'
                   AND prior.participates_in_memory = 1
                   AND prior.sequence < ?
@@ -912,6 +1021,52 @@ class MemoryStore:
         return connection.total_changes - before
 
     @staticmethod
+    def _live_sources_for_version(
+        connection: sqlite3.Connection,
+        version_id: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        return tuple(
+            connection.execute(
+                """
+                SELECT source_message_id, source_conversation_id, live_message_id,
+                       live_conversation_id
+                FROM memory_sources
+                WHERE version_id = ? AND extraction_method = 'automatic'
+                  AND live_message_id IS NOT NULL
+                ORDER BY created_at, id
+                """,
+                (version_id,),
+            ).fetchall()
+        )
+
+    def _insert_inherited_sources(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        version_id: str,
+        sources: Sequence[sqlite3.Row],
+        created_at: str,
+    ) -> None:
+        for source in sources:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_sources(
+                    id, version_id, source_message_id, source_conversation_id,
+                    live_message_id, live_conversation_id, extraction_method, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'automatic', ?)
+                """,
+                (
+                    self._id_factory(),
+                    version_id,
+                    source["source_message_id"],
+                    source["source_conversation_id"],
+                    source["live_message_id"],
+                    source["live_conversation_id"],
+                    created_at,
+                ),
+            )
+
+    @staticmethod
     def _insert_version(
         connection: sqlite3.Connection,
         *,
@@ -928,14 +1083,19 @@ class MemoryStore:
         operation: MemoryVersionOperation,
         supersedes_version_id: str | None,
         created_at: str,
+        event_started_at: str | None,
+        event_ended_at: str | None,
+        time_confidence: float | None,
+        deep_memory_eligible: bool,
     ) -> None:
         connection.execute(
             """
             INSERT INTO memory_versions(
                 id, memory_id, version_number, content, normalized_content,
                 content_hash, search_text, importance, confidence, origin,
-                operation, supersedes_version_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                operation, supersedes_version_id, created_at, event_started_at,
+                event_ended_at, time_confidence, deep_memory_eligible
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 version_id,
@@ -951,6 +1111,10 @@ class MemoryStore:
                 operation.value,
                 supersedes_version_id,
                 created_at,
+                event_started_at,
+                event_ended_at,
+                time_confidence,
+                int(deep_memory_eligible),
             ),
         )
 
@@ -1010,6 +1174,37 @@ def _status(value: MemoryStatus | str) -> MemoryStatus:
         return value if isinstance(value, MemoryStatus) else MemoryStatus(str(value))
     except ValueError as exc:
         raise StorageValidationError("unsupported memory status") from exc
+
+
+def _fact_subject_scope(value: MemorySubjectScope | str) -> MemorySubjectScope:
+    try:
+        scope = value if isinstance(value, MemorySubjectScope) else MemorySubjectScope(str(value))
+    except ValueError as exc:
+        raise StorageValidationError("unsupported fact subject scope") from exc
+    if scope is MemorySubjectScope.COMPANION:
+        raise StorageValidationError("companion observations belong to the persona layer")
+    return scope
+
+
+def _temporal_fields(
+    kind: MemoryKind,
+    started_at: datetime | None,
+    ended_at: datetime | None,
+    confidence: float | None,
+) -> tuple[str | None, str | None, float | None]:
+    if kind is not MemoryKind.EVENT and any(
+        value is not None for value in (started_at, ended_at, confidence)
+    ):
+        raise StorageValidationError("only event memories accept temporal fields")
+    if started_at is not None and ended_at is not None and ended_at < started_at:
+        raise StorageValidationError("event end must not precede event start")
+    if confidence is not None:
+        confidence = _unit_interval(confidence, "time_confidence")
+    return (
+        None if started_at is None else encode_utc(started_at),
+        None if ended_at is None else encode_utc(ended_at),
+        confidence,
+    )
 
 
 def _content_fields(content: str) -> tuple[str, str, str, str]:
@@ -1094,6 +1289,10 @@ def _version_from_row(row: sqlite3.Row) -> MemoryVersion:
         operation=MemoryVersionOperation(row["operation"]),
         supersedes_version_id=row["supersedes_version_id"],
         created_at=_required_datetime(row["created_at"]),
+        event_started_at=decode_utc(row["event_started_at"]),
+        event_ended_at=decode_utc(row["event_ended_at"]),
+        time_confidence=(None if row["time_confidence"] is None else float(row["time_confidence"])),
+        deep_memory_eligible=bool(row["deep_memory_eligible"]),
     )
 
 
@@ -1111,6 +1310,10 @@ def _memory_from_row(row: sqlite3.Row) -> MemoryRecord:
         operation=MemoryVersionOperation(row["operation"]),
         supersedes_version_id=row["supersedes_version_id"],
         created_at=_required_datetime(row["version_created_at"]),
+        event_started_at=decode_utc(row["event_started_at"]),
+        event_ended_at=decode_utc(row["event_ended_at"]),
+        time_confidence=(None if row["time_confidence"] is None else float(row["time_confidence"])),
+        deep_memory_eligible=bool(row["deep_memory_eligible"]),
     )
     return MemoryRecord(
         memory_id=str(row["memory_id"]),
@@ -1122,6 +1325,7 @@ def _memory_from_row(row: sqlite3.Row) -> MemoryRecord:
         current_version=version,
         created_at=_required_datetime(row["group_created_at"]),
         updated_at=_required_datetime(row["group_updated_at"]),
+        subject_scope=MemorySubjectScope(row["subject_scope"]),
     )
 
 

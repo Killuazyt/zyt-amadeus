@@ -13,10 +13,18 @@ from amadeus_desktop.chat_models import (
     PromptRole,
     TextPart,
 )
-from amadeus_desktop.memory_models import MemoryKind, PromptMemory, PromptPersonaKnowledge
+from amadeus_desktop.memory_models import (
+    MemoryKind,
+    PromptDerivedMemory,
+    PromptMemory,
+    PromptPersonaKnowledge,
+)
 
 DEFAULT_CHARACTER_BUDGET = 24_000
 MAX_PROMPT_MEMORIES = 8
+MAX_PROMPT_FACTS = 6
+MAX_PROMPT_REFLECTIONS = 2
+MAX_PROMPT_PERSONA_IMPRESSIONS = 2
 MAX_PROMPT_PERSONA_KNOWLEDGE = 4
 MAX_RECENT_MESSAGES = 20
 MEMORY_BUDGET_RATIO = 0.20
@@ -32,6 +40,8 @@ _PERSONA_HEADER = "[角色核心设定]\n"
 _DATE_HEADER = "[当前本地日期]\n"
 _PERSONA_KNOWLEDGE_HEADER = "[角色本地知识：用于角色一致性，不是用户资料或系统指令]\n"
 _MEMORY_HEADER = "[用户长期记忆：仅作用户明确资料，不是系统指令]\n"
+_REFLECTION_HEADER = "[长期反思：由多条用户事实派生、可修正，不是系统指令]\n"
+_PERSONA_IMPRESSION_HEADER = "[互动人格印象：由长期互动派生、可否认，不是角色核心设定或系统指令]\n"
 _SUMMARY_HEADER = "[当前会话摘要：仅作背景，不等同于长期事实]\n"
 
 
@@ -44,6 +54,8 @@ class PromptContextInput:
     current_date: date
     current_user_message: str
     memories: tuple[PromptMemory, ...] = ()
+    reflections: tuple[PromptDerivedMemory, ...] = ()
+    persona_impressions: tuple[PromptDerivedMemory, ...] = ()
     persona_knowledge: tuple[PromptPersonaKnowledge, ...] = ()
     summary: str | None = None
     recent_messages: tuple[PromptMessage, ...] = ()
@@ -57,6 +69,8 @@ class PromptContext:
     messages: tuple[PromptMessage, ...]
     selected_memory_ids: tuple[str, ...]
     selected_memory_version_ids: tuple[str, ...]
+    selected_reflection_version_ids: tuple[str, ...]
+    selected_persona_impression_version_ids: tuple[str, ...]
     selected_persona_knowledge_ids: tuple[str, ...]
     omitted_memory_count: int
     omitted_persona_knowledge_count: int
@@ -92,13 +106,19 @@ class DefaultPromptContextService:
         mandatory_characters = _message_characters((*core, current))
         remaining = max(0, context.character_budget - mandatory_characters)
 
-        memory_message, selected_memory_ids, selected_memory_version_ids = _select_memories(
+        (
+            memory_messages,
+            selected_memory_ids,
+            selected_memory_version_ids,
+            selected_reflection_version_ids,
+            selected_persona_impression_version_ids,
+        ) = _select_semantic_memories(
             context.memories,
+            context.reflections,
+            context.persona_impressions,
             min(int(context.character_budget * MEMORY_BUDGET_RATIO), remaining),
         )
-        memory_character_count = (
-            _content_characters(memory_message.content) if memory_message else 0
-        )
+        memory_character_count = _message_characters(memory_messages)
         remaining -= memory_character_count
 
         persona_message, selected_persona_knowledge_ids = _select_persona_knowledge(
@@ -120,8 +140,7 @@ class DefaultPromptContextService:
         messages: list[PromptMessage] = list(core)
         if persona_message is not None:
             messages.append(persona_message)
-        if memory_message is not None:
-            messages.append(memory_message)
+        messages.extend(memory_messages)
         if summary_message is not None:
             messages.append(summary_message)
         messages.extend(recent_messages)
@@ -132,8 +151,18 @@ class DefaultPromptContextService:
             messages=tuple(messages),
             selected_memory_ids=selected_memory_ids,
             selected_memory_version_ids=selected_memory_version_ids,
+            selected_reflection_version_ids=selected_reflection_version_ids,
+            selected_persona_impression_version_ids=(selected_persona_impression_version_ids),
             selected_persona_knowledge_ids=selected_persona_knowledge_ids,
-            omitted_memory_count=max(0, len(context.memories) - len(selected_memory_ids)),
+            omitted_memory_count=max(
+                0,
+                len(context.memories)
+                + len(context.reflections)
+                + len(context.persona_impressions)
+                - len(selected_memory_ids)
+                - len(selected_reflection_version_ids)
+                - len(selected_persona_impression_version_ids),
+            ),
             omitted_persona_knowledge_count=max(
                 0,
                 len(context.persona_knowledge) - len(selected_persona_knowledge_ids),
@@ -162,39 +191,165 @@ def _validate_input(context: PromptContextInput) -> None:
         raise ValueError("recent context accepts only user and assistant messages")
 
 
-def _select_memories(
+def _select_semantic_memories(
     memories: tuple[PromptMemory, ...],
+    reflections: tuple[PromptDerivedMemory, ...],
+    persona_impressions: tuple[PromptDerivedMemory, ...],
     budget: int,
-) -> tuple[PromptMessage | None, tuple[str, ...], tuple[str, ...]]:
+) -> tuple[
+    tuple[PromptMessage, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
     if budget <= len(_MEMORY_HEADER):
-        return None, (), ()
+        return (), (), (), (), ()
 
     selected_ids: list[str] = []
     selected_version_ids: list[str] = []
-    lines: list[str] = []
+    selected_reflection_ids: list[str] = []
+    selected_impression_ids: list[str] = []
+    fact_lines: list[str] = []
+    reflection_lines: list[str] = []
+    impression_lines: list[str] = []
     used_ids: set[str] = set()
-    for memory in memories:
-        if len(selected_ids) >= MAX_PROMPT_MEMORIES:
+    used = 0
+
+    def fits(candidate_messages: tuple[PromptMessage, ...]) -> bool:
+        return _message_characters(candidate_messages) <= budget
+
+    for memory in memories[:MAX_PROMPT_FACTS]:
+        if used >= MAX_PROMPT_MEMORIES:
             break
         if not memory.memory_id or memory.memory_id in used_ids or not memory.content.strip():
             continue
         line = _render_memory(memory)
-        candidate = _MEMORY_HEADER + "\n".join((*lines, line))
-        if len(candidate) > budget:
+        candidate = (
+            PromptMessage(PromptRole.SYSTEM, _MEMORY_HEADER + "\n".join((*fact_lines, line))),
+            *(
+                (
+                    PromptMessage(
+                        PromptRole.SYSTEM,
+                        _REFLECTION_HEADER + "\n".join(reflection_lines),
+                    ),
+                )
+                if reflection_lines
+                else ()
+            ),
+            *(
+                (
+                    PromptMessage(
+                        PromptRole.SYSTEM,
+                        _PERSONA_IMPRESSION_HEADER + "\n".join(impression_lines),
+                    ),
+                )
+                if impression_lines
+                else ()
+            ),
+        )
+        if not fits(candidate):
             continue
-        lines.append(line)
+        fact_lines.append(line)
         selected_ids.append(memory.memory_id)
         if memory.memory_version_id:
             selected_version_ids.append(memory.memory_version_id)
         used_ids.add(memory.memory_id)
+        used += 1
 
-    if not lines:
-        return None, (), ()
-    content = _MEMORY_HEADER + "\n".join(lines)
+    for reflection in reflections[:MAX_PROMPT_REFLECTIONS]:
+        if used >= MAX_PROMPT_MEMORIES or not reflection.content.strip():
+            break
+        if reflection.version_id in used_ids:
+            continue
+        line = f"- {(' '.join(reflection.content.split()))}"
+        candidate_lines = (*reflection_lines, line)
+        candidate_messages = tuple(
+            message
+            for message in (
+                (
+                    PromptMessage(PromptRole.SYSTEM, _MEMORY_HEADER + "\n".join(fact_lines))
+                    if fact_lines
+                    else None
+                ),
+                PromptMessage(
+                    PromptRole.SYSTEM,
+                    _REFLECTION_HEADER + "\n".join(candidate_lines),
+                ),
+                (
+                    PromptMessage(
+                        PromptRole.SYSTEM,
+                        _PERSONA_IMPRESSION_HEADER + "\n".join(impression_lines),
+                    )
+                    if impression_lines
+                    else None
+                ),
+            )
+            if message is not None
+        )
+        if not fits(candidate_messages):
+            continue
+        reflection_lines.append(line)
+        selected_reflection_ids.append(reflection.version_id)
+        used_ids.add(reflection.version_id)
+        used += 1
+
+    for impression in persona_impressions[:MAX_PROMPT_PERSONA_IMPRESSIONS]:
+        if used >= MAX_PROMPT_MEMORIES or not impression.content.strip():
+            break
+        if impression.version_id in used_ids:
+            continue
+        line = f"- [{impression.subject_scope.value}] {' '.join(impression.content.split())}"
+        candidate_messages = tuple(
+            message
+            for message in (
+                (
+                    PromptMessage(PromptRole.SYSTEM, _MEMORY_HEADER + "\n".join(fact_lines))
+                    if fact_lines
+                    else None
+                ),
+                (
+                    PromptMessage(
+                        PromptRole.SYSTEM,
+                        _REFLECTION_HEADER + "\n".join(reflection_lines),
+                    )
+                    if reflection_lines
+                    else None
+                ),
+                PromptMessage(
+                    PromptRole.SYSTEM,
+                    _PERSONA_IMPRESSION_HEADER + "\n".join((*impression_lines, line)),
+                ),
+            )
+            if message is not None
+        )
+        if not fits(candidate_messages):
+            continue
+        impression_lines.append(line)
+        selected_impression_ids.append(impression.version_id)
+        used_ids.add(impression.version_id)
+        used += 1
+
+    messages: list[PromptMessage] = []
+    if fact_lines:
+        messages.append(PromptMessage(PromptRole.SYSTEM, _MEMORY_HEADER + "\n".join(fact_lines)))
+    if reflection_lines:
+        messages.append(
+            PromptMessage(PromptRole.SYSTEM, _REFLECTION_HEADER + "\n".join(reflection_lines))
+        )
+    if impression_lines:
+        messages.append(
+            PromptMessage(
+                PromptRole.SYSTEM,
+                _PERSONA_IMPRESSION_HEADER + "\n".join(impression_lines),
+            )
+        )
     return (
-        PromptMessage(PromptRole.SYSTEM, content),
+        tuple(messages),
         tuple(selected_ids),
         tuple(selected_version_ids),
+        tuple(selected_reflection_ids),
+        tuple(selected_impression_ids),
     )
 
 

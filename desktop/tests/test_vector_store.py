@@ -6,7 +6,10 @@ import sqlite3
 import pytest
 
 from amadeus_desktop import vector_store as vector_store_module
+from amadeus_desktop.conversation_store import ConversationStore
 from amadeus_desktop.database import SQLiteDatabase
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
+from amadeus_desktop.memory_models import MemoryLayer
 from amadeus_desktop.memory_store import MemoryStore
 from amadeus_desktop.persona_repository import PersonaRepository
 from amadeus_desktop.storage_models import (
@@ -152,6 +155,89 @@ def test_memory_and_persona_generations_are_physically_isolated(tmp_path) -> Non
         database.close()
 
 
+def test_reflection_and_persona_impression_vectors_are_independent_corpora(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "amadeus.sqlite3").open()
+    conversations = ConversationStore(database)
+    memory = MemoryStore(database)
+    deep = DeepMemoryStore(database)
+    vectors = VectorStore(database)
+    try:
+        conversation = conversations.create_conversation()
+        fact_ids: list[str] = []
+        for index in range(5):
+            message = conversations.save_user_message(
+                conversation.conversation_id,
+                f"turn-{index}",
+                f"user-{index}",
+                f"我第 {index + 1} 次表示重视稳定互动",
+            )
+            fact = memory.create_memory(
+                "relationship",
+                f"稳定互动:{index}",
+                f"用户第 {index + 1} 次表示重视稳定互动",
+                source_message_ids=(message.message_id,),
+            )
+            fact_ids.append(fact.current_version.version_id)
+        active_reflection = deep.create_reflection(
+            "用户重视稳定互动",
+            "稳定互动",
+            fact_version_ids=fact_ids,
+            importance=0.8,
+        )
+        active_reflection = deep.confirm(MemoryLayer.REFLECTION, active_reflection.group_id)
+        promoted_reflection = deep.create_reflection(
+            "关系信任来自长期可预期交流",
+            "关系信任",
+            fact_version_ids=fact_ids,
+            importance=1.0,
+        )
+        deep.confirm(MemoryLayer.REFLECTION, promoted_reflection.group_id)
+        deep.confirm(MemoryLayer.REFLECTION, promoted_reflection.group_id)
+        impression = deep.promote_reflection(promoted_reflection.group_id)
+
+        reflection_generation = vectors.begin_reflection_generation(
+            generation_id="reflection-generation",
+            **MODEL,
+        )
+        impression_generation = vectors.begin_persona_impression_generation(
+            generation_id="impression-generation",
+            **MODEL,
+        )
+        vectors.activate_reflection_generation(
+            reflection_generation.generation_id,
+            {active_reflection.current_version.version_id: _vector(3.0)},
+        )
+        vectors.activate_persona_impression_generation(
+            impression_generation.generation_id,
+            {impression.current_version.version_id: _vector(4.0)},
+        )
+
+        assert [item.target_id for item in vectors.load_reflection_vectors()] == [
+            active_reflection.current_version.version_id
+        ]
+        assert [item.target_id for item in vectors.load_persona_impression_vectors()] == [
+            impression.current_version.version_id
+        ]
+        assert (
+            database.connection.execute(
+                "SELECT COUNT(*) FROM memory_reflection_vectors"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            database.connection.execute(
+                "SELECT COUNT(*) FROM memory_persona_impression_vectors"
+            ).fetchone()[0]
+            == 1
+        )
+        static_count = database.connection.execute(
+            "SELECT COUNT(*) FROM persona_vectors"
+        ).fetchone()[0]
+        assert static_count == 0
+    finally:
+        database.close()
+
+
 def test_interrupted_builds_become_retryable_failures_without_moving_active(tmp_path) -> None:
     database = SQLiteDatabase(tmp_path / "amadeus.sqlite3").open()
     memory = MemoryStore(database)
@@ -188,7 +274,7 @@ def test_interrupted_builds_become_retryable_failures_without_moving_active(tmp_
             persona_id="kurisu", generation_id="interrupted-p", **MODEL
         )
 
-        assert vectors.recover_interrupted_generations() == (1, 1)
+        assert vectors.recover_interrupted_generations() == (1, 0, 0, 1)
         assert (
             vectors.get_memory_generation(interrupted_user.generation_id).status
             is EmbeddingGenerationStatus.FAILED
@@ -199,7 +285,7 @@ def test_interrupted_builds_become_retryable_failures_without_moving_active(tmp_
         )
         assert vectors.get_active_memory_generation().generation_id == "active-u"
         assert vectors.get_active_persona_generation("kurisu").generation_id == "active-p"
-        assert vectors.recover_interrupted_generations() == (0, 0)
+        assert vectors.recover_interrupted_generations() == (0, 0, 0, 0)
     finally:
         database.close()
 

@@ -29,6 +29,7 @@ from amadeus_desktop.chat_models import (
 from amadeus_desktop.conversation_store import ConversationStore
 from amadeus_desktop.data_runtime import SerialDataThread
 from amadeus_desktop.database import SQLiteDatabase
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
 from amadeus_desktop.embedding_backend import (
     CPU_PROVIDER,
     EmbeddingBackend,
@@ -65,6 +66,8 @@ from amadeus_desktop.vector_store import VectorStore
 
 MEMORY_BENCHMARK_ITEMS = 10_000
 PERSONA_BENCHMARK_ITEMS = 40
+REFLECTION_BENCHMARK_ITEMS = 20
+PERSONA_IMPRESSION_BENCHMARK_ITEMS = 10
 BENCHMARK_WARMUPS = 5
 BENCHMARK_QUERY_COUNT = 100
 BENCHMARK_P95_LIMIT_MS = 300.0
@@ -251,6 +254,8 @@ def run_production_benchmark(
     backend_factory: BackendFactory | None = None,
     memory_items: int = MEMORY_BENCHMARK_ITEMS,
     persona_items: int = PERSONA_BENCHMARK_ITEMS,
+    reflection_items: int = REFLECTION_BENCHMARK_ITEMS,
+    persona_impression_items: int = PERSONA_IMPRESSION_BENCHMARK_ITEMS,
     warmup_queries: Sequence[str] = BENCHMARK_WARMUP_QUERIES,
     measured_queries: Sequence[str] = BENCHMARK_QUERIES,
     p95_limit_ms: float = BENCHMARK_P95_LIMIT_MS,
@@ -261,6 +266,10 @@ def run_production_benchmark(
         raise ValueError("production benchmark memory size must be between 1 and 10,000")
     if persona_items <= 0 or persona_items > MEMORY_BENCHMARK_ITEMS:
         raise ValueError("production benchmark persona size must be between 1 and 10,000")
+    if reflection_items <= 0 or reflection_items > MEMORY_BENCHMARK_ITEMS:
+        raise ValueError("production benchmark reflection size must be between 1 and 10,000")
+    if persona_impression_items <= 0 or persona_impression_items > MEMORY_BENCHMARK_ITEMS:
+        raise ValueError("production benchmark impression size must be between 1 and 10,000")
     if not measured_queries or len(set(measured_queries)) != len(measured_queries):
         raise ValueError("benchmark queries must be non-empty and distinct")
     factory = backend_factory or FastEmbedEmbeddingBackend
@@ -287,6 +296,8 @@ def run_production_benchmark(
             backup_path,
             memory_items=memory_items,
             persona_items=persona_items,
+            reflection_items=reflection_items,
+            persona_impression_items=persona_impression_items,
             threshold=calibration.threshold,
         )
         seed_ms = _elapsed_ms(seed_started)
@@ -307,6 +318,7 @@ def run_production_benchmark(
                 resource.memories,
                 resource.personas,
                 resource.vectors,
+                resource.deep_memories,
             ),
             backend_calibrator=lambda backend: calibrate_backend(backend).calibration.threshold,
         )
@@ -340,6 +352,10 @@ def run_production_benchmark(
                 raise AcceptanceFailure("production_memory_cache_count_mismatch")
             if coordinator.status.persona_count != persona_items:
                 raise AcceptanceFailure("production_persona_cache_count_mismatch")
+            if coordinator.status.reflection_count != reflection_items:
+                raise AcceptanceFailure("production_reflection_cache_count_mismatch")
+            if coordinator.status.persona_impression_count != persona_impression_items:
+                raise AcceptanceFailure("production_impression_cache_count_mismatch")
 
             warmup_started = time.perf_counter()
             for index, query in enumerate(warmup_queries):
@@ -392,7 +408,11 @@ def run_production_benchmark(
     p50 = _percentile(latencies_ms, 0.50)
     p95 = _percentile(latencies_ms, 0.95)
     maximum = max(latencies_ms)
-    expected_cache_bytes = (memory_items + persona_items) * MODEL_DIMENSION * 4
+    expected_cache_bytes = (
+        (memory_items + persona_items + reflection_items + persona_impression_items)
+        * MODEL_DIMENSION
+        * 4
+    )
     if cache_bytes != expected_cache_bytes:
         raise AcceptanceFailure("production_cache_size_mismatch")
     if correct_recall_count != len(latencies_ms):
@@ -417,6 +437,8 @@ def run_production_benchmark(
         "dimension": MODEL_DIMENSION,
         "memory_items": memory_items,
         "persona_items": persona_items,
+        "reflection_items": reflection_items,
+        "persona_impression_items": persona_impression_items,
         "memory_matrix_bytes": memory_items * MODEL_DIMENSION * 4,
         "total_cache_bytes": cache_bytes,
         "model_load_ms": _rounded(model_load_ms),
@@ -497,14 +519,29 @@ def _seed_production_database(
     *,
     memory_items: int,
     persona_items: int,
+    reflection_items: int,
+    persona_impression_items: int,
     threshold: float,
 ) -> None:
     database = SQLiteDatabase(database_path, backup_dir=backup_path).open()
     try:
         conversations = ConversationStore(database)
-        conversations.create_conversation(
+        conversation = conversations.create_conversation(
             "公开合成性能验收",
             conversation_id="benchmark-conversation",
+        )
+        source_fact_count = min(
+            memory_items,
+            reflection_items + persona_impression_items,
+        )
+        source_messages = tuple(
+            conversations.save_user_message(
+                conversation.conversation_id,
+                f"benchmark-source-turn-{index:05d}",
+                f"benchmark-source-message-{index:05d}",
+                f"公开合成深层证据编号{index:05d}",
+            )
+            for index in range(source_fact_count)
         )
         now = encode_utc(datetime.now(UTC))
         memory_rows: list[tuple[object, ...]] = []
@@ -536,6 +573,7 @@ def _seed_production_database(
                     exact_memory_hash(content),
                     search_text,
                     now,
+                    int(index < source_fact_count),
                 )
             )
             fts_rows.append((version_id, memory_id, DEFAULT_PROFILE_ID, search_text))
@@ -554,11 +592,29 @@ def _seed_production_database(
                 INSERT INTO memory_versions(
                     id, memory_id, version_number, content, normalized_content,
                     content_hash, search_text, importance, confidence, origin,
-                    operation, supersedes_version_id, created_at
+                    operation, supersedes_version_id, created_at, deep_memory_eligible
                 ) VALUES (?, ?, 1, ?, ?, ?, ?, 0.75, 1.0, 'manual',
-                          'manual_edit', NULL, ?)
+                          'manual_edit', NULL, ?, ?)
                 """,
                 version_rows,
+            )
+            connection.executemany(
+                """
+                INSERT INTO memory_sources(
+                    id, version_id, source_message_id, live_message_id,
+                    extraction_method, created_at
+                ) VALUES (?, ?, ?, ?, 'automatic', ?)
+                """,
+                (
+                    (
+                        f"benchmark-memory-source-{index:05d}",
+                        f"benchmark-version-{index:05d}",
+                        source_messages[index].message_id,
+                        source_messages[index].message_id,
+                        now,
+                    )
+                    for index in range(source_fact_count)
+                ),
             )
             connection.executemany(
                 """
@@ -607,6 +663,30 @@ def _seed_production_database(
                 persona_fts_rows,
             )
 
+        deep_memories = DeepMemoryStore(database)
+        active_reflections = []
+        persona_impressions = []
+        for index in range(reflection_items + persona_impression_items):
+            fact_index = index % source_fact_count
+            reflection = deep_memories.create_reflection(
+                f"zephyrreflection{index:05d}",
+                f"benchmark-reflection:{index:05d}",
+                fact_version_ids=(f"benchmark-version-{fact_index:05d}",),
+                importance=1.0,
+                confidence=1.0,
+            )
+            reflection = deep_memories.confirm("reflection", reflection.group_id)
+            if index < persona_impression_items:
+                reflection = deep_memories.confirm("reflection", reflection.group_id)
+                persona_impressions.append(
+                    deep_memories.promote_reflection(
+                        reflection.group_id,
+                        content=f"zephyrimpression{index:05d}",
+                    )
+                )
+            else:
+                active_reflections.append(reflection)
+
         vectors = VectorStore(database)
         user_generation = vectors.begin_memory_generation(
             generation_id="benchmark-user-generation",
@@ -618,6 +698,20 @@ def _seed_production_database(
         persona_generation = vectors.begin_persona_generation(
             generation_id="benchmark-persona-generation",
             persona_id="kurisu",
+            model_name=MODEL_API_NAME,
+            model_commit=MODEL_REVISION,
+            model_sha256=MODEL_ONNX_SHA256,
+            calibration_threshold=threshold,
+        )
+        reflection_generation = vectors.begin_reflection_generation(
+            generation_id="benchmark-reflection-generation",
+            model_name=MODEL_API_NAME,
+            model_commit=MODEL_REVISION,
+            model_sha256=MODEL_ONNX_SHA256,
+            calibration_threshold=threshold,
+        )
+        impression_generation = vectors.begin_persona_impression_generation(
+            generation_id="benchmark-impression-generation",
             model_name=MODEL_API_NAME,
             model_commit=MODEL_REVISION,
             model_sha256=MODEL_ONNX_SHA256,
@@ -636,6 +730,20 @@ def _seed_production_database(
             {
                 f"benchmark-persona-{index:05d}": basis[(index + 257) % MODEL_DIMENSION]
                 for index in range(persona_items)
+            },
+        )
+        vectors.activate_reflection_generation(
+            reflection_generation.generation_id,
+            {
+                record.current_version.version_id: basis[(index + 129) % MODEL_DIMENSION]
+                for index, record in enumerate(active_reflections)
+            },
+        )
+        vectors.activate_persona_impression_generation(
+            impression_generation.generation_id,
+            {
+                record.current_version.version_id: basis[(index + 385) % MODEL_DIMENSION]
+                for index, record in enumerate(persona_impressions)
             },
         )
     finally:
@@ -691,8 +799,13 @@ def _prepare_production_prompt(
 def _user_query_cross_library_mis_hits(prompt: PreparedPrompt) -> int:
     """Count role-corpus injections into a controlled user-only query."""
 
-    return len(prompt.persona_knowledge_ids) + sum(
-        not value.startswith("benchmark-version-") for value in prompt.user_memory_version_ids
+    return (
+        len(prompt.reflection_version_ids)
+        + len(prompt.persona_impression_version_ids)
+        + len(prompt.persona_knowledge_ids)
+        + sum(
+            not value.startswith("benchmark-version-") for value in prompt.user_memory_version_ids
+        )
     )
 
 

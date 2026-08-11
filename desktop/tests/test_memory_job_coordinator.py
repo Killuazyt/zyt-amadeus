@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QTimer
 
 from amadeus_desktop.background_generation import BackgroundGenerationRunner
@@ -30,6 +31,7 @@ from amadeus_desktop.chat_provider import (
 from amadeus_desktop.conversation_store import BackgroundJobStore, ConversationStore
 from amadeus_desktop.data_runtime import SerialDataThread
 from amadeus_desktop.database import SQLiteDatabase
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
 from amadeus_desktop.memory_job_coordinator import (
     MEMORY_EXTRACTION_JOB_KIND,
     SUMMARY_JOB_KIND,
@@ -140,6 +142,7 @@ def _repositories(database: SQLiteDatabase, clock: MutableClock) -> JobRepositor
         conversations=ConversationStore(database, clock=clock),
         jobs=BackgroundJobStore(database, clock=clock),
         memories=MemoryStore(database, clock=clock),
+        deep_memories=DeepMemoryStore(database, clock=clock),
     )
 
 
@@ -227,6 +230,12 @@ def _valid_candidate(source_message_id: str, content: str = "用户喜欢咖啡"
         },
         ensure_ascii=False,
     )
+
+
+def _correction_candidate(source_message_id: str, content: str) -> str:
+    payload = json.loads(_valid_candidate(source_message_id, content))
+    payload["candidates"][0]["operation"] = "correct"
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _seed_extraction(
@@ -403,6 +412,88 @@ def test_extraction_repairs_strict_json_once_then_upserts_memory(qtbot, tmp_path
             ).fetchone()[0]
         assert count == 1
         assert source_count == 1
+    finally:
+        _stop(qtbot, runtime, runner, coordinator)
+
+
+@pytest.mark.parametrize(
+    ("source_text", "expect_conflict"),
+    (
+        ("最近我似乎更喜欢喝茶", True),
+        ("我现在改为只喝茶，已经不是咖啡偏好了", False),
+    ),
+)
+def test_correction_intent_opens_challenger_or_creates_new_current_version(
+    qtbot,
+    tmp_path,
+    source_text: str,
+    expect_conflict: bool,
+) -> None:
+    path = tmp_path / "amadeus.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 1, 9, 15, tzinfo=UTC))
+
+    def seed(repositories: JobRepositoryBundle) -> str:
+        conversation = repositories.conversations.create_conversation()
+        original = repositories.conversations.save_user_message(
+            conversation.conversation_id,
+            "turn-original",
+            "user-original",
+            "我喜欢喝咖啡",
+        )
+        repositories.memories.create_memory(
+            "preference",
+            "饮料 咖啡",
+            "用户喜欢喝咖啡",
+            source_message_ids=(original.message_id,),
+            memory_id="drink-preference",
+        )
+        correction = repositories.conversations.save_user_message(
+            conversation.conversation_id,
+            "turn-correction",
+            "user-correction",
+            source_text,
+        )
+        repositories.jobs.enqueue(
+            MEMORY_EXTRACTION_JOB_KIND,
+            "extract:correction",
+            profile_id=conversation.profile_id,
+            conversation_id=conversation.conversation_id,
+            message_id=correction.message_id,
+            payload={
+                "source_message_ids": [correction.message_id],
+                "turn_id": correction.turn_id,
+                "terminal_reason": TurnTerminalReason.COMPLETED.value,
+            },
+        )
+        return correction.message_id
+
+    source_id = _seed(path, clock, seed)
+    provider = SequenceProvider([_correction_candidate(source_id, "用户喜欢喝茶")])
+    runtime, runner, coordinator = _start(qtbot, path, clock, provider)
+    try:
+        qtbot.waitUntil(
+            lambda: _job_status(path, "extract:correction") == "completed",
+            timeout=3_000,
+        )
+        with sqlite3.connect(path) as connection:
+            current = connection.execute(
+                """
+                SELECT v.content FROM memory_groups AS g
+                JOIN memory_versions AS v ON v.id = g.current_version_id
+                WHERE g.id = 'drink-preference'
+                """
+            ).fetchone()[0]
+            open_conflicts = connection.execute(
+                "SELECT COUNT(*) FROM memory_conflicts WHERE status = 'open'"
+            ).fetchone()[0]
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM memory_versions WHERE memory_id = 'drink-preference'"
+                ).fetchone()[0]
+                == 2
+            )
+        assert open_conflicts == int(expect_conflict)
+        assert current == ("用户喜欢喝咖啡" if expect_conflict else "用户喜欢喝茶")
     finally:
         _stop(qtbot, runtime, runner, coordinator)
 

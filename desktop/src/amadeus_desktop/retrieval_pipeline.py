@@ -34,8 +34,12 @@ from amadeus_desktop.memory_models import (
     MemoryKind as DomainMemoryKind,
 )
 from amadeus_desktop.memory_models import (
+    MemoryLayer,
+    PromptDerivedMemory,
     PromptMemory,
     PromptPersonaKnowledge,
+    WorkingMemoryItem,
+    WorkingMemorySnapshot,
 )
 from amadeus_desktop.persona import (
     build_capability_safety_boundary,
@@ -71,6 +75,16 @@ class _MemoryRepository(Protocol):
 
     def recall_stats(self, *, profile_id: str, memory_ids=None): ...
 
+    def recent_recalled_version_ids(self, *, profile_id: str, response_limit: int): ...
+
+
+class _DeepMemoryRepository(Protocol):
+    def search(self, layer, query: str, *, profile_id: str, limit: int): ...
+
+    def get_active_by_version_ids(self, layer, version_ids, *, profile_id: str): ...
+
+    def recent_recalled_version_ids(self, layer, *, profile_id: str, response_limit: int): ...
+
 
 class _PersonaRepository(Protocol):
     def search(self, persona_id: str, query: str, *, limit: int): ...
@@ -78,6 +92,8 @@ class _PersonaRepository(Protocol):
     def get_active_by_ids(self, persona_id: str, knowledge_ids): ...
 
     def recall_stats(self, persona_id: str, knowledge_ids=None): ...
+
+    def recent_recalled_knowledge_ids(self, persona_id: str, *, response_limit: int): ...
 
 
 class _AttachmentRepository(Protocol):
@@ -87,6 +103,7 @@ class _AttachmentRepository(Protocol):
 class RetrievalStores(Protocol):
     conversations: _ConversationRepository
     memories: _MemoryRepository
+    deep_memories: _DeepMemoryRepository
     personas: _PersonaRepository
     attachments: _AttachmentRepository
 
@@ -104,6 +121,8 @@ class PromptRetrievalSeed:
     attachments: tuple[AttachmentSnapshot, ...] = ()
     provider_route: ProviderRoute = ProviderRoute.TEXT
     user_fts_hits: tuple[RankedRetrievalHit, ...] = ()
+    reflection_fts_hits: tuple[RankedRetrievalHit, ...] = ()
+    persona_impression_fts_hits: tuple[RankedRetrievalHit, ...] = ()
     persona_fts_hits: tuple[RankedRetrievalHit, ...] = ()
 
 
@@ -112,6 +131,8 @@ class VectorRetrievalResult:
     """Vector-thread output safe to pass back to the serialized data thread."""
 
     user_hits: tuple[RankedRetrievalHit, ...] = ()
+    reflection_hits: tuple[RankedRetrievalHit, ...] = ()
+    persona_impression_hits: tuple[RankedRetrievalHit, ...] = ()
     persona_hits: tuple[RankedRetrievalHit, ...] = ()
     threshold: float = 1.0
     degraded_category: str | None = None
@@ -123,6 +144,7 @@ def collect_prompt_retrieval_seed(
     current_user_message: str,
     *,
     memory_enabled: bool,
+    deep_memory_enabled: bool = True,
     persona_id: str = DEFAULT_PERSONA_ID,
 ) -> PromptRetrievalSeed:
     """Collect recent context and independent FTS candidate lists."""
@@ -176,6 +198,8 @@ def collect_prompt_retrieval_seed(
 
     retrieval_query = build_retrieval_query(current_user_message, retrieval_context)
     user_fts: tuple[RankedRetrievalHit, ...] = ()
+    reflection_fts: tuple[RankedRetrievalHit, ...] = ()
+    impression_fts: tuple[RankedRetrievalHit, ...] = ()
     if memory_enabled:
         try:
             results = stores.memories.search(
@@ -193,6 +217,47 @@ def collect_prompt_retrieval_seed(
             )
         except Exception:
             user_fts = ()
+        if deep_memory_enabled:
+            try:
+                reflection_results = stores.deep_memories.search(
+                    MemoryLayer.REFLECTION,
+                    retrieval_query,
+                    profile_id=DEFAULT_PROFILE_ID,
+                    limit=MAX_SOURCE_HITS,
+                )
+                reflection_fts = tuple(
+                    RankedRetrievalHit(
+                        record.current_version.version_id,
+                        rank,
+                        fts_rank,
+                    )
+                    for rank, (record, fts_rank) in enumerate(
+                        reflection_results,
+                        start=1,
+                    )
+                )
+            except Exception:
+                reflection_fts = ()
+            try:
+                impression_results = stores.deep_memories.search(
+                    MemoryLayer.PERSONA,
+                    retrieval_query,
+                    profile_id=DEFAULT_PROFILE_ID,
+                    limit=MAX_SOURCE_HITS,
+                )
+                impression_fts = tuple(
+                    RankedRetrievalHit(
+                        record.current_version.version_id,
+                        rank,
+                        fts_rank,
+                    )
+                    for rank, (record, fts_rank) in enumerate(
+                        impression_results,
+                        start=1,
+                    )
+                )
+            except Exception:
+                impression_fts = ()
 
     try:
         persona_results = stores.personas.search(
@@ -228,6 +293,8 @@ def collect_prompt_retrieval_seed(
             else ProviderRoute.TEXT
         ),
         user_fts_hits=user_fts,
+        reflection_fts_hits=reflection_fts,
+        persona_impression_fts_hits=impression_fts,
         persona_fts_hits=persona_fts,
     )
 
@@ -239,23 +306,51 @@ def finalize_prepared_prompt(
     turn_id: str,
     attempt: int,
     memory_enabled: bool,
+    deep_memory_enabled: bool = True,
     vector_result: VectorRetrievalResult | None,
     prompt_service: DefaultPromptContextService,
     persona_id: str = DEFAULT_PERSONA_ID,
     follow_user_language: bool = True,
+    message_id: str = "",
 ) -> PreparedPrompt:
     """Revalidate candidates, fuse the two corpora, and build one immutable prompt."""
 
     vectors = vector_result or VectorRetrievalResult(degraded_category="vector_unavailable")
     user_vector_hits = vectors.user_hits if memory_enabled else ()
+    reflection_vector_hits = (
+        vectors.reflection_hits if memory_enabled and deep_memory_enabled else ()
+    )
+    impression_vector_hits = (
+        vectors.persona_impression_hits if memory_enabled and deep_memory_enabled else ()
+    )
     user_fts_hits = seed.user_fts_hits if memory_enabled else ()
+    reflection_fts_hits = seed.reflection_fts_hits if memory_enabled and deep_memory_enabled else ()
+    impression_fts_hits = (
+        seed.persona_impression_fts_hits if memory_enabled and deep_memory_enabled else ()
+    )
     user_version_ids = _candidate_ids(user_fts_hits, user_vector_hits)
+    reflection_version_ids = _candidate_ids(reflection_fts_hits, reflection_vector_hits)
+    impression_version_ids = _candidate_ids(impression_fts_hits, impression_vector_hits)
     persona_ids = _candidate_ids(seed.persona_fts_hits, vectors.persona_hits)
 
     user_records: tuple[MemoryRecord, ...] = ()
     if memory_enabled and user_version_ids:
         user_records = stores.memories.get_active_by_version_ids(
             user_version_ids,
+            profile_id=DEFAULT_PROFILE_ID,
+        )
+    reflection_records = ()
+    impression_records = ()
+    if memory_enabled and deep_memory_enabled and reflection_version_ids:
+        reflection_records = stores.deep_memories.get_active_by_version_ids(
+            MemoryLayer.REFLECTION,
+            reflection_version_ids,
+            profile_id=DEFAULT_PROFILE_ID,
+        )
+    if memory_enabled and deep_memory_enabled and impression_version_ids:
+        impression_records = stores.deep_memories.get_active_by_version_ids(
+            MemoryLayer.PERSONA,
+            impression_version_ids,
             profile_id=DEFAULT_PROFILE_ID,
         )
     persona_records: tuple[PersonaKnowledge, ...] = ()
@@ -272,14 +367,56 @@ def finalize_prepared_prompt(
         record.knowledge_id: _persona_item(record, persona_stats.get(record.knowledge_id))
         for record in persona_records
     }
+    reflection_items = {
+        record.current_version.version_id: _derived_item(record) for record in reflection_records
+    }
+    impression_items = {
+        record.current_version.version_id: _derived_item(record) for record in impression_records
+    }
+    recent = {
+        RetrievalCorpus.USER_MEMORY: stores.memories.recent_recalled_version_ids(
+            profile_id=DEFAULT_PROFILE_ID,
+            response_limit=3,
+        ),
+        RetrievalCorpus.MEMORY_REFLECTION: (
+            stores.deep_memories.recent_recalled_version_ids(
+                MemoryLayer.REFLECTION,
+                profile_id=DEFAULT_PROFILE_ID,
+                response_limit=3,
+            )
+            if deep_memory_enabled
+            else ()
+        ),
+        RetrievalCorpus.MEMORY_PERSONA_IMPRESSION: (
+            stores.deep_memories.recent_recalled_version_ids(
+                MemoryLayer.PERSONA,
+                profile_id=DEFAULT_PROFILE_ID,
+                response_limit=3,
+            )
+            if deep_memory_enabled
+            else ()
+        ),
+        RetrievalCorpus.PERSONA_KNOWLEDGE: stores.personas.recent_recalled_knowledge_ids(
+            persona_id,
+            response_limit=3,
+        ),
+    }
     bundle = build_retrieval_bundle(
         user_fts_hits=user_fts_hits,
         user_vector_hits=user_vector_hits,
         user_items=user_items,
+        reflection_fts_hits=reflection_fts_hits,
+        reflection_vector_hits=reflection_vector_hits,
+        reflection_items=reflection_items,
+        persona_impression_fts_hits=impression_fts_hits,
+        persona_impression_vector_hits=impression_vector_hits,
+        persona_impression_items=impression_items,
         persona_fts_hits=seed.persona_fts_hits,
         persona_vector_hits=vectors.persona_hits,
         persona_items=persona_items,
         vector_threshold=vectors.threshold,
+        query_text=seed.current_user_message,
+        recently_recalled=recent,
     )
 
     memories_by_version = {record.current_version.version_id: record for record in user_records}
@@ -304,6 +441,20 @@ def finalize_prepared_prompt(
         )
         for result in bundle.persona_knowledge
     )
+    reflections_by_version = {
+        record.current_version.version_id: record for record in reflection_records
+    }
+    impressions_by_version = {
+        record.current_version.version_id: record for record in impression_records
+    }
+    reflections = tuple(
+        _prompt_derived(reflections_by_version[result.item.target_id])
+        for result in bundle.reflections
+    )
+    impressions = tuple(
+        _prompt_derived(impressions_by_version[result.item.target_id])
+        for result in bundle.persona_impressions
+    )
     context = prompt_service.build(
         PromptContextInput(
             safety_boundary=build_capability_safety_boundary(),
@@ -311,20 +462,67 @@ def finalize_prepared_prompt(
             current_date=date.today(),
             current_user_message=seed.current_user_message,
             memories=memories,
+            reflections=reflections,
+            persona_impressions=impressions,
             persona_knowledge=persona,
             summary=seed.summary,
             recent_messages=seed.recent_messages,
         )
     )
     messages = (*context.messages[:-1], PromptMessage(PromptRole.USER, seed.current_prompt_content))
+    working_items: list[WorkingMemoryItem] = []
+    selected_ids = {
+        *context.selected_memory_version_ids,
+        *context.selected_reflection_version_ids,
+        *context.selected_persona_impression_version_ids,
+        *context.selected_persona_knowledge_ids,
+    }
+    for layer, results in (
+        (MemoryLayer.FACT, bundle.user_memories),
+        (MemoryLayer.REFLECTION, bundle.reflections),
+        (MemoryLayer.PERSONA, bundle.persona_impressions),
+        (MemoryLayer.STATIC_PERSONA, bundle.persona_knowledge),
+    ):
+        for result in results:
+            if result.item.target_id not in selected_ids:
+                continue
+            sources = "+".join(
+                name
+                for name, present in (
+                    ("fts", result.fts_rank is not None),
+                    ("vector", result.vector_rank is not None),
+                )
+                if present
+            )
+            working_items.append(
+                WorkingMemoryItem(
+                    layer=layer,
+                    target_id=result.item.target_id,
+                    version_id=result.item.target_id,
+                    score=result.final_score,
+                    reason=(
+                        f"{sources or 'revalidated'}; relevance gated; "
+                        f"evidence={result.evidence_weight:.2f}; "
+                        f"repeat={result.repetition_weight:.2f}"
+                    ),
+                )
+            )
     return PreparedPrompt(
         messages=messages,
         user_memory_version_ids=context.selected_memory_version_ids,
+        reflection_version_ids=context.selected_reflection_version_ids,
+        persona_impression_version_ids=context.selected_persona_impression_version_ids,
         persona_knowledge_ids=context.selected_persona_knowledge_ids,
         retrieval_ticket_id=f"{turn_id}:{attempt}",
         attempt=attempt,
         attachments=seed.attachments,
         provider_route=seed.provider_route,
+        working_memory_snapshot=WorkingMemorySnapshot(
+            conversation_id=seed.conversation_id,
+            message_id=message_id or turn_id,
+            query=seed.current_user_message,
+            selected=tuple(working_items),
+        ),
     )
 
 
@@ -381,6 +579,7 @@ def _user_item(record: MemoryRecord, stats: RecallStats | None) -> RetrievalItem
         corpus=RetrievalCorpus.USER_MEMORY,
         content=version.content,
         kind=record.kind.value,
+        topic_key=record.topic_key,
         importance=version.importance,
         confidence=version.confidence,
         pinned=record.pinned,
@@ -405,4 +604,43 @@ def _persona_item(record: PersonaKnowledge, stats: RecallStats | None) -> Retrie
         last_successful_recall_at=None if stats is None else stats.last_recalled_at,
         active=record.active,
         current=record.active,
+    )
+
+
+def _derived_item(record) -> RetrievalItem:
+    version = record.current_version
+    return RetrievalItem(
+        target_id=version.version_id,
+        corpus=(
+            RetrievalCorpus.MEMORY_REFLECTION
+            if record.layer is MemoryLayer.REFLECTION
+            else RetrievalCorpus.MEMORY_PERSONA_IMPRESSION
+        ),
+        content=version.content,
+        kind=record.layer.value,
+        topic_key=record.topic_key,
+        importance=version.importance,
+        confidence=version.confidence,
+        evidence_score=record.evidence_score,
+        status_weight=1.0,
+        pinned=record.pinned,
+        created_at=version.created_at,
+        active=not record.conflicted,
+        current=True,
+    )
+
+
+def _prompt_derived(record) -> PromptDerivedMemory:
+    version = record.current_version
+    return PromptDerivedMemory(
+        group_id=record.group_id,
+        version_id=version.version_id,
+        layer=record.layer,
+        subject_scope=record.subject_scope,
+        content=version.content,
+        topic_key=record.topic_key,
+        importance=version.importance,
+        confidence=version.confidence,
+        evidence_score=record.evidence_score,
+        pinned=record.pinned,
     )

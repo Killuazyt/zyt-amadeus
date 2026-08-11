@@ -31,6 +31,7 @@ from amadeus_desktop.chat_models import (
 )
 from amadeus_desktop.conversation_store import BackgroundJobStore, ConversationStore
 from amadeus_desktop.data_runtime import DataPriority, SerialDataThread
+from amadeus_desktop.deep_memory_store import DeepMemoryStore
 from amadeus_desktop.memory_extraction import (
     ExtractionPayloadError,
     contains_do_not_remember,
@@ -52,6 +53,7 @@ from amadeus_desktop.storage_models import (
     StoredMessageRole,
     StoredMessageStatus,
     SummaryProgress,
+    decode_utc,
     utc_now,
 )
 
@@ -89,6 +91,7 @@ class JobRepositoryBundle:
     conversations: ConversationStore
     jobs: BackgroundJobStore
     memories: MemoryService
+    deep_memories: DeepMemoryStore | None = None
 
 
 RepositoryResolver = Callable[[object], JobRepositoryBundle]
@@ -551,7 +554,24 @@ class MemoryJobCoordinator(QObject):
                     candidates,
                     sources,
                     profile_id=profile_id,
+                    deep_memories=repositories.deep_memories,
                 )
+                if repositories.deep_memories is not None:
+                    turn_count = repositories.deep_memories.note_completed_turn(
+                        profile_id=profile_id
+                    )
+                    immediate = turn_count % 10 == 0
+                    repositories.jobs.schedule_deep_memory_cycle(
+                        completed_turn_count=turn_count,
+                        source_message_ids=sorted(sources),
+                        profile_id=profile_id,
+                        conversation_id=execution.job.conversation_id,
+                        message_id=execution.job.message_id,
+                        run_after=(
+                            self._clock() if immediate else self._clock() + timedelta(minutes=5)
+                        ),
+                        trigger="turn" if immediate else "idle",
+                    )
             return repositories.jobs.mark_completed(job_id)
 
         self._submit_finalization(job_id, persist, "memory_persistence")
@@ -904,8 +924,11 @@ _EXTRACTION_SYSTEM_PROMPT: Final = (
     "不得提炼密码、密钥、验证码、支付信息、医疗诊断、法律结论或对第三方的推测。"
     "最多五条，只输出严格 JSON，不能有 Markdown 或说明文字。根对象只能有 candidates；"
     "每项必须且只能包含 type、operation、content、topic_key、importance、confidence、"
-    "source_message_ids。type 只能为 fact/preference/event/relationship；operation 只能为 "
-    "add/supplement/correct；importance 与 confidence 是 0 到 1 的数字；来源只能引用输入中的"
+    "source_message_ids、subject_scope、event_started_at、event_ended_at、time_confidence、"
+    "correction_explicit。type 只能为 fact/preference/event/relationship；operation 只能为 "
+    "add/supplement/correct；subject_scope 只能为 user/relationship；事件时间为带时区 ISO "
+    "字符串或 null，非事件三个时间字段必须为 null；correction_explicit 仅在用户原文明确更正时"
+    "为 true；importance、confidence 与非空 time_confidence 是 0 到 1 的数字；来源只能引用输入中的"
     '用户 message_id。若没有候选，输出 {"candidates":[]}。'
 )
 
@@ -923,6 +946,11 @@ def _repair_request(job: BackgroundJob, invalid_output: str) -> ChatRequest:
                     "importance": "number 0..1",
                     "confidence": "number 0..1",
                     "source_message_ids": ["input user message id"],
+                    "subject_scope": "user|relationship",
+                    "event_started_at": "timezone-aware ISO timestamp|null",
+                    "event_ended_at": "timezone-aware ISO timestamp|null",
+                    "time_confidence": "number 0..1|null",
+                    "correction_explicit": "boolean",
                 }
             ]
         },
@@ -956,6 +984,7 @@ def _apply_candidates(
     sources: Mapping[str, ExtractionSource],
     *,
     profile_id: str,
+    deep_memories: DeepMemoryStore | None = None,
 ) -> None:
     records = list(memory_store.list_memories(profile_id=profile_id, limit=2_000))
     for candidate in candidates:
@@ -968,6 +997,10 @@ def _apply_candidates(
                 importance=candidate.importance,
                 confidence=candidate.confidence,
                 source_message_ids=candidate.source_message_ids,
+                subject_scope=candidate.subject_scope,
+                event_started_at=decode_utc(candidate.event_started_at),
+                event_ended_at=decode_utc(candidate.event_ended_at),
+                time_confidence=candidate.time_confidence,
             )
             if result.created_group:
                 records.append(result.memory)
@@ -983,6 +1016,10 @@ def _apply_candidates(
                 importance=candidate.importance,
                 confidence=candidate.confidence,
                 source_message_ids=candidate.source_message_ids,
+                subject_scope=candidate.subject_scope,
+                event_started_at=decode_utc(candidate.event_started_at),
+                event_ended_at=decode_utc(candidate.event_ended_at),
+                time_confidence=candidate.time_confidence,
             )
             if result.created_group:
                 records.append(result.memory)
@@ -990,6 +1027,14 @@ def _apply_candidates(
         if candidate.operation is MemoryOperation.CORRECT and not _explicit_correction(
             candidate, sources
         ):
+            if deep_memories is not None:
+                deep_memories.open_fact_conflict(
+                    existing.memory_id,
+                    candidate.content,
+                    source_message_id=candidate.source_message_ids[0],
+                    importance=candidate.importance,
+                    confidence=candidate.confidence,
+                )
             continue
         try:
             updated = memory_store.add_version(
@@ -999,11 +1044,19 @@ def _apply_candidates(
                 confidence=candidate.confidence,
                 operation=candidate.operation,
                 source_message_ids=candidate.source_message_ids,
+                event_started_at=decode_utc(candidate.event_started_at),
+                event_ended_at=decode_utc(candidate.event_ended_at),
+                time_confidence=candidate.time_confidence,
             )
         except (ManualVersionProtectedError, StaleMemorySourceError):
             # Automatic supplements never replace an explicit manual edit or
             # a newer automatically-derived version with older provenance.
             continue
+        if deep_memories is not None:
+            deep_memories.suppress_fact_descendants(
+                existing.memory_id,
+                reason_code="upstream_version_changed",
+            )
         records[records.index(existing)] = updated
 
 
@@ -1019,7 +1072,7 @@ def _matching_topic(
 def _explicit_correction(
     candidate: MemoryCandidate, sources: Mapping[str, ExtractionSource]
 ) -> bool:
-    return any(
+    return candidate.correction_explicit or any(
         source is not None and _CORRECTION_MARKER.search(source.content) is not None
         for source_id in candidate.source_message_ids
         if (source := sources.get(source_id)) is not None
