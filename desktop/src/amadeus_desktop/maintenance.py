@@ -15,7 +15,8 @@ from amadeus_desktop.autostart import AutostartError, AutostartManager
 from amadeus_desktop.credential_store import (
     CredentialStore,
     CredentialStoreError,
-    WinCredentialStore,
+    delete_all_amadeus_credentials,
+    enumerate_amadeus_profile_targets,
 )
 from amadeus_desktop.data_management import (
     DataManagementError,
@@ -194,11 +195,15 @@ def _delete_validated_local_data(
     except AutostartError:
         raise MaintenanceError("Launch-at-login state could not be removed safely.") from None
 
-    selected_credentials = credential_store or WinCredentialStore()
     try:
-        selected_credentials.delete_secret()
-        if selected_credentials.has_secret():
-            raise CredentialStoreError("Credential removal could not be verified.")
+        if credential_store is not None:
+            credential_store.delete_secret()
+            if credential_store.has_secret():
+                raise CredentialStoreError("Credential removal could not be verified.")
+        else:
+            delete_all_amadeus_credentials()
+            if enumerate_amadeus_profile_targets():
+                raise CredentialStoreError("Dynamic credential removal could not be verified.")
     except CredentialStoreError:
         raise MaintenanceError("Credential state could not be removed safely.") from None
 

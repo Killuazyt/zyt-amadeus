@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import re
@@ -16,10 +17,15 @@ from amadeus_desktop.provider_config import (
     MULTIMODAL_CREDENTIAL_REF,
     PROVIDER_CREDENTIAL_REF,
 )
+from amadeus_desktop.provider_profiles import (
+    ProviderProfile,
+    legacy_credential_ref,
+)
 
 WINCRED_TARGET_NAME = "Amadeus/DesktopPet/ChatProviderApiKey"
 WINCRED_MULTIMODAL_TARGET_NAME = "Amadeus/DesktopPet/MultimodalProviderApiKey"
 WINCRED_MIMO_SPEECH_TARGET_NAME = "Amadeus/DesktopPet/MiMoSpeechApiKey"
+WINCRED_PROFILE_TARGET_PREFIX = "Amadeus/DesktopPet/ModelProvider/"
 _CREDENTIAL_USER_NAME = "Amadeus Desktop Pet"
 _ERROR_NOT_FOUND = 1168
 _MAX_CREDENTIAL_BLOB_BYTES = 5 * 512
@@ -86,7 +92,15 @@ class WinCredentialStore:
 
     target_name = WINCRED_TARGET_NAME
 
-    def __init__(self, credential_ref: str = PROVIDER_CREDENTIAL_REF) -> None:
+    def __init__(
+        self,
+        credential_ref: str = PROVIDER_CREDENTIAL_REF,
+        *,
+        target_name: str | None = None,
+    ) -> None:
+        if target_name is not None:
+            self.target_name = validate_owned_profile_target(target_name)
+            return
         if credential_ref == PROVIDER_CREDENTIAL_REF:
             self.target_name = WINCRED_TARGET_NAME
         elif credential_ref == MULTIMODAL_CREDENTIAL_REF:
@@ -107,6 +121,119 @@ class WinCredentialStore:
 
     def delete_secret(self) -> None:
         _delete_secret(self.target_name)
+
+    @classmethod
+    def for_profile(cls, profile: ProviderProfile) -> "WinCredentialStore":
+        """Resolve a fixed legacy slot or deterministic P7G profile target."""
+
+        legacy_ref = legacy_credential_ref(profile)
+        if legacy_ref is not None:
+            return cls(legacy_ref)
+        return cls(target_name=profile_credential_target(profile))
+
+
+def profile_credential_target(profile: ProviderProfile) -> str:
+    """Return the only code-owned dynamic target accepted for a profile."""
+
+    profile.validated(None)
+    identifier_digest = hashlib.sha256(profile.profile_id.encode("utf-8")).hexdigest()[:32]
+    return (
+        f"{WINCRED_PROFILE_TARGET_PREFIX}{identifier_digest}/"
+        f"{profile.credential_scope_digest}"
+    )
+
+
+def validate_owned_profile_target(target_name: object) -> str:
+    if not isinstance(target_name, str) or not target_name.startswith(WINCRED_PROFILE_TARGET_PREFIX):
+        raise ValueError("credential target is not owned by Amadeus")
+    suffix = target_name[len(WINCRED_PROFILE_TARGET_PREFIX) :]
+    parts = suffix.split("/")
+    if (
+        len(parts) != 2
+        or len(parts[0]) != 32
+        or len(parts[1]) != 24
+        or any(character not in "0123456789abcdef" for part in parts for character in part)
+    ):
+        raise ValueError("credential target is not owned by Amadeus")
+    return target_name
+
+
+def delete_profile_credentials(profiles: tuple[ProviderProfile, ...]) -> None:
+    """Delete only exact code-derived profile targets; never enumerate WinCred."""
+
+    seen: set[str] = set()
+    for profile in profiles:
+        if profile.credential_slot != "dynamic":
+            continue
+        target = profile_credential_target(profile)
+        if target in seen:
+            continue
+        seen.add(target)
+        WinCredentialStore(target_name=target).delete_secret()
+
+
+def delete_all_amadeus_credentials() -> None:
+    """Remove fixed slots and every credential below Amadeus' dynamic prefix.
+
+    Enumeration is deliberately restricted to the code-owned prefix. Credential
+    values are never read, returned or logged by this cleanup path.
+    """
+
+    for target in (
+        WINCRED_TARGET_NAME,
+        WINCRED_MULTIMODAL_TARGET_NAME,
+        WINCRED_MIMO_SPEECH_TARGET_NAME,
+    ):
+        _delete_secret(target)
+    for target in _enumerate_dynamic_profile_targets():
+        _delete_secret(target)
+    if any(_read_secret(target) is not None for target in (
+        WINCRED_TARGET_NAME,
+        WINCRED_MULTIMODAL_TARGET_NAME,
+        WINCRED_MIMO_SPEECH_TARGET_NAME,
+    )) or _enumerate_dynamic_profile_targets():
+        raise CredentialStoreError("Amadeus credential removal could not be verified.")
+
+
+def enumerate_amadeus_profile_targets() -> tuple[str, ...]:
+    """Return only validated code-owned dynamic target names, never secret values."""
+
+    return _enumerate_dynamic_profile_targets()
+
+
+def _enumerate_dynamic_profile_targets() -> tuple[str, ...]:
+    win32cred = _load_win32cred()
+    try:
+        credentials = win32cred.CredEnumerate(f"{WINCRED_PROFILE_TARGET_PREFIX}*", 0)
+    except Exception as exc:
+        if _winerror(exc) == _ERROR_NOT_FOUND:
+            return ()
+        raise CredentialStoreError(
+            "Windows Credential Manager could not enumerate Amadeus credentials."
+        ) from None
+    if not isinstance(credentials, (list, tuple)):
+        raise CredentialStoreError(
+            "Windows Credential Manager returned invalid Amadeus credential metadata."
+        )
+    targets: list[str] = []
+    for credential in credentials:
+        target = credential.get("TargetName") if isinstance(credential, dict) else None
+        if (
+            not isinstance(target, str)
+            or not target.startswith(WINCRED_PROFILE_TARGET_PREFIX)
+            or len(target) > 512
+            or "\x00" in target
+        ):
+            raise CredentialStoreError(
+                "Windows Credential Manager returned an unsafe Amadeus credential target."
+            )
+        try:
+            targets.append(validate_owned_profile_target(target))
+        except ValueError:
+            raise CredentialStoreError(
+                "Windows Credential Manager returned an unsafe Amadeus credential target."
+            ) from None
+    return tuple(dict.fromkeys(targets))
 
 
 def run_wincred_acceptance_probe(probe_id: str) -> bool:
@@ -216,7 +343,11 @@ def _validate_secret(secret: object) -> str:
         raise InvalidCredentialError("Credential is empty or malformed.")
     if secret.lower().startswith("tp-"):
         raise InvalidCredentialError("MiMo Token Plan credentials are not supported.")
-    if len(secret.encode("utf-16-le")) > _MAX_CREDENTIAL_BLOB_BYTES:
+    try:
+        encoded = secret.encode("utf-16-le")
+    except UnicodeEncodeError:
+        raise InvalidCredentialError("Credential is empty or malformed.") from None
+    if len(encoded) > _MAX_CREDENTIAL_BLOB_BYTES:
         raise InvalidCredentialError("Credential is too long for Windows Credential Manager.")
     return secret
 

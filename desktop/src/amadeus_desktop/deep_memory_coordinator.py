@@ -656,6 +656,7 @@ def _request(
             temperature=0.1,
             max_output_tokens=max_output_tokens,
         ),
+        provider_role="memory",
     )
 
 

@@ -87,7 +87,7 @@ def test_unversioned_settings_migrate_and_persist(tmp_path: Path) -> None:
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
 
-def test_schema_v8_to_v9_enables_deep_memory_without_changing_total_switch(
+def test_schema_v8_migrates_through_v10_and_enables_deep_memory(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "settings.json"
@@ -98,10 +98,16 @@ def test_schema_v8_to_v9_enables_deep_memory_without_changing_total_switch(
 
     loaded = SettingsRepository(path).load()
 
-    assert loaded["schema_version"] == 9
+    assert loaded["schema_version"] == CURRENT_SCHEMA_VERSION
     assert loaded["memory"] == {
         "enabled": False,
         "deep_memory_enabled": True,
+    }
+    assert set(loaded["model_providers"]["assignments"]) == {
+        "conversation",
+        "summary",
+        "memory",
+        "vision",
     }
     assert json.loads(path.read_text(encoding="utf-8")) == loaded
 
@@ -269,7 +275,7 @@ def test_enabled_voice_rejects_incompatible_reused_provider_credential() -> None
     document["voice"]["enabled"] = True
     document["voice"]["credential_source"] = PROVIDER_CREDENTIAL_REF
 
-    with pytest.raises(InvalidSettingsError, match="Voice cannot reuse"):
+    with pytest.raises(InvalidSettingsError, match="credential_source"):
         validate_settings_document(document)
 
 
@@ -490,3 +496,108 @@ def test_provider_config_convenience_methods_round_trip(tmp_path: Path) -> None:
 
     assert saved["provider"] == config.to_mapping()
     assert repository.load_provider_config() == config
+
+
+def test_schema_v9_to_v10_migrates_four_roles_and_keeps_legacy_credential_slots(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy.pop("model_providers")
+    legacy["schema_version"] = 9
+    legacy["provider_enabled"] = True
+    legacy["voice"]["credential_source"] = PROVIDER_CREDENTIAL_REF
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["schema_version"] == 10
+    assignments = loaded["model_providers"]["assignments"]
+    assert assignments["conversation"] == "legacy-chat"
+    assert assignments["summary"] == "legacy-chat"
+    assert assignments["memory"] == "legacy-chat"
+    assert loaded["model_providers"]["profiles"][0]["credential_slot"] == "legacy_chat"
+    assert loaded["voice"]["credential_source"] == "independent"
+
+
+def test_schema_v9_mimo_voice_reuse_maps_to_the_migrated_profile_id(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy.pop("model_providers")
+    legacy["schema_version"] = 9
+    legacy["provider"] = ProviderConfig.for_preset(ProviderPreset.MIMO_PAYG).to_mapping()
+    legacy["voice"]["credential_source"] = PROVIDER_CREDENTIAL_REF
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["voice"]["credential_source"] == "profile:legacy-chat"
+
+
+def test_v9_voice_reuse_keeps_the_profile_id_but_disables_voice_if_profile_is_dormant(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy.pop("model_providers")
+    legacy["schema_version"] = 9
+    legacy["provider_enabled"] = False
+    legacy["provider"] = ProviderConfig.for_preset(ProviderPreset.MIMO_PAYG).to_mapping()
+    legacy["voice"]["enabled"] = True
+    legacy["voice"]["credential_source"] = PROVIDER_CREDENTIAL_REF
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    loaded = SettingsRepository(path).load()
+
+    assert loaded["voice"]["credential_source"] == "profile:legacy-chat"
+    assert loaded["voice"]["enabled"] is False
+
+
+def test_disabled_mimo_profile_may_remain_a_dormant_voice_source_but_cannot_run_voice(
+    tmp_path: Path,
+) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    profile = document["model_providers"]["profiles"][0]
+    profile.update(
+        {
+            "catalog_id": "mimo_payg",
+            "protocol": "openai_chat_completions",
+            "base_url": "https://api.xiaomimimo.com/v1",
+            "auth": "api_key",
+            "enabled": False,
+        }
+    )
+    document["voice"]["credential_source"] = f"profile:{profile['profile_id']}"
+
+    SettingsRepository(tmp_path / "settings.json").save(document)
+
+    document["voice"]["enabled"] = True
+    with pytest.raises(InvalidSettingsError, match="Voice cannot reuse"):
+        validate_settings_document(document)
+
+
+def test_backup_style_v9_migration_does_not_trust_legacy_provider_test_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    legacy = deepcopy(DEFAULT_SETTINGS)
+    legacy.pop("model_providers")
+    legacy["schema_version"] = 9
+    legacy["provider_enabled"] = True
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    loaded = SettingsRepository(path, trust_legacy_provider_tests=False).load()
+
+    profile = loaded["model_providers"]["profiles"][0]
+    assert profile["enabled"] is True
+    assert set(profile["test_fingerprints"].values()) == {""}
+
+
+def test_settings_document_never_accepts_secret_material_inside_dynamic_profiles(
+    tmp_path: Path,
+) -> None:
+    document = deepcopy(DEFAULT_SETTINGS)
+    document["model_providers"]["profiles"][0]["api_key"] = "invalid-fake-key"
+
+    with pytest.raises(InvalidSettingsError):
+        SettingsRepository(tmp_path / "settings.json").save(document)

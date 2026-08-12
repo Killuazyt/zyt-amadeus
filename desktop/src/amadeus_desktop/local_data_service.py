@@ -400,6 +400,18 @@ class LocalDataService(QObject):
         self._multimodal_provider_name = provider_name
         self._multimodal_model_name = model_name
 
+    def bind_turn_provider_metadata(
+        self,
+        turn_id: str,
+        provider_name: str | None,
+        model_name: str | None,
+    ) -> None:
+        """Bind metadata captured at provider-request start to one durable turn."""
+
+        identifier = str(turn_id)
+        if identifier in self._turn_provider_metadata:
+            self._turn_provider_metadata[identifier] = (provider_name, model_name)
+
     def pop_finalized_provider_metadata(
         self,
         turn_id: str,

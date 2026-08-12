@@ -223,6 +223,7 @@ class ChatRequest:
     options: GenerationOptions = field(default_factory=GenerationOptions)
     attachments: tuple[AttachmentSnapshot, ...] = ()
     provider_route: ProviderRoute = ProviderRoute.TEXT
+    provider_role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

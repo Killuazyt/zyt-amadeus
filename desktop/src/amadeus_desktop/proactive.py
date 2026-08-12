@@ -155,6 +155,7 @@ def build_proactive_request(now: datetime, trigger: ProactiveTrigger) -> ChatReq
             temperature=0.7,
             max_output_tokens=80,
         ),
+        provider_role="conversation",
     )
 
 
@@ -201,6 +202,7 @@ def build_proactive_visual_request(
             max_output_tokens=80,
         ),
         provider_route=ProviderRoute.MULTIMODAL,
+        provider_role="vision",
     )
 
 

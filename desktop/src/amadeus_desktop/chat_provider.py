@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import codecs
 import contextlib
 import json
@@ -28,7 +30,15 @@ from amadeus_desktop.provider_config import (
     AuthMode,
     ProviderConfig,
     ProviderPreset,
+    TokenLimitField,
 )
+from amadeus_desktop.provider_catalog import (
+    CachePolicy,
+    ProviderAuth,
+    ProviderProtocol,
+    ReasoningPolicy,
+)
+from amadeus_desktop.provider_profiles import ProviderRequestSnapshot
 
 
 class ProviderErrorCode(StrEnum):
@@ -291,14 +301,9 @@ def _serialize_prompt_content(content: PromptContent) -> object:
             serialized.append({"type": "text", "text": part.text})
             continue
         if isinstance(part, ImagePart):
-            if (
-                not part.data_url.startswith(
-                    ("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,")
-                )
-                or len(part.data_url) > 36 * 1024 * 1024
-                or part.detail not in {"auto", "low", "high"}
-            ):
+            if part.detail not in {"auto", "low", "high"}:
                 raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+            _parse_image_data_url(part.data_url)
             serialized.append(
                 {
                     "type": "image_url",
@@ -317,13 +322,17 @@ class OpenAICompatibleChatProvider:
 
     def __init__(
         self,
-        config: ProviderConfig,
+        config: ProviderConfig | ProviderRequestSnapshot,
         credential_store: CredentialStore,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         client_factory: ClientFactory = httpx.AsyncClient,
     ) -> None:
-        self.config = config.validated()
+        self.config = config.validated() if isinstance(config, ProviderConfig) else config
+        if isinstance(self.config, ProviderRequestSnapshot) and (
+            self.config.protocol is not ProviderProtocol.OPENAI_CHAT_COMPLETIONS
+        ):
+            raise ValueError("OpenAI-compatible provider received another protocol")
         self._credential_store = credential_store
         self._transport = transport
         self._client_factory = client_factory
@@ -343,6 +352,7 @@ class OpenAICompatibleChatProvider:
             cancellation.raise_if_cancelled()
             secret = self._read_secret()
             headers = self._auth_headers(secret)
+            headers.update(self._cache_headers())
             payload = self._build_payload(request)
             timeout = httpx.Timeout(
                 self.config.request_timeout_seconds,
@@ -372,7 +382,23 @@ class OpenAICompatibleChatProvider:
                     )
                     await self._raise_for_status(response)
                     if self.config.stream_enabled:
-                        async for chunk in self._parse_stream(response):
+                        async for chunk in _bounded_stream_chunks(
+                            self._parse_stream(response),
+                            first_timeout_seconds=float(
+                                getattr(
+                                    self.config,
+                                    "first_chunk_timeout_seconds",
+                                    self.config.request_timeout_seconds,
+                                )
+                            ),
+                            idle_timeout_seconds=float(
+                                getattr(
+                                    self.config,
+                                    "idle_timeout_seconds",
+                                    self.config.request_timeout_seconds,
+                                )
+                            ),
+                        ):
                             cancellation.raise_if_cancelled()
                             yield chunk
                     else:
@@ -401,6 +427,8 @@ class OpenAICompatibleChatProvider:
             cancellation.unbind_current_task()
 
     def _read_secret(self) -> str:
+        if getattr(self.config, "auth", None) is ProviderAuth.NONE:
+            return ""
         try:
             secret = self._credential_store.read_secret()
         except Exception as exc:
@@ -419,13 +447,29 @@ class OpenAICompatibleChatProvider:
             # implicit content decoder inflate an attacker-controlled body first.
             "Accept-Encoding": "identity",
         }
-        if self.config.auth_mode is AuthMode.BEARER:
+        auth_mode = getattr(self.config, "auth", None)
+        if auth_mode is None:
+            auth_mode = (
+                ProviderAuth.BEARER
+                if self.config.auth_mode is AuthMode.BEARER
+                else ProviderAuth.API_KEY
+            )
+        if auth_mode is ProviderAuth.BEARER:
             headers["Authorization"] = f"Bearer {secret}"
-        elif self.config.auth_mode is AuthMode.API_KEY:
+        elif auth_mode is ProviderAuth.API_KEY:
             headers["api-key"] = secret
+        elif auth_mode is ProviderAuth.NONE:
+            pass
         else:
             raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
         return headers
+
+    def _cache_headers(self) -> dict[str, str]:
+        if not bool(getattr(self.config, "cache_enabled", False)):
+            return {}
+        if getattr(self.config, "cache_policy", None) is CachePolicy.DASHSCOPE_SESSION:
+            return {"x-dashscope-session-cache": "enable"}
+        return {}
 
     def _build_payload(self, request: ChatRequest) -> dict[str, object]:
         temperature = (
@@ -447,13 +491,22 @@ class OpenAICompatibleChatProvider:
             "temperature": temperature,
             "top_p": self.config.top_p,
             "stream": self.config.stream_enabled,
-            self.config.token_limit_field.value: max_output_tokens,
         }
-        if self.config.preset in {
+        token_field = getattr(self.config, "token_limit_field", None)
+        if isinstance(token_field, TokenLimitField):
+            token_field = token_field.value
+        if token_field is None:
+            token_field = "max_completion_tokens"
+        if token_field not in {"max_tokens", "max_completion_tokens"}:
+            raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+        payload[token_field] = max_output_tokens
+        policy = getattr(self.config, "reasoning_policy", None)
+        if policy is None and self.config.preset in {
             ProviderPreset.DEEPSEEK_PAYG,
             ProviderPreset.MIMO_PAYG,
         }:
-            payload["thinking"] = {"type": "disabled"}
+            policy = ReasoningPolicy.THINKING_TYPE_DISABLED
+        payload.update(_reasoning_payload(policy))
         return payload
 
     @staticmethod
@@ -493,6 +546,9 @@ class OpenAICompatibleChatProvider:
             raise ChatProviderError(ProviderErrorCode.PROTOCOL)
 
     async def _parse_completion(self, response: httpx.Response) -> tuple[str, ...]:
+        content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
         body = await _read_response_limited(response)
         try:
             payload = json.loads(body)
@@ -504,11 +560,284 @@ class OpenAICompatibleChatProvider:
         return content
 
 
+class AnthropicMessagesChatProvider(OpenAICompatibleChatProvider):
+    """Strict Anthropic Messages adapter implemented directly on ``httpx``."""
+
+    def __init__(
+        self,
+        config: ProviderRequestSnapshot,
+        credential_store: CredentialStore,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        client_factory: ClientFactory = httpx.AsyncClient,
+    ) -> None:
+        if config.protocol is not ProviderProtocol.ANTHROPIC_MESSAGES:
+            raise ValueError("Anthropic provider requires anthropic_messages protocol")
+        self.config = config
+        self._credential_store = credential_store
+        self._transport = transport
+        self._client_factory = client_factory
+        self._visible_output_limit = min(
+            _MAX_VISIBLE_OUTPUT_CHARS,
+            max(4_096, config.max_output_tokens * 16),
+        )
+
+    def _auth_headers(self, secret: str) -> dict[str, str]:
+        headers = {
+            "Accept": "text/event-stream, application/json",
+            "Accept-Encoding": "identity",
+            "anthropic-version": "2023-06-01",
+        }
+        if self.config.auth is ProviderAuth.ANTHROPIC_X_API_KEY:
+            headers["x-api-key"] = secret
+        elif self.config.auth is ProviderAuth.BEARER:
+            headers["Authorization"] = f"Bearer {secret}"
+        elif self.config.auth is ProviderAuth.NONE:
+            pass
+        else:
+            raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+        return headers
+
+    async def stream(
+        self,
+        request: ChatRequest,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[str]:
+        cancellation.bind_current_task()
+        response: httpx.Response | None = None
+        try:
+            cancellation.raise_if_cancelled()
+            payload = self._build_anthropic_payload(request)
+            timeout = httpx.Timeout(
+                self.config.request_timeout_seconds,
+                connect=self.config.connect_timeout_seconds,
+            )
+            kwargs: dict[str, object] = {
+                "timeout": timeout,
+                "follow_redirects": False,
+                "trust_env": False,
+            }
+            if self._transport is not None:
+                kwargs["transport"] = self._transport
+            async with asyncio.timeout(self.config.request_timeout_seconds):
+                async with self._client_factory(**kwargs) as client:
+                    network_request = client.build_request(
+                        "POST",
+                        f"{self.config.base_url.rstrip('/')}/messages",
+                        headers=self._auth_headers(self._read_secret()),
+                        json=payload,
+                    )
+                    response = await client.send(network_request, stream=True)
+                    await self._raise_for_status(response)
+                    if self.config.stream_enabled:
+                        async for chunk in _bounded_stream_chunks(
+                            self._parse_anthropic_stream(response),
+                            first_timeout_seconds=self.config.first_chunk_timeout_seconds,
+                            idle_timeout_seconds=self.config.idle_timeout_seconds,
+                        ):
+                            cancellation.raise_if_cancelled()
+                            yield chunk
+                    else:
+                        for chunk in await self._parse_anthropic_completion(response):
+                            cancellation.raise_if_cancelled()
+                            yield chunk
+        except asyncio.CancelledError as exc:
+            raise CancellationRequested from exc
+        except TimeoutError as exc:
+            raise ChatProviderError(ProviderErrorCode.TIMEOUT) from exc
+        except httpx.TimeoutException as exc:
+            raise ChatProviderError(ProviderErrorCode.TIMEOUT) from exc
+        except httpx.RemoteProtocolError as exc:
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL) from exc
+        except (httpx.NetworkError, httpx.ProxyError) as exc:
+            raise ChatProviderError(ProviderErrorCode.NETWORK) from exc
+        except ChatProviderError:
+            raise
+        except Exception as exc:
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL) from exc
+        finally:
+            if response is not None:
+                with contextlib.suppress(Exception):
+                    await response.aclose()
+            cancellation.unbind_current_task()
+
+    def _build_anthropic_payload(self, request: ChatRequest) -> dict[str, object]:
+        systems: list[str] = []
+        messages: list[dict[str, object]] = []
+        for message in request.messages:
+            if message.role is PromptRole.SYSTEM:
+                systems.extend(_text_only_parts(message.content))
+                continue
+            messages.append(
+                {
+                    "role": message.role.value,
+                    "content": _serialize_anthropic_content(message.content),
+                }
+            )
+        if not messages:
+            raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+        max_output = (
+            self.config.max_output_tokens
+            if request.options.max_output_tokens is None
+            else min(request.options.max_output_tokens, self.config.max_output_tokens)
+        )
+        system_text = "\n\n".join(systems)
+        payload: dict[str, object] = {
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": max_output,
+            "temperature": (
+                self.config.temperature
+                if request.options.temperature is None
+                else request.options.temperature
+            ),
+            "top_p": self.config.top_p,
+            "stream": self.config.stream_enabled,
+        }
+        if system_text:
+            payload["system"] = (
+                [
+                    {
+                        "type": "text",
+                        "text": system_text,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+                if self.config.cache_enabled
+                and self.config.cache_policy is CachePolicy.ANTHROPIC_EPHEMERAL
+                else system_text
+            )
+        return payload
+
+    async def _parse_anthropic_stream(self, response: httpx.Response) -> AsyncIterator[str]:
+        content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "text/event-stream":
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+        started = False
+        stopped = False
+        visible = 0
+        text_blocks: set[int] = set()
+        ignored_thinking_blocks: set[int] = set()
+        closed_blocks: set[int] = set()
+        async for data in _iter_sse_data(response.aiter_bytes()):
+            if not data.strip():
+                continue
+            try:
+                payload = json.loads(data)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL) from exc
+            if not isinstance(payload, dict):
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            event_type = payload.get("type")
+            if event_type == "message_stop":
+                if not started or text_blocks or ignored_thinking_blocks:
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                stopped = True
+                break
+            if event_type == "error":
+                raise ChatProviderError(_payload_error_code(payload.get("error")))
+            if event_type == "message_start":
+                if started or not isinstance(payload.get("message"), dict):
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                started = True
+                continue
+            if not started and event_type != "ping":
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            if event_type == "message_delta":
+                delta = payload.get("delta")
+                if not isinstance(delta, dict):
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                _raise_for_anthropic_stop_reason(delta.get("stop_reason"))
+                continue
+            if event_type == "ping":
+                continue
+            if event_type == "content_block_start":
+                block = payload.get("content_block")
+                index = payload.get("index")
+                if not isinstance(block, dict) or not _is_event_index(index):
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                if index in text_blocks or index in ignored_thinking_blocks or index in closed_blocks:
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                block_type = block.get("type")
+                if block_type in {"thinking", "redacted_thinking"}:
+                    ignored_thinking_blocks.add(index)
+                    continue
+                if block_type != "text":
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                text_blocks.add(index)
+                continue
+            if event_type == "content_block_stop":
+                index = payload.get("index")
+                if not _is_event_index(index):
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                if index in text_blocks:
+                    text_blocks.remove(index)
+                elif index in ignored_thinking_blocks:
+                    ignored_thinking_blocks.remove(index)
+                else:
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                closed_blocks.add(index)
+                continue
+            if event_type != "content_block_delta":
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            index = payload.get("index")
+            delta = payload.get("delta")
+            if not _is_event_index(index) or not isinstance(delta, dict):
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            if index in ignored_thinking_blocks:
+                if delta.get("type") not in {"thinking_delta", "signature_delta"}:
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                continue
+            if index not in text_blocks:
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            if delta.get("type") != "text_delta":
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            text = delta.get("text")
+            if not isinstance(text, str):
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            visible += len(text)
+            if visible > self._visible_output_limit:
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            if text:
+                yield text
+        if not stopped:
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+
+    async def _parse_anthropic_completion(self, response: httpx.Response) -> tuple[str, ...]:
+        content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+        body = await _read_response_limited(response)
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeError, ValueError) as exc:
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL) from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+        _raise_for_anthropic_stop_reason(payload.get("stop_reason"))
+        chunks: list[str] = []
+        for block in payload["content"]:
+            if not isinstance(block, dict):
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            if block.get("type") in {"thinking", "redacted_thinking"}:
+                continue
+            if block.get("type") != "text":
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+            if text:
+                chunks.append(text)
+        if sum(len(chunk) for chunk in chunks) > self._visible_output_limit:
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+        return tuple(chunks)
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectionTestResult:
     """Privacy-safe evidence that a candidate provider completed a small request."""
 
-    preset: ProviderPreset
+    preset: ProviderPreset | str
     model: str
     elapsed_ms: int
 
@@ -579,6 +908,213 @@ class ProviderConnectionTester:
             elapsed_ms=max(0, round((time.perf_counter() - started) * 1000)),
         )
 
+    async def test_profile(
+        self,
+        snapshot: ProviderRequestSnapshot,
+        secret: str,
+        cancellation: CancellationToken,
+        *,
+        visual_data_url: str | None = None,
+    ) -> ConnectionTestResult:
+        """Test one exact role/model snapshot with only synthetic app data."""
+
+        provider = build_profile_provider(
+            replace(snapshot, max_output_tokens=min(snapshot.max_output_tokens, 32)),
+            _CandidateCredentialStore(secret),
+            transport=self._transport,
+            client_factory=self._client_factory,
+        )
+        user_content: PromptContent = "请回复：连接正常。"
+        if snapshot.role.value == "vision":
+            if not visual_data_url:
+                raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+            user_content = (
+                TextPart("这是应用生成的测试图。请只回复：视觉连接正常。"),
+                ImagePart("connection-test-image", visual_data_url, "low"),
+            )
+        request = ChatRequest(
+            request_id="profile-connection-test",
+            turn_id="profile-connection-test",
+            attempt=1,
+            messages=(
+                PromptMessage(
+                    PromptRole.SYSTEM,
+                    "这是不含用户聊天、附件或记忆的 Amadeus 最小连接测试。",
+                ),
+                PromptMessage(PromptRole.USER, user_content),
+            ),
+            provider_role=snapshot.role.value,
+        )
+        started = time.perf_counter()
+        received = False
+        async for chunk in provider.stream(request, cancellation):
+            received = received or bool(chunk)
+        if not received:
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+        return ConnectionTestResult(
+            preset=snapshot.catalog_id,
+            model=snapshot.model,
+            elapsed_ms=max(0, round((time.perf_counter() - started) * 1000)),
+        )
+
+
+def build_profile_provider(
+    snapshot: ProviderRequestSnapshot,
+    credential_store: CredentialStore,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    client_factory: ClientFactory = httpx.AsyncClient,
+) -> ChatProvider:
+    """Construct exactly the protocol captured in an immutable request snapshot."""
+
+    if snapshot.protocol is ProviderProtocol.OPENAI_CHAT_COMPLETIONS:
+        provider: ChatProvider = OpenAICompatibleChatProvider(
+            snapshot,
+            credential_store,
+            transport=transport,
+            client_factory=client_factory,
+        )
+    elif snapshot.protocol is ProviderProtocol.ANTHROPIC_MESSAGES:
+        provider = AnthropicMessagesChatProvider(
+            snapshot,
+            credential_store,
+            transport=transport,
+            client_factory=client_factory,
+        )
+    else:
+        raise ValueError("Unsupported provider protocol")
+    if snapshot.filter_think_tags:
+        provider = ThinkingSafeProvider(provider)
+    return provider
+
+
+class ThinkingSafeProvider:
+    """Remove a leading provider-leaked ``<think>`` block across stream chunks."""
+
+    def __init__(self, provider: ChatProvider) -> None:
+        self._provider = provider
+
+    async def stream(
+        self,
+        request: ChatRequest,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[str]:
+        filtering: bool | None = None
+        buffer = ""
+        async for chunk in self._provider.stream(request, cancellation):
+            if filtering is False:
+                yield chunk
+                continue
+            buffer += chunk
+            stripped = buffer.lstrip("\ufeff\r\n \t")
+            if filtering is None:
+                if len(stripped) < len("<think>") and "<think>".startswith(stripped.casefold()):
+                    continue
+                if stripped.casefold().startswith("<think>"):
+                    filtering = True
+                else:
+                    filtering = False
+                    if buffer:
+                        yield buffer
+                    buffer = ""
+                    continue
+            closing = buffer.casefold().find("</think>")
+            if closing < 0:
+                if len(buffer) > _MAX_SSE_EVENT_CHARS:
+                    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+                continue
+            buffer = buffer[closing + len("</think>") :].lstrip("\r\n")
+            filtering = False
+            if buffer:
+                yield buffer
+            buffer = ""
+        if filtering is True or (filtering is None and buffer):
+            raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+        if buffer:
+            yield buffer
+
+
+def _reasoning_payload(policy: ReasoningPolicy | None) -> dict[str, object]:
+    """Return only reviewed provider-specific non-reasoning modifiers.
+
+    This is a closed allowlist. No Profile field can inject an arbitrary
+    request header, ``extra_body`` value, tool or search parameter.
+    """
+
+    if policy is ReasoningPolicy.ENABLE_THINKING_FALSE:
+        return {"enable_thinking": False}
+    if policy is ReasoningPolicy.THINKING_TYPE_DISABLED:
+        return {"thinking": {"type": "disabled"}}
+    if policy is ReasoningPolicy.GEMINI_DISABLED:
+        # Gemini's OpenAI-compatibility wrappers have used SDK-only
+        # ``extra_body`` shims across versions. Raw HTTP requests never emit
+        # that field; absence is the only stable, reviewed no-opt-in contract.
+        return {}
+    if policy is ReasoningPolicy.OPENROUTER_NONE:
+        return {"reasoning": {"effort": "none"}}
+    if policy is ReasoningPolicy.MINIMAX_SPLIT:
+        return {"reasoning_split": True}
+    return {}
+
+
+def _text_only_parts(content: PromptContent) -> tuple[str, ...]:
+    if isinstance(content, str):
+        return (content,) if content else ()
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, TextPart) and part.text:
+            parts.append(part.text)
+        elif isinstance(part, ImagePart):
+            raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    return tuple(parts)
+
+
+def _serialize_anthropic_content(content: PromptContent) -> object:
+    if isinstance(content, str):
+        return content
+    blocks: list[dict[str, object]] = []
+    for part in content:
+        if isinstance(part, TextPart):
+            if not part.text:
+                raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+            blocks.append({"type": "text", "text": part.text})
+            continue
+        if isinstance(part, ImagePart):
+            media_type, data = _parse_image_data_url(part.data_url)
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                }
+            )
+            continue
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    if not blocks:
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    return blocks
+
+
+def _parse_image_data_url(value: object) -> tuple[str, str]:
+    if not isinstance(value, str) or len(value) > 36 * 1024 * 1024:
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    prefix, separator, data = value.partition(",")
+    if not separator or not data or not prefix.startswith("data:") or not prefix.endswith(";base64"):
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    media_type = prefix[5:-7]
+    if media_type not in {"image/png", "image/jpeg", "image/webp"}:
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER) from None
+    if not decoded or len(decoded) > 25 * 1024 * 1024:
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    return media_type, data
+
 
 async def _iter_sse_data(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[str]:
     """Decode SSE data events across arbitrary UTF-8 and line chunk boundaries."""
@@ -638,6 +1174,26 @@ async def _iter_sse_data(byte_chunks: AsyncIterator[bytes]) -> AsyncIterator[str
         yield "\n".join(data_lines)
 
 
+async def _bounded_stream_chunks(
+    chunks: AsyncIterator[str],
+    *,
+    first_timeout_seconds: float,
+    idle_timeout_seconds: float,
+) -> AsyncIterator[str]:
+    """Apply profile-captured first-chunk and stream-idle deadlines."""
+
+    iterator = chunks.__aiter__()
+    first = True
+    while True:
+        timeout_seconds = first_timeout_seconds if first else idle_timeout_seconds
+        try:
+            value = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_seconds)
+        except StopAsyncIteration:
+            return
+        first = False
+        yield value
+
+
 async def _read_response_limited(response: httpx.Response) -> bytes:
     chunks: list[bytes] = []
     total_bytes = 0
@@ -672,6 +1228,25 @@ def _content_from_payload(payload: object, *, streaming: bool) -> tuple[str, ...
         raise ChatProviderError(ProviderErrorCode.PROTOCOL)
     if container.get("tool_calls") or container.get("function_call"):
         raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+    if any(
+        key in container
+        for key in (
+            "reasoning",
+            "reasoning_content",
+            "thinking",
+            "thought",
+            "analysis",
+        )
+    ):
+        # Amadeus never surfaces independent provider thinking fields. A
+        # registered leading <think> leak in visible content is handled by the
+        # separate bounded stream filter.
+        container = {
+            key: value
+            for key, value in container.items()
+            if key
+            not in {"reasoning", "reasoning_content", "thinking", "thought", "analysis"}
+        }
     if container.get("refusal"):
         raise ChatProviderError(ProviderErrorCode.CONTENT_FILTER)
     _raise_for_finish_reason(finish_reason)
@@ -694,6 +1269,22 @@ def _raise_for_finish_reason(finish_reason: object) -> None:
     if finish_reason in {"tool_calls", "function_call"}:
         raise ChatProviderError(ProviderErrorCode.PROTOCOL)
     raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+
+
+def _raise_for_anthropic_stop_reason(stop_reason: object) -> None:
+    if stop_reason in {None, "end_turn", "stop_sequence"}:
+        return
+    if stop_reason == "max_tokens":
+        raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
+    if stop_reason in {"tool_use", "pause_turn"}:
+        raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+    if stop_reason == "refusal":
+        raise ChatProviderError(ProviderErrorCode.CONTENT_FILTER)
+    raise ChatProviderError(ProviderErrorCode.PROTOCOL)
+
+
+def _is_event_index(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _safe_error_details(body: bytes) -> object:

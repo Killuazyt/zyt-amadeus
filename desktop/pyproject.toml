@@ -61,6 +61,7 @@ amadeus_desktop = [
     "resources/builtin_pet/*.txt",
     "resources/licenses/*.json",
     "resources/licenses/*.txt",
+    "resources/provider_catalog/*.json",
 ]
 
 [tool.pytest.ini_options]

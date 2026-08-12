@@ -19,14 +19,13 @@ def make_window(qtbot) -> SettingsWindow:
     return window
 
 
-def test_settings_shell_has_p7e_navigation_and_embeds_model_dialog(qtbot) -> None:
+def test_settings_shell_has_p7g_navigation_and_embeds_provider_center(qtbot) -> None:
     window = make_window(qtbot)
 
     assert window.page_names == (
         "general",
         "pet",
         "model",
-        "multimodal",
         "voice",
         "visual",
         "persona",
@@ -35,11 +34,10 @@ def test_settings_shell_has_p7e_navigation_and_embeds_model_dialog(qtbot) -> Non
         "proactive",
         "diagnostics",
     )
-    assert [window.navigation.item(index).text() for index in range(11)] == [
+    assert [window.navigation.item(index).text() for index in range(10)] == [
         "常规",
         "桌宠",
-        "对话模型",
-        "图片与视觉模型",
+        "模型提供商",
         "语音",
         "屏幕与相机",
         "角色",
@@ -48,13 +46,12 @@ def test_settings_shell_has_p7e_navigation_and_embeds_model_dialog(qtbot) -> Non
         "主动互动",
         "诊断",
     ]
-    assert window.stack.count() == 11
+    assert window.stack.count() == 10
     assert window.stack.widget(2) is window.model_page
-    assert window.stack.widget(3) is window.multimodal_page
-    assert window.stack.widget(4) is window.voice_page
-    assert window.stack.widget(5) is window.visual_page
-    assert window.stack.widget(7) is window.history_page
-    assert window.stack.widget(8) is window.memory_page
+    assert window.stack.widget(3) is window.voice_page
+    assert window.stack.widget(4) is window.visual_page
+    assert window.stack.widget(6) is window.history_page
+    assert window.stack.widget(7) is window.memory_page
     assert window.model_page.windowType() == Qt.WindowType.Widget
     assert window.model_page.close_button.isHidden()
     assert not window.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)

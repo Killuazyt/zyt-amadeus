@@ -27,6 +27,7 @@ REQUIRED_FILES = (
     "resources/licenses/KURISU-ASSET-NOTICE.txt",
     "resources/licenses/KURISU-ICON-NOTICE.txt",
     "resources/licenses/runtime-license-manifest.json",
+    "resources/provider_catalog/providers.json",
 )
 
 
@@ -166,6 +167,39 @@ def _verify_payloads(label: str, payloads: dict[str, bytes]) -> None:
         or "not independently verified" not in normalized_icon_notice
     ):
         raise ValueError(f"{label} Kurisu application icon notice is incomplete")
+
+    provider_catalog = json.loads(
+        payloads["resources/provider_catalog/providers.json"].decode("utf-8")
+    )
+    providers = provider_catalog.get("providers")
+    if provider_catalog.get("schema_version") != 1 or not isinstance(providers, list):
+        raise ValueError(f"{label} provider catalog is invalid")
+    provider_ids = {provider.get("id") for provider in providers if isinstance(provider, dict)}
+    required_provider_ids = {
+        "deepseek",
+        "mimo_payg",
+        "openai",
+        "qwen_cn",
+        "qwen_intl",
+        "gemini",
+        "glm",
+        "kimi_payg",
+        "doubao_ark",
+        "minimax_cn",
+        "minimax_intl",
+        "siliconflow",
+        "stepfun",
+        "grok",
+        "openrouter",
+        "anthropic",
+        "custom_openai",
+        "custom_anthropic",
+        "ollama",
+        "lm_studio",
+        "vllm",
+    }
+    if provider_ids != required_provider_ids:
+        raise ValueError(f"{label} provider catalog range is invalid")
 
 
 def main() -> int:

@@ -22,8 +22,14 @@ from amadeus_desktop.provider_config import (
     ProviderConfigError,
     ProviderPreset,
 )
+from amadeus_desktop.provider_catalog import load_provider_catalog
+from amadeus_desktop.provider_profiles import (
+    ProviderProfileError,
+    ProviderSettings,
+    migrate_legacy_provider_settings,
+)
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -44,6 +50,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "provider_enabled": False,
     "provider": ProviderConfig.default().to_mapping(),
+    "model_providers": migrate_legacy_provider_settings(
+        {
+            "provider_enabled": False,
+            "provider": ProviderConfig.default().to_mapping(),
+            "multimodal": {
+                "enabled": False,
+                "reuse_mimo_credential": False,
+                "provider": ProviderConfig.for_preset(
+                    ProviderPreset.MIMO_PAYG,
+                    credential_ref=MULTIMODAL_CREDENTIAL_REF,
+                ).to_mapping(),
+            },
+        }
+    ),
     "multimodal": {
         "enabled": False,
         "reuse_mimo_credential": False,
@@ -100,6 +120,7 @@ _MEMORY_FIELDS = frozenset(DEFAULT_SETTINGS["memory"])
 _PERSONA_FIELDS = frozenset(DEFAULT_SETTINGS["persona"])
 _PROACTIVE_FIELDS = frozenset(DEFAULT_SETTINGS["proactive"])
 _MULTIMODAL_FIELDS = frozenset(DEFAULT_SETTINGS["multimodal"])
+_MODEL_PROVIDER_FIELDS = frozenset(DEFAULT_SETTINGS["model_providers"])
 _VOICE_FIELDS = frozenset(DEFAULT_SETTINGS["voice"])
 _VISUAL_FIELDS = frozenset(DEFAULT_SETTINGS["visual"])
 _PROACTIVE_MODES = frozenset({"restrained", "startup_only", "off"})
@@ -113,6 +134,11 @@ _FORBIDDEN_SETTING_KEYS = {
     "secret",
     "token",
 }
+_FORBIDDEN_SETTING_VALUE_MARKERS = (
+    "-----begin private key-----",
+    "sk-ant-",
+    "sk-or-v1-",
+)
 _FORBIDDEN_SETTING_SUFFIXES = (
     "_api_key",
     "_authorization",
@@ -229,6 +255,47 @@ def _migrate_v8_to_v9(source: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v9_to_v10(
+    source: dict[str, Any],
+    *,
+    trust_local_migration: bool = True,
+) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 10
+    migrated["model_providers"] = migrate_legacy_provider_settings(
+        migrated,
+        trust_local_migration=trust_local_migration,
+    )
+    voice = migrated.get("voice")
+    if isinstance(voice, dict):
+        source_ref = voice.get("credential_source")
+        text_config = ProviderConfig.from_mapping(migrated["provider"])
+        multimodal_config = ProviderConfig.from_mapping(migrated["multimodal"]["provider"])
+        if source_ref == PROVIDER_CREDENTIAL_REF and _is_mimo_payg(text_config):
+            voice["credential_source"] = "profile:legacy-chat"
+        elif source_ref == MULTIMODAL_CREDENTIAL_REF and _is_mimo_payg(multimodal_config):
+            vision_assignment = migrated["model_providers"]["assignments"]["vision"]
+            voice["credential_source"] = (
+                f"profile:{vision_assignment}" if vision_assignment else "independent"
+            )
+        elif source_ref != "independent":
+            voice["credential_source"] = "independent"
+        mapped_source = str(voice.get("credential_source", ""))
+        if mapped_source.startswith("profile:") and voice.get("enabled") is True:
+            mapped_profile_id = mapped_source.removeprefix("profile:")
+            mapped_profile = next(
+                (
+                    profile
+                    for profile in migrated["model_providers"]["profiles"]
+                    if profile.get("profile_id") == mapped_profile_id
+                ),
+                None,
+            )
+            if not isinstance(mapped_profile, dict) or mapped_profile.get("enabled") is not True:
+                voice["enabled"] = False
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
@@ -239,14 +306,16 @@ _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     6: _migrate_v6_to_v7,
     7: _migrate_v7_to_v8,
     8: _migrate_v8_to_v9,
+    9: _migrate_v9_to_v10,
 }
 
 
 class SettingsRepository:
     """Load, migrate, validate, and atomically save JSON settings."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, trust_legacy_provider_tests: bool = True) -> None:
         self.path = path
+        self._trust_legacy_provider_tests = bool(trust_legacy_provider_tests)
 
     def load_or_create(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -279,7 +348,14 @@ class SettingsRepository:
             migration = _MIGRATIONS.get(version)
             if migration is None:
                 raise InvalidSettingsError(f"No migration exists for schema {version}.")
-            settings = migration(settings)
+            settings = (
+                _migrate_v9_to_v10(
+                    settings,
+                    trust_local_migration=self._trust_legacy_provider_tests,
+                )
+                if version == 9
+                else migration(settings)
+            )
             version = settings.get("schema_version")
             if not isinstance(version, int):
                 raise InvalidSettingsError("A migration produced an invalid schema version.")
@@ -367,12 +443,20 @@ class SettingsRepository:
         return ProviderConfig.from_mapping(self.load()["provider"])
 
     def save_provider_config(self, config: ProviderConfig) -> dict[str, Any]:
-        """Atomically replace only the active provider configuration."""
+        """Retain the v9 mirror without changing the P7G runtime Profile source."""
 
         settings = self.load_or_create()
         settings["provider"] = config.validated().to_mapping()
         self.save(settings)
         return settings
+
+    def load_model_provider_settings(self) -> ProviderSettings:
+        """Load the current P7G profiles without exposing credential material."""
+
+        return ProviderSettings.from_mapping(
+            self.load()["model_providers"],
+            load_provider_catalog(),
+        )
 
     @classmethod
     def _validate(cls, settings: Mapping[str, Any]) -> None:
@@ -430,6 +514,20 @@ class SettingsRepository:
         if not isinstance(settings.get("provider_enabled"), bool):
             raise InvalidSettingsError("provider_enabled must be a boolean.")
 
+        model_providers = settings.get("model_providers")
+        if not isinstance(model_providers, Mapping):
+            raise InvalidSettingsError("The model provider settings must be an object.")
+        cls._require_exact_fields(
+            model_providers,
+            _MODEL_PROVIDER_FIELDS,
+            "The model provider settings section",
+        )
+        catalog = load_provider_catalog()
+        try:
+            provider_settings = ProviderSettings.from_mapping(model_providers, catalog)
+        except ProviderProfileError as exc:
+            raise InvalidSettingsError("The model provider settings are invalid.") from exc
+
         multimodal = settings.get("multimodal")
         if not isinstance(multimodal, Mapping):
             raise InvalidSettingsError("The multimodal settings section must be an object.")
@@ -477,18 +575,28 @@ class SettingsRepository:
         }
         if any(voice.get(key) != value for key, value in required_voice_values.items()):
             raise InvalidSettingsError("The MiMo voice contract is invalid.")
-        if voice.get("credential_source") not in {
-            "independent",
-            PROVIDER_CREDENTIAL_REF,
-            MULTIMODAL_CREDENTIAL_REF,
-        }:
+        credential_source = voice.get("credential_source")
+        compatible_profile_sources = {
+            f"profile:{profile.profile_id}"
+            for profile in provider_settings.profiles
+            if profile.catalog_id == "mimo_payg"
+            and profile.base_url == "https://api.xiaomimimo.com/v1"
+            and profile.auth.value == "api_key"
+        }
+        enabled_profile_sources = {
+            f"profile:{profile.profile_id}"
+            for profile in provider_settings.profiles
+            if profile.enabled
+            and f"profile:{profile.profile_id}" in compatible_profile_sources
+        }
+        if credential_source not in {"independent", *compatible_profile_sources}:
             raise InvalidSettingsError("voice.credential_source is invalid.")
         if voice.get("enabled") is True:
-            source = voice.get("credential_source")
-            if source == PROVIDER_CREDENTIAL_REF and not _is_mimo_payg(provider_config):
-                raise InvalidSettingsError("Voice cannot reuse the text provider credential.")
-            if source == MULTIMODAL_CREDENTIAL_REF and not _is_mimo_payg(multimodal_provider):
-                raise InvalidSettingsError("Voice cannot reuse the multimodal credential.")
+            if (
+                credential_source != "independent"
+                and credential_source not in enabled_profile_sources
+            ):
+                raise InvalidSettingsError("Voice cannot reuse that provider credential.")
         for key in ("connect_timeout_seconds", "request_timeout_seconds"):
             value = voice.get(key)
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 300:
@@ -602,6 +710,10 @@ class SettingsRepository:
         elif isinstance(value, list):
             for nested in value:
                 cls._reject_sensitive_keys(nested)
+        elif isinstance(value, str):
+            lowered = value.casefold()
+            if any(marker in lowered for marker in _FORBIDDEN_SETTING_VALUE_MARKERS):
+                raise InvalidSettingsError("Sensitive values are forbidden in settings.")
 
 
 def validate_settings_document(settings: Mapping[str, Any]) -> None:

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from copy import deepcopy
@@ -51,6 +52,7 @@ from amadeus_desktop.credential_store import (
     CredentialStore,
     CredentialStoreError,
     WinCredentialStore,
+    delete_all_amadeus_credentials,
 )
 from amadeus_desktop.data_management import (
     DataManagementError,
@@ -60,6 +62,7 @@ from amadeus_desktop.data_management import (
     ValidatedRestorePayload,
     apply_validated_restore,
     create_backup_archive,
+    disable_provider_credential_reuse_for_restore,
     discard_staged_restore,
     export_chat_json,
     export_memory_json,
@@ -120,8 +123,16 @@ from amadeus_desktop.provider_config import (
     AuthMode,
     ProviderConfig,
     ProviderPreset,
+    TokenLimitField,
 )
 from amadeus_desktop.provider_router import ProviderRouter
+from amadeus_desktop.provider_catalog import ProviderAuth, ProviderRole, load_provider_catalog
+from amadeus_desktop.provider_profiles import (
+    ProviderProfile,
+    ProviderProfileError,
+    ProviderSettings,
+    transient_credential_fingerprint,
+)
 from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
     InvalidSettingsError,
@@ -137,8 +148,10 @@ from amadeus_desktop.storage_models import PersonaKnowledgeDraft
 from amadeus_desktop.ui.chat_panel import ChatPanel
 from amadeus_desktop.ui.control_window import ControlWindow
 from amadeus_desktop.ui.greeting_bubble import GreetingBubble
-from amadeus_desktop.ui.model_settings import ModelSettingsWindow
-from amadeus_desktop.ui.multimodal_settings import MultimodalSettingsPage
+from amadeus_desktop.ui.provider_settings import (
+    ProviderSettingsChange,
+    ProviderSettingsPage,
+)
 from amadeus_desktop.ui.pet_window import PetWindow
 from amadeus_desktop.ui.settings_window import SettingsWindow
 from amadeus_desktop.ui.tray import TrayController
@@ -189,6 +202,8 @@ class ApplicationController:
         credential_store: CredentialStore | None = None,
         multimodal_credential_store: CredentialStore | None = None,
         speech_credential_store: CredentialStore | None = None,
+        profile_credential_store_factory: Callable[[ProviderProfile], CredentialStore]
+        | None = None,
         connection_tester: ProviderConnectionTester | None = None,
         first_chunk_timeout_ms: int = 15_000,
         focused_first_chunk_timeout_ms: int = DEFAULT_FOCUSED_FIRST_CHUNK_TIMEOUT_MS,
@@ -237,6 +252,17 @@ class ApplicationController:
         self._pending_provider_configuration: ProviderConfig | None = None
         self._pending_provider_secret: str | None = None
         self._provider_switch_generation = 0
+        self.provider_catalog = load_provider_catalog()
+        self._profile_credential_store_factory = (
+            profile_credential_store_factory or WinCredentialStore.for_profile
+        )
+        self._explicit_profile_credential_store_factory = (
+            profile_credential_store_factory is not None
+        )
+        self.model_provider_settings = ProviderSettings.from_mapping(
+            settings["model_providers"],
+            self.provider_catalog,
+        )
         self._initial_index_refresh_requested = False
         self._vector_index_available = False
         self._last_safe_error_category = ""
@@ -263,40 +289,46 @@ class ApplicationController:
         self.speech_credential_store = speech_credential_store or WinCredentialStore(
             MIMO_SPEECH_CREDENTIAL_REF
         )
+        provider_availability_message = self._reconcile_model_provider_credentials(
+            persist=allow_saved_provider,
+        )
+        if provider_availability_message:
+            status_message = (
+                f"{status_message}\n{provider_availability_message}"
+                if status_message
+                else provider_availability_message
+            )
         self._pending_voice_token: SpeechToken | None = None
         self.autostart_manager = autostart_manager or AutostartManager()
         self._reconcile_autostart_setting()
         self._clear_expired_proactive_pause()
-        self.provider_config = ProviderConfig.from_mapping(settings["provider"])
-        has_provider_secret = False
-        if (
-            chat_provider is None
-            and not mock_chat
-            and allow_saved_provider
-            and settings.get("provider_enabled") is True
-        ):
-            try:
-                has_provider_secret = self.credential_store.has_secret()
-            except CredentialStoreError as exc:
-                logger.warning("Credential store unavailable error_type=%s", type(exc).__name__)
-                credential_message = "Windows 凭据管理器不可用，真实对话模型已禁用。"
-                status_message = (
-                    f"{status_message}\n{credential_message}"
-                    if status_message
-                    else credential_message
-                )
+        self.provider_config = ProviderConfig.from_mapping(self.settings["provider"])
+        conversation_profile = self.model_provider_settings.assigned_profile(
+            ProviderRole.CONVERSATION
+        )
+        has_provider_secret = self._profile_credential_available(conversation_profile)
 
-        has_multimodal_secret = False
+        vision_profile = self.model_provider_settings.assigned_profile(ProviderRole.VISION)
+        has_multimodal_secret = self._profile_credential_available(vision_profile)
         has_own_multimodal_secret = False
         selected_multimodal_store: CredentialStore | None = None
-        multimodal_settings = settings["multimodal"]
+        multimodal_settings = self.settings["multimodal"]
         if allow_saved_provider:
             try:
                 has_own_multimodal_secret = self.multimodal_credential_store.has_secret()
             except CredentialStoreError:
                 has_own_multimodal_secret = False
-        if chat_provider is None and not mock_chat and allow_saved_provider:
-            selected_multimodal_store = self._selected_multimodal_credential_store()
+        if (
+            chat_provider is None
+            and not mock_chat
+            and allow_saved_provider
+            and not self.provider_catalog.degraded
+        ):
+            selected_multimodal_store = (
+                self._credential_store_for_profile(vision_profile)
+                if vision_profile is not None
+                else None
+            )
             if selected_multimodal_store is not None:
                 try:
                     has_multimodal_secret = selected_multimodal_store.has_secret()
@@ -310,8 +342,8 @@ class ApplicationController:
             tray_available = QSystemTrayIcon.isSystemTrayAvailable()
         self.tray_available = tray_available
 
-        pet_settings = settings["pet"]
-        always_on_top = bool(settings["general"]["always_on_top"])
+        pet_settings = self.settings["pet"]
+        always_on_top = bool(self.settings["general"]["always_on_top"])
         self.pet_asset_service = PetAssetService(paths.directory(AppDirectory.PETS))
         asset = self.pet_asset_service.load_active(pet_settings["active_pet_id"])
         if asset.is_fallback:
@@ -372,14 +404,22 @@ class ApplicationController:
             selected_provider,
             selected_multimodal_provider,
         )
+        if chat_provider is None and not mock_chat and allow_saved_provider:
+            self.provider_router.replace_profiles(
+                self.model_provider_settings,
+                self.provider_catalog,
+                self._credential_store_for_profile,
+            )
         self._active_chat_provider = selected_provider
         if background_jobs_enabled is None:
             background_jobs_enabled = not explicit_provider
         self._background_jobs_enabled = bool(background_jobs_enabled)
-        provider_ready = (
-            has_provider_secret
+        provider_ready = bool(
+            conversation_profile
+            and conversation_profile.enabled
+            and conversation_profile.is_tested(ProviderRole.CONVERSATION)
+            and has_provider_secret
             and allow_saved_provider
-            and settings.get("provider_enabled") is True
         )
         self._chat_available = explicit_provider or mock_chat or provider_ready
         self.attachment_store = AttachmentStore(self.paths.attachments_directory)
@@ -438,9 +478,9 @@ class ApplicationController:
         )
         self.data_service = LocalDataService(
             self.data_runtime,
-            memory_enabled=bool(settings["memory"]["enabled"]),
-            deep_memory_enabled=bool(settings["memory"].get("deep_memory_enabled", True)),
-            follow_user_language=bool(settings["persona"]["follow_user_language"]),
+            memory_enabled=bool(self.settings["memory"]["enabled"]),
+            deep_memory_enabled=bool(self.settings["memory"].get("deep_memory_enabled", True)),
+            follow_user_language=bool(self.settings["persona"]["follow_user_language"]),
             vector_query=self.vector_index.query,
             parent=application,
         )
@@ -448,7 +488,7 @@ class ApplicationController:
         self.memory_maintenance_timer.setInterval(24 * 60 * 60 * 1_000)
         self.memory_maintenance_timer.timeout.connect(self.data_service.run_memory_maintenance)
         self.background_generation = BackgroundGenerationRunner(
-            selected_provider,
+            self.provider_router,
             parent=application,
         )
         self.background_generation.idle.connect(self._on_background_provider_idle)
@@ -466,7 +506,7 @@ class ApplicationController:
                 resource.memories,
                 resource.deep_memories,
             ),
-            memory_enabled=bool(settings["memory"]["enabled"]),
+            memory_enabled=bool(self.settings["memory"]["enabled"]),
             parent=application,
         )
         self.deep_memory_jobs = DeepMemoryJobCoordinator(
@@ -477,8 +517,8 @@ class ApplicationController:
                 resource.memories,
                 resource.deep_memories,
             ),
-            memory_enabled=bool(settings["memory"]["enabled"]),
-            deep_memory_enabled=bool(settings["memory"].get("deep_memory_enabled", True)),
+            memory_enabled=bool(self.settings["memory"]["enabled"]),
+            deep_memory_enabled=bool(self.settings["memory"].get("deep_memory_enabled", True)),
             parent=application,
         )
         self.data_service.jobs_enqueued.connect(self.memory_jobs.poll)
@@ -503,17 +543,21 @@ class ApplicationController:
             self.data_service.set_provider_metadata("explicit_mock", "scripted")
             self.data_service.set_multimodal_provider_metadata("explicit_mock", "scripted")
         else:
+            conversation_metadata = self.model_provider_settings.assigned_profile(
+                ProviderRole.CONVERSATION
+            )
+            vision_metadata = self.model_provider_settings.assigned_profile(
+                ProviderRole.VISION
+            )
             self.data_service.set_provider_metadata(
-                self.provider_config.preset.value,
-                self.provider_config.model,
+                conversation_metadata.display_name if conversation_metadata else None,
+                conversation_metadata.model_for(ProviderRole.CONVERSATION)
+                if conversation_metadata
+                else None,
             )
             self.data_service.set_multimodal_provider_metadata(
-                (
-                    self.multimodal_config.preset.value
-                    if selected_multimodal_provider is not None
-                    else None
-                ),
-                self.multimodal_config.model if selected_multimodal_provider is not None else None,
+                vision_metadata.display_name if vision_metadata else None,
+                vision_metadata.model_for(ProviderRole.VISION) if vision_metadata else None,
             )
         self.conversation = ConversationCoordinator(
             self.provider_router,
@@ -531,10 +575,11 @@ class ApplicationController:
         self.chat_panel.configure_requested.connect(self._show_model_settings_from_chat)
         self.conversation.turn_added.connect(self.chat_panel.add_turn)
         self.conversation.turn_updated.connect(self.chat_panel.update_turn)
+        self.conversation.chunk_received.connect(self._bind_captured_provider_metadata)
         self.conversation.state_changed.connect(self._on_conversation_state_changed)
         self.conversation.request_finished.connect(self._record_conversation_evidence)
 
-        voice_settings = settings["voice"]
+        voice_settings = self.settings["voice"]
         self.audio_device_catalog = AudioDeviceCatalog(parent=application)
         self.microphone_capture = MicrophoneCapture(
             self.audio_device_catalog,
@@ -589,28 +634,13 @@ class ApplicationController:
         self.conversation.chunk_received.connect(self._on_voice_chat_chunk)
         self.conversation.request_finished.connect(self._on_voice_chat_finished)
 
-        self.model_settings_window = ModelSettingsWindow(
-            self.provider_config,
-            has_saved_secret=has_provider_secret,
-            credential_reader=self._read_provider_secret,
+        self.model_settings_window = ProviderSettingsPage(
+            self.model_provider_settings,
+            self.provider_catalog,
+            credential_store_factory=self._credential_store_for_profile,
             tester=connection_tester,
         )
-        self.model_settings_window.save_requested.connect(self._save_provider_configuration)
-        reusable_multimodal_secret = has_provider_secret and self._can_reuse_mimo_credential(
-            self.provider_config,
-            self.multimodal_config,
-        )
-        self.multimodal_settings_page = MultimodalSettingsPage(
-            self.multimodal_config,
-            enabled=bool(multimodal_settings["enabled"]),
-            reuse_mimo_credential=bool(multimodal_settings["reuse_mimo_credential"]),
-            has_saved_secret=has_own_multimodal_secret,
-            has_reusable_secret=reusable_multimodal_secret,
-            credential_reader=self._read_multimodal_secret,
-            reusable_credential_reader=self._read_provider_secret,
-            tester=connection_tester,
-        )
-        self.multimodal_settings_page.save_requested.connect(self._save_multimodal_configuration)
+        self.model_settings_window.save_requested.connect(self._save_model_provider_settings)
         self.voice_settings_page = VoiceSettingsPage(
             voice_settings,
             self.audio_device_catalog,
@@ -621,18 +651,24 @@ class ApplicationController:
             multimodal_credential_reusable=(
                 has_multimodal_secret and self._mimo_credential_compatible(self.multimodal_config)
             ),
+            reusable_mimo_profiles=tuple(
+                profile
+                for profile in self.model_provider_settings.profiles
+                if self._mimo_profile_credential_compatible(profile)
+                and profile.enabled
+                and self._profile_credential_available(profile)
+            ),
         )
         self.voice_settings_page.save_requested.connect(self._save_voice_configuration)
-        self.visual_settings_page = VisualSettingsPage(settings["visual"])
+        self.visual_settings_page = VisualSettingsPage(self.settings["visual"])
         self.visual_settings_page.save_requested.connect(self._save_visual_configuration)
         preferred_visual_index = self.chat_panel.visual_source_combo.findData(
-            str(settings["visual"]["preferred_source"])
+            str(self.settings["visual"]["preferred_source"])
         )
         if preferred_visual_index >= 0:
             self.chat_panel.visual_source_combo.setCurrentIndex(preferred_visual_index)
         self.settings_window = SettingsWindow(
             self.model_settings_window,
-            multimodal_page=self.multimodal_settings_page,
             voice_page=self.voice_settings_page,
             visual_page=self.visual_settings_page,
         )
@@ -644,9 +680,9 @@ class ApplicationController:
         self.proactive_page = self.settings_window.proactive_page
         self.diagnostics_page = self.settings_window.diagnostics_page
         self._sync_settings_pages()
-        self.memory_page.set_memory_enabled(bool(settings["memory"]["enabled"]))
+        self.memory_page.set_memory_enabled(bool(self.settings["memory"]["enabled"]))
         self.memory_page.set_deep_memory_enabled(
-            bool(settings["memory"].get("deep_memory_enabled", True))
+            bool(self.settings["memory"].get("deep_memory_enabled", True))
         )
         self._connect_settings_ui()
         self._connect_data_ui()
@@ -754,9 +790,17 @@ class ApplicationController:
         if mock_chat or (explicit_provider and isinstance(selected_provider, ScriptedChatProvider)):
             self.chat_panel.set_provider_mode("mock")
         elif explicit_provider or provider_ready:
+            runtime_profile = self.model_provider_settings.assigned_profile(
+                ProviderRole.CONVERSATION
+            )
             self.chat_panel.set_provider_mode(
                 "provider",
-                provider_name=f"{self.provider_config.display_name} · {self.provider_config.model}",
+                provider_name=(
+                    f"{runtime_profile.display_name} · "
+                    f"{runtime_profile.model_for(ProviderRole.CONVERSATION)}"
+                    if runtime_profile is not None and not explicit_provider
+                    else f"{self.provider_config.display_name} · {self.provider_config.model}"
+                ),
             )
         else:
             # Production starts fail-closed. P4 composition replaces the provider only
@@ -1222,16 +1266,15 @@ class ApplicationController:
             self.tray.set_proactive_paused_today(self._proactive_is_paused_today())
 
     def _provider_is_configured(self) -> bool:
-        return bool(
-            not self._mock_chat
-            and self._chat_available
-            and self.settings.get("provider_enabled") is True
-        )
+        return bool(not self._mock_chat and self._chat_available)
 
     def _proactive_provider_metadata(self) -> tuple[str | None, str | None]:
         if not self._provider_is_configured():
             return None, None
-        return self.provider_config.preset.value, self.provider_config.model
+        profile = self.model_provider_settings.assigned_profile(ProviderRole.CONVERSATION)
+        if profile is None:
+            return None, None
+        return profile.display_name, profile.model_for(ProviderRole.CONVERSATION)
 
     def _build_proactive_visual_plan(
         self,
@@ -1249,19 +1292,20 @@ class ApplicationController:
         ):
             return None
         frame = self.visual_sources.latest()
-        multimodal = self.settings.get("multimodal")
+        vision_profile = self.model_provider_settings.assigned_profile(ProviderRole.VISION)
         if (
             frame is None
-            or not isinstance(multimodal, dict)
-            or multimodal.get("enabled") is not True
-            or self.provider_router.provider(ProviderCapability.MULTIMODAL) is None
+            or vision_profile is None
+            or not vision_profile.enabled
+            or not vision_profile.is_tested(ProviderRole.VISION)
+            or not self._profile_credential_available(vision_profile)
         ):
             return ProactiveVisualPlan(None)
         return ProactiveVisualPlan(
             build_proactive_visual_request(now, trigger, frame),
             (
-                self.multimodal_config.preset.value,
-                self.multimodal_config.model,
+                vision_profile.display_name,
+                vision_profile.model_for(ProviderRole.VISION),
             ),
         )
 
@@ -1545,13 +1589,29 @@ class ApplicationController:
             self.settings_window,
             "确认恢复",
             "备份已通过格式、校验和与数据库完整性检查。继续后应用会创建恢复前备份、"
-            "替换本地数据并退出；请随后手动重新启动。是否继续？",
+            "替换本地数据并退出。\n\n"
+            "选择“是”：仅当 Profile ID、凭据安全域、本机绑定和连接测试指纹全部匹配时，"
+            "尝试复用本机仍存在的凭据。\n"
+            "选择“否”：继续恢复，但停用全部模型 Profile 并要求重新测试。\n"
+            "选择“取消”：不恢复。",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if answer == QMessageBox.StandardButton.Cancel:
             with suppress(DataManagementError):
                 discard_staged_restore(payload)
             self._finish_data_operation()
             return
+        if answer == QMessageBox.StandardButton.No:
+            try:
+                payload = disable_provider_credential_reuse_for_restore(payload)
+            except DataManagementError as exc:
+                with suppress(DataManagementError):
+                    discard_staged_restore(payload)
+                self._on_restore_validation_failed(type(exc).__name__)
+                return
         self._staged_restore = payload
         self._data_change_state = "restore_prebackup"
         if not self._begin_data_change():
@@ -1805,19 +1865,35 @@ class ApplicationController:
             self.autostart_manager.set_enabled(False)
         except AutostartError:
             failures = True
-        deleted_store_ids: set[int] = set()
-        for store in (
-            self.credential_store,
-            self.multimodal_credential_store,
-            self.speech_credential_store,
-        ):
-            if id(store) in deleted_store_ids:
-                continue
-            deleted_store_ids.add(id(store))
+        production_wincred = bool(
+            not self._explicit_profile_credential_store_factory
+            and isinstance(self.credential_store, WinCredentialStore)
+            and isinstance(self.multimodal_credential_store, WinCredentialStore)
+            and isinstance(self.speech_credential_store, WinCredentialStore)
+        )
+        if production_wincred:
             try:
-                store.delete_secret()
+                delete_all_amadeus_credentials()
             except CredentialStoreError:
                 failures = True
+        else:
+            deleted_store_ids: set[int] = set()
+            reset_stores: list[CredentialStore] = [
+                self.credential_store,
+                self.multimodal_credential_store,
+                self.speech_credential_store,
+            ]
+            for profile in self.model_provider_settings.profiles:
+                if profile.auth is not ProviderAuth.NONE:
+                    reset_stores.append(self._credential_store_for_profile(profile))
+            for store in reset_stores:
+                if id(store) in deleted_store_ids:
+                    continue
+                deleted_store_ids.add(id(store))
+                try:
+                    store.delete_secret()
+                except CredentialStoreError:
+                    failures = True
         logging.shutdown()
         for target in reset_plan.targets:
             try:
@@ -2457,6 +2533,622 @@ class ApplicationController:
     def _read_multimodal_secret(self) -> str | None:
         return self.multimodal_credential_store.read_secret()
 
+    def _credential_store_for_profile(self, profile: ProviderProfile) -> CredentialStore:
+        """Resolve retained v9 slots or one deterministic dynamic Profile target."""
+
+        if self._explicit_profile_credential_store_factory:
+            return self._profile_credential_store_factory(profile)
+        if profile.credential_slot == "legacy_chat":
+            return self.credential_store
+        if profile.credential_slot == "legacy_vision":
+            return self.multimodal_credential_store
+        return self._profile_credential_store_factory(profile)
+
+    def _profile_credential_available(self, profile: ProviderProfile | None) -> bool:
+        if profile is None:
+            return False
+        if profile.auth is ProviderAuth.NONE:
+            return True
+        try:
+            return self._credential_store_for_profile(profile).has_secret()
+        except CredentialStoreError:
+            return False
+
+    def _reconcile_model_provider_credentials(self, *, persist: bool) -> str | None:
+        """Fail closed after restore/catalog drift without discarding Profile data."""
+
+        assigned_roles: dict[str, set[ProviderRole]] = {}
+        for role, profile_id in self.model_provider_settings.assignments.items():
+            if profile_id is not None:
+                assigned_roles.setdefault(profile_id, set()).add(role)
+        profiles: list[ProviderProfile] = []
+        disabled = False
+        catalog_degraded = self.provider_catalog.degraded
+        for profile in self.model_provider_settings.profiles:
+            valid_catalog_contract = profile.catalog_id in self.provider_catalog.entries
+            assigned_tests_valid = all(
+                profile.is_tested(role)
+                for role in assigned_roles.get(profile.profile_id, set())
+            )
+            credential_valid = self._profile_credential_available(profile)
+            should_disable = bool(
+                profile.enabled
+                and (
+                    not valid_catalog_contract
+                    or not assigned_tests_valid
+                    or not credential_valid
+                )
+            )
+            profiles.append(replace(profile, enabled=False) if should_disable else profile)
+            disabled = disabled or should_disable
+        if not disabled:
+            return "内置提供商目录损坏，当前仅开放安全自定义恢复入口。" if catalog_degraded else None
+        reconciled = ProviderSettings(
+            tuple(profiles),
+            self.model_provider_settings.assignments,
+        ).runtime_validated(self.provider_catalog)
+        self.model_provider_settings = reconciled
+        candidate = deepcopy(self.settings)
+        candidate["model_providers"] = reconciled.to_mapping()
+        voice_source = str(candidate["voice"].get("credential_source", ""))
+        if voice_source.startswith("profile:"):
+            voice_profile = reconciled.profile(voice_source.removeprefix("profile:"))
+            if (
+                voice_profile is None
+                or not voice_profile.enabled
+                or not self._mimo_profile_credential_compatible(voice_profile)
+            ):
+                candidate["voice"]["enabled"] = False
+                candidate["voice"]["credential_source"] = "independent"
+        if persist:
+            try:
+                self.settings_repository.save(candidate)
+            except SettingsError:
+                self.logger.warning("Provider restore reconciliation could not be persisted")
+            else:
+                self.settings.clear()
+                self.settings.update(candidate)
+        return (
+            "提供商目录、连接测试指纹或 Windows 凭据安全域不匹配；"
+            "相关 Profile 已自动停用，请在模型提供商中心重新测试。"
+        )
+
+    def _save_model_provider_settings(self, change_object: object) -> None:
+        """Commit profile settings, credentials and routing as one rollback unit."""
+
+        if not isinstance(change_object, ProviderSettingsChange):
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="模型提供商变更无效。",
+            )
+            return
+        if self.conversation.is_active or self.conversation.state is not ConversationState.IDLE:
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="请等待当前回复结束后再替换任务路由。",
+            )
+            return
+        if self.background_generation.is_running or self.visual_background_generation.is_running:
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="后台模型任务正在运行；已保留原路由，请稍后重试。",
+            )
+            return
+        memory_was_paused = not self.memory_jobs.pause(wait_ms=0)
+        deep_memory_was_paused = not self.deep_memory_jobs.pause(wait_ms=0)
+        if memory_was_paused or deep_memory_was_paused:
+            self.memory_jobs.resume()
+            self.deep_memory_jobs.resume()
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="记忆后台任务正在暂停，请稍后重试；原路由未更改。",
+            )
+            return
+        try:
+            if (
+                not isinstance(change_object.secret_updates, Mapping)
+                or not isinstance(change_object.tested_secret_fingerprints, Mapping)
+                or not isinstance(change_object.deleted_profiles, tuple)
+            ):
+                raise ProviderProfileError("模型提供商事务载荷无效。")
+            candidate_settings = change_object.settings.validated(
+                self.provider_catalog
+            ).require_assigned_tests()
+            candidate_profile_ids = {
+                profile.profile_id for profile in candidate_settings.profiles
+            }
+            current_profiles = {
+                profile.profile_id: profile
+                for profile in self.model_provider_settings.profiles
+            }
+            if not set(change_object.secret_updates).issubset(candidate_profile_ids):
+                raise ProviderProfileError("模型凭据变更引用了不存在的 Profile。")
+            secret_update_ids = set(change_object.secret_updates)
+            tested_secret_ids = set(change_object.tested_secret_fingerprints)
+            assigned_secret_update_ids = secret_update_ids.intersection(
+                profile_id
+                for profile_id in candidate_settings.assignments.values()
+                if profile_id is not None
+            )
+            if (
+                not tested_secret_ids.issubset(secret_update_ids)
+                or not assigned_secret_update_ids.issubset(tested_secret_ids)
+            ):
+                raise ProviderProfileError("模型凭据变更缺少对应的连接测试。")
+            deleted_profile_ids = [
+                profile.profile_id for profile in change_object.deleted_profiles
+            ]
+            expected_deleted_profile_ids = (
+                set(current_profiles) - candidate_profile_ids
+            )
+            if (
+                len(deleted_profile_ids) != len(set(deleted_profile_ids))
+                or any(profile_id in candidate_profile_ids for profile_id in deleted_profile_ids)
+                or set(deleted_profile_ids) != expected_deleted_profile_ids
+                or any(
+                    current_profiles.get(profile.profile_id) != profile
+                    for profile in change_object.deleted_profiles
+                )
+            ):
+                raise ProviderProfileError("删除 Profile 的事务边界无效。")
+            for secret in change_object.secret_updates.values():
+                if (
+                    not isinstance(secret, str)
+                    or not secret
+                    or secret != secret.strip()
+                    or "\x00" in secret
+                    or secret.casefold().startswith("tp-")
+                ):
+                    raise ProviderProfileError("模型凭据变更无效。")
+            for profile_id, tested_fingerprint in (
+                change_object.tested_secret_fingerprints.items()
+            ):
+                secret = change_object.secret_updates[profile_id]
+                if (
+                    not isinstance(profile_id, str)
+                    or not isinstance(tested_fingerprint, str)
+                    or len(tested_fingerprint) != 64
+                    or not hmac.compare_digest(
+                        transient_credential_fingerprint(secret),
+                        tested_fingerprint,
+                    )
+                ):
+                    raise ProviderProfileError(
+                        "模型凭据变更未通过当前连接测试。"
+                    )
+            for profile_id in change_object.secret_updates:
+                profile = candidate_settings.profile(profile_id)
+                if profile is None or profile.auth is ProviderAuth.NONE:
+                    raise ProviderProfileError("无鉴权 Profile 不得写入凭据。")
+            voice_source = str(self.settings["voice"].get("credential_source", ""))
+            if voice_source.startswith("profile:"):
+                voice_profile = candidate_settings.profile(
+                    voice_source.removeprefix("profile:")
+                )
+                if (
+                    voice_profile is None
+                    or not voice_profile.enabled
+                    or not self._mimo_profile_credential_compatible(voice_profile)
+                ):
+                    raise ProviderProfileError(
+                        "语音正在复用该 MiMo PAYG Profile，请先调整语音凭据来源。"
+                    )
+        except ProviderProfileError as exc:
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message=str(exc),
+            )
+            self.memory_jobs.resume()
+            self.deep_memory_jobs.resume()
+            return
+        previous_document = deepcopy(self.settings)
+        previous_voice_source = str(
+            previous_document["voice"].get("credential_source", "")
+        )
+        voice_profile_changed = False
+        if previous_voice_source.startswith("profile:"):
+            voice_profile_id = previous_voice_source.removeprefix("profile:")
+            voice_profile_changed = (
+                self.model_provider_settings.profile(voice_profile_id)
+                != candidate_settings.profile(voice_profile_id)
+                or voice_profile_id in change_object.secret_updates
+            )
+        if voice_profile_changed:
+            self.voice_session.stop_session(stop_chat=False)
+            if self.speech_network.busy:
+                self.model_settings_window.apply_save_result(
+                    success=False,
+                    message="语音 ASR/TTS 网络任务尚未停止，模型 Profile 未更改。",
+                )
+                self.memory_jobs.resume()
+                self.deep_memory_jobs.resume()
+                return
+        try:
+            settings_snapshot = self.settings_repository.capture_snapshot()
+        except SettingsError as exc:
+            self.logger.warning(
+                "Model provider settings snapshot failed error_type=%s",
+                type(exc).__name__,
+            )
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message="设置文件无法安全备份，模型 Profile 未更改。",
+            )
+            self.memory_jobs.resume()
+            self.deep_memory_jobs.resume()
+            return
+        previous_profiles = {
+            profile.profile_id: profile for profile in self.model_provider_settings.profiles
+        }
+        changed_profiles = {
+            profile.profile_id: profile for profile in candidate_settings.profiles
+        }
+        retired_profiles: list[ProviderProfile] = []
+        for profile_id, previous_profile in previous_profiles.items():
+            candidate_profile = changed_profiles.get(profile_id)
+            if candidate_profile is None or (
+                self._provider_credential_domain(previous_profile)
+                != self._provider_credential_domain(candidate_profile)
+            ):
+                retired_profiles.append(previous_profile)
+
+        affected_domains: dict[str, ProviderProfile] = {}
+        for profile_id in change_object.secret_updates:
+            profile = changed_profiles[profile_id]
+            domain = self._provider_credential_domain(profile)
+            if domain is not None:
+                affected_domains[domain] = profile
+        for profile in retired_profiles:
+            domain = self._provider_credential_domain(profile)
+            if domain is not None:
+                affected_domains[domain] = profile
+
+        credential_snapshots: dict[str, tuple[CredentialStore, str | None]] = {}
+        for domain, profile in affected_domains.items():
+            store = self._credential_store_for_profile(profile)
+            try:
+                credential_snapshots[domain] = (store, store.read_secret())
+            except CredentialStoreError:
+                self.model_settings_window.apply_save_result(
+                    success=False,
+                    message="Windows 凭据管理器不可用，原配置未更改。",
+                )
+                self.memory_jobs.resume()
+                self.deep_memory_jobs.resume()
+                return
+
+        candidate_document = deepcopy(self.settings)
+        candidate_document["model_providers"] = candidate_settings.to_mapping()
+        # Keep v9 compatibility mirrors synchronized while no longer using them
+        # as the P7G runtime source of truth.
+        conversation_profile = candidate_settings.assigned_profile(ProviderRole.CONVERSATION)
+        vision_profile = candidate_settings.assigned_profile(ProviderRole.VISION)
+        conversation_mirror = self._legacy_mirror_config_or_none(
+            conversation_profile,
+            ProviderRole.CONVERSATION,
+            PROVIDER_CREDENTIAL_REF,
+        )
+        vision_mirror = self._legacy_mirror_config_or_none(
+            vision_profile,
+            ProviderRole.VISION,
+            MULTIMODAL_CREDENTIAL_REF,
+        )
+        candidate_document["provider_enabled"] = bool(
+            conversation_profile
+            and conversation_profile.enabled
+            and conversation_profile.credential_slot == "legacy_chat"
+            and conversation_mirror is not None
+        )
+        if conversation_mirror is not None:
+            candidate_document["provider"] = conversation_mirror.to_mapping()
+        candidate_document["multimodal"]["enabled"] = bool(
+            vision_profile
+            and vision_profile.enabled
+            and vision_profile.credential_slot == "legacy_vision"
+            and vision_mirror is not None
+        )
+        candidate_document["multimodal"]["reuse_mimo_credential"] = False
+        if vision_mirror is not None:
+            candidate_document["multimodal"]["provider"] = vision_mirror.to_mapping()
+
+        disabled_document = deepcopy(candidate_document)
+        for raw_profile in disabled_document["model_providers"]["profiles"]:
+            raw_profile["enabled"] = False
+        disabled_document["provider_enabled"] = False
+        disabled_document["multimodal"]["enabled"] = False
+        disabled_document["voice"]["enabled"] = False
+        mutated_domains: list[str] = []
+        disabled_saved = False
+        router_replaced = False
+        try:
+            self.settings_repository.save(disabled_document)
+            disabled_saved = True
+            for profile_id, secret in change_object.secret_updates.items():
+                profile = changed_profiles[profile_id]
+                domain = self._provider_credential_domain(profile)
+                if domain is None:
+                    raise ProviderProfileError("无鉴权 Profile 不得写入凭据。")
+                mutated_domains.append(domain)
+                credential_snapshots[domain][0].write_secret(secret)
+            for role in ProviderRole:
+                profile = candidate_settings.assigned_profile(role)
+                if profile is None or not profile.enabled:
+                    continue
+                store = self._credential_store_for_profile(profile)
+                if profile.auth is not ProviderAuth.NONE and not store.has_secret():
+                    raise SettingsError("Assigned provider credential is unavailable.")
+            for profile in retired_profiles:
+                domain = self._provider_credential_domain(profile)
+                if domain is None:
+                    continue
+                mutated_domains.append(domain)
+                credential_snapshots[domain][0].delete_secret()
+            # A stale scope must never erase a candidate credential.  This
+            # second check also protects injected credential-store factories
+            # used by tests from accidentally aliasing two security domains.
+            for role in ProviderRole:
+                profile = candidate_settings.assigned_profile(role)
+                if profile is None or not profile.enabled or profile.auth is ProviderAuth.NONE:
+                    continue
+                if not self._credential_store_for_profile(profile).has_secret():
+                    raise SettingsError("Assigned provider credential was lost during cleanup.")
+            # Enable the durable candidate only after every credential mutation
+            # and cleanup has succeeded. Until this point a crash leaves the
+            # previously written all-disabled document as the recovery state.
+            self.settings_repository.save(candidate_document)
+            self.provider_router.replace_profiles(
+                candidate_settings,
+                self.provider_catalog,
+                self._credential_store_for_profile,
+            )
+            router_replaced = True
+        except (CredentialStoreError, ProviderProfileError, SettingsError, ValueError) as exc:
+            credential_rollback_ok = True
+            for domain in reversed(tuple(dict.fromkeys(mutated_domains))):
+                store, previous_secret = credential_snapshots[domain]
+                try:
+                    if previous_secret is None:
+                        store.delete_secret()
+                    else:
+                        store.write_secret(previous_secret)
+                except CredentialStoreError:
+                    credential_rollback_ok = False
+            # Restore enabled settings only after every credential is back in
+            # its previous security domain. Otherwise retain the durable
+            # all-disabled marker written before the first credential mutation.
+            settings_rollback_ok = not disabled_saved
+            if disabled_saved and credential_rollback_ok:
+                try:
+                    self.settings_repository.restore_snapshot(settings_snapshot)
+                except SettingsError:
+                    settings_rollback_ok = False
+                else:
+                    settings_rollback_ok = True
+            rollback_ok = settings_rollback_ok and credential_rollback_ok
+            if rollback_ok:
+                self.settings.clear()
+                self.settings.update(previous_document)
+                self.model_provider_settings = ProviderSettings.from_mapping(
+                    previous_document["model_providers"],
+                    self.provider_catalog,
+                )
+                if router_replaced:
+                    self.provider_router.replace_profiles(
+                        self.model_provider_settings,
+                        self.provider_catalog,
+                        self._credential_store_for_profile,
+                    )
+            else:
+                fail_closed_settings = ProviderSettings(
+                    tuple(
+                        replace(profile, enabled=False)
+                        for profile in candidate_settings.profiles
+                    ),
+                    candidate_settings.assignments,
+                ).runtime_validated(self.provider_catalog)
+                fail_closed_document = deepcopy(candidate_document)
+                fail_closed_document["model_providers"] = fail_closed_settings.to_mapping()
+                fail_closed_document["provider_enabled"] = False
+                fail_closed_document["multimodal"]["enabled"] = False
+                fail_closed_document["voice"]["enabled"] = False
+                with suppress(SettingsError):
+                    self.settings_repository.save(fail_closed_document)
+                self.settings.clear()
+                self.settings.update(fail_closed_document)
+                self.model_provider_settings = fail_closed_settings
+                self.provider_router.replace_profiles(
+                    fail_closed_settings,
+                    self.provider_catalog,
+                    self._credential_store_for_profile,
+                )
+                self._chat_available = False
+                self._voice_configured = False
+                self.voice_session.stop_session(stop_chat=False)
+                self.chat_panel.set_provider_mode("unconfigured")
+                self._sync_voice_availability()
+            self.logger.warning(
+                "Model provider transaction failed error_type=%s "
+                "settings_rollback=%s credential_rollback=%s",
+                type(exc).__name__,
+                settings_rollback_ok,
+                credential_rollback_ok,
+            )
+            if not rollback_ok:
+                self.model_settings_window.update_settings(
+                    fail_closed_settings,
+                    force=True,
+                )
+            self.model_settings_window.apply_save_result(
+                success=False,
+                message=(
+                    "模型提供商保存失败，原 Profile、凭据和路由已保留。"
+                    if rollback_ok
+                    else "模型提供商保存或回滚失败；相关 Profile 已失效关闭，请重新配置。"
+                ),
+            )
+            self.memory_jobs.resume()
+            self.deep_memory_jobs.resume()
+            return
+
+        self.settings.clear()
+        self.settings.update(candidate_document)
+        self.model_provider_settings = candidate_settings
+        self._settings_trusted = True
+        voice_source = str(candidate_document["voice"].get("credential_source", ""))
+        if voice_source.startswith("profile:") and voice_profile_changed:
+            voice_store = self._speech_store_for_source(voice_source)
+            if voice_store is None:
+                self._voice_configured = False
+            else:
+                speech_config = self._speech_config_from_settings(candidate_document["voice"])
+                speech_client = MiMoSpeechClient(speech_config, voice_store)
+                if not self.speech_network.set_services(speech_client, speech_client):
+                    self._voice_configured = False
+                    self.logger.warning(
+                        "Voice runtime was still busy after provider transaction"
+                    )
+                else:
+                    self._voice_configured = bool(
+                        candidate_document["voice"].get("enabled") is True
+                        and self._profile_credential_available(
+                            candidate_settings.profile(
+                                voice_source.removeprefix("profile:")
+                            )
+                        )
+                    )
+        self.voice_settings_page.update_reusable_mimo_profiles(
+            tuple(
+                profile
+                for profile in candidate_settings.profiles
+                if self._mimo_profile_credential_compatible(profile)
+                and profile.enabled
+                and self._profile_credential_available(profile)
+            ),
+            selected_source=voice_source,
+        )
+        conversation = candidate_settings.assigned_profile(ProviderRole.CONVERSATION)
+        self._chat_available = bool(
+            conversation
+            and conversation.enabled
+            and conversation.is_tested(ProviderRole.CONVERSATION)
+            and self._profile_credential_available(conversation)
+        )
+        self.provider_config = ProviderConfig.from_mapping(candidate_document["provider"])
+        if conversation is not None and conversation.enabled:
+            self.chat_panel.set_provider_mode(
+                "provider",
+                provider_name=(
+                    f"{conversation.display_name} · "
+                    f"{conversation.model_for(ProviderRole.CONVERSATION)}"
+                ),
+            )
+            self.data_service.set_provider_metadata(
+                conversation.display_name,
+                conversation.model_for(ProviderRole.CONVERSATION),
+            )
+        else:
+            self.chat_panel.set_provider_mode("unconfigured")
+            self.data_service.set_provider_metadata(None, None)
+        self.multimodal_config = ProviderConfig.from_mapping(
+            candidate_document["multimodal"]["provider"]
+        )
+        if vision_profile is not None and vision_profile.enabled:
+            self.data_service.set_multimodal_provider_metadata(
+                vision_profile.display_name,
+                vision_profile.model_for(ProviderRole.VISION),
+            )
+        else:
+            self.data_service.set_multimodal_provider_metadata(None, None)
+        self.model_settings_window.apply_save_result(
+            success=True,
+            message="模型 Profile、凭据和四任务路由已安全保存。",
+        )
+        self._sync_voice_availability()
+        self._refresh_diagnostics()
+        self.memory_jobs.resume()
+        self.deep_memory_jobs.resume()
+
+    @staticmethod
+    def _provider_credential_domain(profile: ProviderProfile) -> str | None:
+        """Return the code-owned security-domain identity without reading a secret."""
+
+        if profile.auth is ProviderAuth.NONE:
+            return None
+        if profile.credential_slot in {"legacy_chat", "legacy_vision"}:
+            return profile.credential_slot
+        return (
+            f"dynamic:{profile.profile_id}:{profile.protocol.value}:"
+            f"{profile.credential_scope_digest}"
+        )
+
+    @staticmethod
+    def _legacy_mirror_config(
+        profile: ProviderProfile,
+        role: ProviderRole,
+        credential_ref: str,
+    ) -> ProviderConfig:
+        preset = (
+            ProviderPreset.MIMO_PAYG
+            if profile.catalog_id == "mimo_payg"
+            else ProviderPreset.DEEPSEEK_PAYG
+            if profile.catalog_id == "deepseek"
+            else ProviderPreset.CUSTOM_OPENAI
+        )
+        auth = AuthMode.BEARER if profile.auth is ProviderAuth.BEARER else AuthMode.API_KEY
+        token_field = (
+            TokenLimitField.MAX_COMPLETION_TOKENS
+            if profile.catalog_id in {"mimo_payg", "openai"}
+            else TokenLimitField.MAX_TOKENS
+        )
+        return ProviderConfig.for_preset(
+            preset,
+            display_name=(
+                ProviderConfig.for_preset(preset).display_name
+                if preset is not ProviderPreset.CUSTOM_OPENAI
+                else profile.display_name
+            ),
+            base_url=(
+                ProviderConfig.for_preset(preset).base_url
+                if preset is not ProviderPreset.CUSTOM_OPENAI
+                else profile.base_url
+            ),
+            model=profile.model_for(role),
+            auth_mode=(
+                ProviderConfig.for_preset(preset).auth_mode
+                if preset is not ProviderPreset.CUSTOM_OPENAI
+                else auth
+            ),
+            credential_ref=credential_ref,
+            connect_timeout_seconds=profile.connect_timeout_seconds,
+            request_timeout_seconds=profile.request_timeout_seconds,
+            max_output_tokens=min(profile.max_output_tokens, 32_768),
+            temperature=profile.temperature,
+            top_p=profile.top_p,
+            stream_enabled=profile.stream_enabled,
+            token_limit_field=token_field,
+        )
+
+    @classmethod
+    def _legacy_mirror_config_or_none(
+        cls,
+        profile: ProviderProfile | None,
+        role: ProviderRole,
+        credential_ref: str,
+    ) -> ProviderConfig | None:
+        """Mirror only contracts the v9 compatibility schema can represent."""
+
+        if (
+            profile is None
+            or profile.protocol.value != "openai_chat_completions"
+            or not profile.base_url.startswith("https://")
+            or profile.auth not in {ProviderAuth.BEARER, ProviderAuth.API_KEY}
+        ):
+            return None
+        try:
+            return cls._legacy_mirror_config(profile, role, credential_ref)
+        except ValueError:
+            return None
+
     @staticmethod
     def _mimo_credential_compatible(config: ProviderConfig) -> bool:
         return (
@@ -2480,6 +3172,15 @@ class ApplicationController:
     def _speech_store_for_source(self, source: str) -> CredentialStore | None:
         if source == "independent":
             return self.speech_credential_store
+        if source.startswith("profile:"):
+            profile = self.model_provider_settings.profile(source.removeprefix("profile:"))
+            if (
+                profile is None
+                or not profile.enabled
+                or not self._mimo_profile_credential_compatible(profile)
+            ):
+                return None
+            return self._credential_store_for_profile(profile)
         if source == PROVIDER_CREDENTIAL_REF:
             return (
                 self.credential_store
@@ -2491,6 +3192,14 @@ class ApplicationController:
                 return None
             return self._selected_multimodal_credential_store()
         return None
+
+    @staticmethod
+    def _mimo_profile_credential_compatible(profile: ProviderProfile) -> bool:
+        return bool(
+            profile.catalog_id == "mimo_payg"
+            and profile.base_url == "https://api.xiaomimimo.com/v1"
+            and profile.auth is ProviderAuth.API_KEY
+        )
 
     @staticmethod
     def _speech_config_from_settings(settings: object) -> MiMoSpeechConfig:
@@ -2532,133 +3241,12 @@ class ApplicationController:
         enabled: bool,
         reuse_mimo_credential: bool,
     ) -> None:
-        if not isinstance(config_object, ProviderConfig):
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="多模态供应商配置无效。",
-            )
-            return
-        if config_object.credential_ref != MULTIMODAL_CREDENTIAL_REF:
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="多模态凭据引用无效。",
-            )
-            return
-        if (
-            enabled
-            and reuse_mimo_credential
-            and not self._can_reuse_mimo_credential(
-                self.provider_config,
-                config_object,
-            )
-        ):
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="只有相同 MiMo PAYG 安全域才能复用对话密钥。",
-            )
-            return
-        voice = self.settings.get("voice")
-        if (
-            enabled
-            and isinstance(voice, dict)
-            and voice.get("enabled") is True
-            and voice.get("credential_source") == MULTIMODAL_CREDENTIAL_REF
-            and not self._mimo_credential_compatible(config_object)
-        ):
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="语音正在复用多模态 MiMo PAYG 密钥，请先调整语音配置。",
-            )
-            return
-        if self.conversation.is_active or self.conversation.state is not ConversationState.IDLE:
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="请等当前回复结束后再更新多模态配置。",
-            )
-            return
-        self.proactive_interactions.cancel_ai_generation(wait_ms=0)
-        if self.visual_background_generation.is_running:
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="主动视觉分析正在安全停止，请稍后重试保存。",
-            )
-            return
-        secret = secret_object if isinstance(secret_object, str) and secret_object else None
-        previous_settings = deepcopy(self.settings)
-        snapshot = self.settings_repository.snapshot()
-        try:
-            previous_secret = self.multimodal_credential_store.read_secret()
-        except CredentialStoreError:
-            previous_secret = None
-        previous_provider = self.provider_router.provider(ProviderCapability.MULTIMODAL)
-        candidate = deepcopy(self.settings)
-        candidate["multimodal"] = {
-            "enabled": bool(enabled),
-            "reuse_mimo_credential": bool(reuse_mimo_credential),
-            "provider": config_object.validated().to_mapping(),
-        }
-        disabled = deepcopy(candidate)
-        disabled["multimodal"]["enabled"] = False
-        wrote_secret = False
-        try:
-            self.settings_repository.save(disabled)
-            if not reuse_mimo_credential and secret is not None:
-                self.multimodal_credential_store.write_secret(secret)
-                wrote_secret = True
-            credential_store = (
-                self.credential_store
-                if reuse_mimo_credential
-                and self._can_reuse_mimo_credential(
-                    self.provider_config,
-                    config_object,
-                )
-                else self.multimodal_credential_store
-            )
-            if enabled and not credential_store.has_secret():
-                raise SettingsError("Multimodal credential is unavailable.")
-            provider = (
-                OpenAICompatibleChatProvider(config_object, credential_store) if enabled else None
-            )
-            self.settings_repository.save(candidate)
-            self.provider_router.set_provider(ProviderCapability.MULTIMODAL, provider)
-        except (CredentialStoreError, SettingsError, ValueError) as exc:
-            with suppress(SettingsError):
-                self.settings_repository.restore_snapshot(snapshot)
-            if wrote_secret:
-                with suppress(CredentialStoreError):
-                    if previous_secret is None:
-                        self.multimodal_credential_store.delete_secret()
-                    else:
-                        self.multimodal_credential_store.write_secret(previous_secret)
-            self.provider_router.set_provider(
-                ProviderCapability.MULTIMODAL,
-                previous_provider,
-            )
-            self.settings.clear()
-            self.settings.update(previous_settings)
-            self.logger.warning(
-                "Multimodal configuration save failed error_type=%s",
-                type(exc).__name__,
-            )
-            self.multimodal_settings_page.apply_save_result(
-                success=False,
-                message="多模态配置保存失败，原配置已保留。",
-            )
-            return
-        self.settings.clear()
-        self.settings.update(candidate)
-        self.multimodal_config = config_object
-        self.data_service.set_multimodal_provider_metadata(
-            config_object.preset.value if enabled else None,
-            config_object.model if enabled else None,
-        )
-        self.multimodal_settings_page.apply_save_result(
-            success=True,
-            message=(
-                "图片与视觉多模态模型已启用。"
-                if enabled
-                else "图片与视觉多模态模型已停用；文字聊天不受影响。"
-            ),
+        """Retired P7C compatibility entry; P7G uses Profile routing only."""
+
+        del config_object, secret_object, enabled, reuse_mimo_credential
+        self.model_settings_window.apply_save_result(
+            success=False,
+            message="旧多模态配置入口已停用，请在模型提供商中心编辑视觉任务。",
         )
 
     def _save_voice_configuration(
@@ -2702,7 +3290,7 @@ class ApplicationController:
             return
         secret = secret_object if isinstance(secret_object, str) and secret_object else None
         previous_settings = deepcopy(self.settings)
-        snapshot = self.settings_repository.snapshot()
+        snapshot = self.settings_repository.capture_snapshot()
         try:
             previous_secret = self.speech_credential_store.read_secret()
         except CredentialStoreError:
@@ -2805,7 +3393,12 @@ class ApplicationController:
         config_object: object,
         secret_object: object,
     ) -> None:
-        """Pause background generation without blocking Qt, then save fail-closed."""
+        """Legacy test/programmatic adapter; the UI is no longer connected here.
+
+        Retaining the proven v9 rollback path keeps pre-P7G recovery fixtures
+        meaningful. It updates only the legacy compatibility mirrors; all P7G
+        production UI and runtime routing use ``model_providers`` Profiles.
+        """
 
         if not isinstance(config_object, ProviderConfig):
             self.model_settings_window.apply_save_result(
@@ -3151,6 +3744,12 @@ class ApplicationController:
             self._active_chat_provider = candidate_provider
         self._settings_trusted = True
         self._chat_available = True
+        # This method is intentionally not connected to the P7G UI. Preserve
+        # the legacy rollback fixture semantics without allowing this adapter
+        # to replace the active task-level Profile router.
+        if not self._mock_chat:
+            self.conversation.set_provider(self.provider_router)
+            self.background_generation.set_provider(self.provider_router)
         self.data_service.set_provider_metadata(
             config_object.preset.value,
             config_object.model,
@@ -3299,7 +3898,13 @@ class ApplicationController:
         if self._privacy_mode:
             self.chat_panel.set_status("请先退出隐私模式。", kind="error")
             return
-        if self.provider_router.provider(ProviderCapability.MULTIMODAL) is None:
+        vision_profile = self.model_provider_settings.assigned_profile(ProviderRole.VISION)
+        if (
+            vision_profile is None
+            or not vision_profile.enabled
+            or not vision_profile.is_tested(ProviderRole.VISION)
+            or not self._profile_credential_available(vision_profile)
+        ):
             self.chat_panel.set_status(
                 "请先在设置中配置并启用图片与视觉模型。",
                 kind="error",
@@ -3776,7 +4381,6 @@ class ApplicationController:
     ) -> None:
         """Write privacy-safe local acceptance metadata without conversation text."""
 
-        del request_id
         turn_id = getattr(turn, "turn_id", "unknown")
         if str(turn_id) == self._active_visual_turn_id:
             self._active_visual_turn_id = None
@@ -3808,8 +4412,20 @@ class ApplicationController:
             provider_name = "explicit_mock"
             model_name = "scripted"
         else:
-            provider_name = self.provider_config.preset.value
-            model_name = self.provider_config.model
+            snapshot = self.provider_router.captured_snapshot(str(request_id))
+            if snapshot is not None:
+                provider_name = snapshot.provider_name
+                model_name = snapshot.model
+            else:
+                profile = self.model_provider_settings.assigned_profile(
+                    ProviderRole.CONVERSATION
+                )
+                provider_name = profile.display_name if profile is not None else None
+                model_name = (
+                    profile.model_for(ProviderRole.CONVERSATION)
+                    if profile is not None
+                    else None
+                )
         self.logger.info(
             "Conversation evidence provider=%s model=%s turn=%s attempt=%s status=%s "
             "latency_ms=%s category=%s",
@@ -3821,6 +4437,17 @@ class ApplicationController:
             elapsed_ms,
             category,
         )
+
+    def _bind_captured_provider_metadata(self, request_id: str, turn_id: str, _chunk: str) -> None:
+        """Use the first routed chunk to replace pre-request provider metadata."""
+
+        snapshot = self.provider_router.captured_snapshot(str(request_id))
+        if snapshot is not None:
+            self.data_service.bind_turn_provider_metadata(
+                str(turn_id),
+                snapshot.provider_name,
+                snapshot.model,
+            )
 
     def _on_conversation_state_changed(self, state: ConversationState) -> None:
         # The runner is also used by opt-in proactive greetings even when the

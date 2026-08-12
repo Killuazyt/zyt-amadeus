@@ -67,6 +67,17 @@ class SpeechNetworkRuntime(QObject):
         with self._lock:
             return len(self._tts_pending) + (1 if self._tts_active is not None else 0)
 
+    @property
+    def busy(self) -> bool:
+        """Whether an ASR or TTS task still owns the current service clients."""
+
+        with self._lock:
+            return bool(
+                self._asr_future is not None
+                or self._tts_active is not None
+                or self._tts_pending
+            )
+
     def set_services(
         self,
         transcriber: SpeechTranscriber,

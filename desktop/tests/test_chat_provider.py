@@ -577,7 +577,11 @@ def test_nonstream_response_body_has_a_hard_byte_limit() -> None:
         config,
         InMemoryCredentialStore("invalid-fake-key"),
         transport=httpx.MockTransport(
-            lambda _: httpx.Response(200, stream=FragmentedStream((oversized,)))
+            lambda _: httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=FragmentedStream((oversized,)),
+            )
         ),
     )
 

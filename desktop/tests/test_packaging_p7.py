@@ -112,6 +112,7 @@ def test_builtin_kurisu_packaging_pins_webp_notice_and_license_manifest() -> Non
 
     assert '"resources/builtin_pet/*.webp"' in pyproject
     assert '"resources/licenses/*.txt"' in pyproject
+    assert '"resources/provider_catalog/*.json"' in pyproject
     assert expected_hash in notice
     assert "NOASSERTION" in notice
     component_name = "Amadeus built-in Kurisu 4x high-resolution spritesheet derivative"
@@ -136,6 +137,7 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
         "resources/licenses/KURISU-ASSET-NOTICE.txt",
         "resources/licenses/KURISU-ICON-NOTICE.txt",
         "resources/licenses/runtime-license-manifest.json",
+        "resources/provider_catalog/providers.json",
     )
     wheel = tmp_path / "amadeus_desktop-0.7.0.dev7-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -190,6 +192,7 @@ def test_pyinstaller_spec_has_p7_resources_and_excludes_unselected_qt_plugins() 
     assert "AMADEUS_PYINSTALLER_BUILD_INFO" in source
     assert "AMADEUS_PYINSTALLER_ICON" in source
     assert 'version=str(desktop_root / "packaging" / "amadeus-version-info.txt")' in source
+    assert '"amadeus_desktop/resources/provider_catalog"' in source
     assert '"pyside6/plugins/imageformats/qpdf.dll"' in source
     assert '"pyside6/plugins/platforminputcontexts/qtvirtualkeyboardplugin.dll"' in source
 

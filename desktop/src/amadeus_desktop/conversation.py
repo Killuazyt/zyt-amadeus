@@ -583,6 +583,11 @@ class ConversationCoordinator(QObject):
             messages=prepared_prompt.messages,
             attachments=prepared_prompt.attachments,
             provider_route=prepared_prompt.provider_route,
+            provider_role=(
+                "vision"
+                if prepared_prompt.provider_route is ProviderRoute.MULTIMODAL
+                else "conversation"
+            ),
         )
         cancellation = CancellationToken()
         thread = QThread(self)

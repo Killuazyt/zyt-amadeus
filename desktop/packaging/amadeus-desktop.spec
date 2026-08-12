@@ -69,6 +69,10 @@ datas = [
         str(source_root / "amadeus_desktop" / "resources" / "licenses"),
         "amadeus_desktop/resources/licenses",
     ),
+    (
+        str(source_root / "amadeus_desktop" / "resources" / "provider_catalog"),
+        "amadeus_desktop/resources/provider_catalog",
+    ),
 ]
 binaries = []
 hiddenimports = ["pywintypes", "win32api", "win32cred", "win32timezone"]

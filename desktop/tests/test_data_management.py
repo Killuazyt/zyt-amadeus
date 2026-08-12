@@ -36,6 +36,7 @@ from amadeus_desktop.data_management import (
     apply_validated_restore,
     create_backup_archive,
     discard_staged_restore,
+    disable_provider_credential_reuse_for_restore,
     export_chat_json,
     export_memory_json,
     plan_factory_reset,
@@ -811,6 +812,46 @@ def test_staged_restore_replaces_database_and_settings_and_drops_sidecars(
         discard_staged_restore(payload)
 
 
+def test_restore_without_credential_reuse_disables_profiles_and_profile_voice(
+    tmp_path: Path,
+) -> None:
+    database = _seed_database(tmp_path / "source")
+    try:
+        settings = _settings()
+        profile = settings["model_providers"]["profiles"][0]
+        profile["enabled"] = True
+        fingerprint = "a" * 64
+        profile["test_fingerprints"] = {
+            role: fingerprint for role in ("conversation", "summary", "memory", "vision")
+        }
+        settings["provider_enabled"] = True
+        backup = create_backup_archive(
+            tmp_path / "provider-backup.amadeus-backup",
+            database_backup=lambda target: database.create_backup(target),
+            settings_snapshot=settings,
+            app_version=__version__,
+            created_at=FIXED_TIME,
+        )
+    finally:
+        database.close()
+    payload = stage_backup_for_restore(backup, tmp_path / "provider-stage")
+
+    try:
+        disabled = disable_provider_credential_reuse_for_restore(payload)
+        document = json.loads(disabled.settings_path.read_text(encoding="utf-8"))
+
+        assert all(
+            profile["enabled"] is False
+            and set(profile["test_fingerprints"].values()) == {""}
+            for profile in document["model_providers"]["profiles"]
+        )
+        assert document["provider_enabled"] is False
+        assert document["multimodal"]["enabled"] is False
+        assert disabled.staged_settings_sha256 != payload.staged_settings_sha256
+    finally:
+        discard_staged_restore(payload)
+
+
 def test_old_v5_database_and_v8_settings_backup_restores_then_migrates_to_p7f(
     tmp_path: Path,
 ) -> None:
@@ -854,7 +895,7 @@ def test_old_v5_database_and_v8_settings_backup_restores_then_migrates_to_p7f(
         finally:
             migrated_database.close()
         settings = SettingsRepository(paths.settings_file).load()
-        assert settings["schema_version"] == 9
+        assert settings["schema_version"] == CURRENT_SCHEMA_VERSION
         assert settings["memory"] == {
             "enabled": True,
             "deep_memory_enabled": True,

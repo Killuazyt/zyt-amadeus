@@ -18,7 +18,7 @@ import tempfile
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -36,6 +36,7 @@ from amadeus_desktop.settings import (
 )
 from amadeus_desktop.settings import (
     InvalidSettingsError,
+    SettingsError,
     SettingsRepository,
     validate_settings_document,
 )
@@ -835,7 +836,13 @@ def stage_backup_for_restore(
                 raise BackupValidationError("settings backup is invalid") from exc
         else:
             try:
-                SettingsRepository(settings_path).load()
+                # A legacy backup has no source-machine-bound P7G test
+                # fingerprints.  Migrate its Profiles, but require a fresh test
+                # rather than trusting credentials that happen to exist here.
+                SettingsRepository(
+                    settings_path,
+                    trust_legacy_provider_tests=False,
+                ).load()
             except Exception as exc:  # noqa: BLE001 - stable validation category only
                 raise BackupValidationError("settings backup cannot be migrated") from exc
 
@@ -867,6 +874,60 @@ def stage_backup_for_restore(
         if staging_root is not None:
             _remove_staging_root(staging_root, staging_parent)
         raise BackupValidationError("backup archive is invalid") from exc
+
+
+def disable_provider_credential_reuse_for_restore(
+    payload: ValidatedRestorePayload,
+) -> ValidatedRestorePayload:
+    """Prepare a validated restore whose model Profiles require explicit retesting.
+
+    This transforms only the private staged settings copy after the archive has
+    passed validation.  The source archive and every credential remain untouched.
+    """
+
+    if not isinstance(payload, ValidatedRestorePayload):
+        raise BackupValidationError("restore payload is invalid")
+    _validate_payload_paths(payload)
+    size, digest = _file_size_and_sha256(
+        payload.settings_path,
+        maximum_bytes=DEFAULT_BACKUP_LIMITS.settings_bytes,
+        error_type=BackupValidationError,
+    )
+    if size <= 0 or digest != payload.staged_settings_sha256:
+        raise BackupValidationError("staged settings changed after validation")
+    try:
+        document = _decode_json_object(
+            payload.settings_path.read_bytes(),
+            "staged settings",
+            error_type=BackupValidationError,
+        )
+        validate_settings_document(document)
+        model_providers = document["model_providers"]
+        for profile in model_providers["profiles"]:
+            profile["enabled"] = False
+            profile["test_fingerprints"] = {
+                role: "" for role in ("conversation", "summary", "memory", "vision")
+            }
+        document["provider_enabled"] = False
+        document["multimodal"]["enabled"] = False
+        document["multimodal"]["reuse_mimo_credential"] = False
+        voice = document["voice"]
+        if str(voice.get("credential_source", "")).startswith("profile:"):
+            voice["enabled"] = False
+            voice["credential_source"] = "independent"
+        SettingsRepository(payload.settings_path).save(document)
+    except (OSError, InvalidSettingsError, SettingsError, KeyError, TypeError) as exc:
+        raise BackupValidationError(
+            "restored provider settings could not be disabled safely"
+        ) from exc
+    new_size, new_digest = _file_size_and_sha256(
+        payload.settings_path,
+        maximum_bytes=DEFAULT_BACKUP_LIMITS.settings_bytes,
+        error_type=BackupValidationError,
+    )
+    if new_size <= 0:
+        raise BackupValidationError("disabled restored settings are empty")
+    return replace(payload, staged_settings_sha256=new_digest)
 
 
 def apply_validated_restore(

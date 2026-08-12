@@ -1,4 +1,4 @@
-"""Single-instance settings center for text, multimodal, voice, and visual controls."""
+"""Single-instance settings center for model profiles, voice, and visual controls."""
 
 from __future__ import annotations
 
@@ -32,8 +32,7 @@ from amadeus_desktop.ui.proactive_page import ProactivePage
 _PAGE_SPECS = (
     ("general", "常规"),
     ("pet", "桌宠"),
-    ("model", "对话模型"),
-    ("multimodal", "图片与视觉模型"),
+    ("model", "模型提供商"),
     ("voice", "语音"),
     ("visual", "屏幕与相机"),
     ("persona", "角色"),
@@ -90,7 +89,6 @@ class SettingsWindow(QDialog):
         self,
         model_page: QWidget,
         *,
-        multimodal_page: QWidget | None = None,
         voice_page: QWidget | None = None,
         visual_page: QWidget | None = None,
         general_page: GeneralSettingsPage | None = None,
@@ -117,7 +115,6 @@ class SettingsWindow(QDialog):
         self.general_page = general_page or GeneralSettingsPage()
         self.pet_page = pet_page or PetSettingsPage()
         self.model_page = model_page
-        self.multimodal_page = multimodal_page or QWidget()
         self.voice_page = voice_page or QWidget()
         self.visual_page = visual_page or QWidget()
         self.persona_page = persona_page or PersonaPage()
@@ -129,7 +126,6 @@ class SettingsWindow(QDialog):
             self.general_page,
             self.pet_page,
             self.model_page,
-            self.multimodal_page,
             self.voice_page,
             self.visual_page,
             self.persona_page,
@@ -179,9 +175,6 @@ class SettingsWindow(QDialog):
         embedded_close = getattr(self.model_page, "close_button", None)
         if isinstance(embedded_close, QWidget):
             embedded_close.hide()
-        multimodal_close = getattr(self.multimodal_page, "close_button", None)
-        if isinstance(multimodal_close, QWidget):
-            multimodal_close.hide()
 
         self.navigation.currentRowChanged.connect(self._on_page_changed)
         self.navigation.setCurrentRow(0)
@@ -292,9 +285,6 @@ class SettingsWindow(QDialog):
         cancel = getattr(self.model_page, "cancel_test", None)
         if callable(cancel):
             cancel()
-        cancel_multimodal = getattr(self.multimodal_page, "cancel_test", None)
-        if callable(cancel_multimodal):
-            cancel_multimodal()
         for page in self._pages:
             cancel_transient = getattr(page, "cancel_transient_work", None)
             if callable(cancel_transient):

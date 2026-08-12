@@ -826,6 +826,7 @@ def _prepare_summary(conversations: ConversationStore, job: BackgroundJob) -> _P
             temperature=0.2,
             max_output_tokens=1_200,
         ),
+        provider_role="summary",
     )
     return _PreparedJob(
         request=request,
@@ -914,6 +915,7 @@ def _prepare_extraction(
             temperature=0.1,
             max_output_tokens=1_600,
         ),
+        provider_role="memory",
     )
     return _PreparedJob(request=request, sources=sources)
 
@@ -975,6 +977,7 @@ def _repair_request(job: BackgroundJob, invalid_output: str) -> ChatRequest:
             temperature=0.0,
             max_output_tokens=1_600,
         ),
+        provider_role="memory",
     )
 
 

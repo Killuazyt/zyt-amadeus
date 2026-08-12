@@ -18,10 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from amadeus_desktop.audio_runtime import AudioDeviceCatalog, AudioDeviceInfo
-from amadeus_desktop.provider_config import (
-    MULTIMODAL_CREDENTIAL_REF,
-    PROVIDER_CREDENTIAL_REF,
-)
+from amadeus_desktop.provider_profiles import ProviderProfile
 
 
 class VoiceSettingsPage(QWidget):
@@ -35,6 +32,7 @@ class VoiceSettingsPage(QWidget):
         has_own_secret: bool,
         text_credential_reusable: bool,
         multimodal_credential_reusable: bool,
+        reusable_mimo_profiles: tuple[ProviderProfile, ...] = (),
     ) -> None:
         super().__init__()
         self._catalog = catalog
@@ -48,12 +46,11 @@ class VoiceSettingsPage(QWidget):
         self.hands_free_check.setChecked(bool(settings["hands_free_enabled"]))
         self.credential_source = QComboBox()
         self.credential_source.addItem("独立 MiMo 语音密钥", "independent")
-        if text_credential_reusable:
-            self.credential_source.addItem("复用相同 MiMo 对话密钥", PROVIDER_CREDENTIAL_REF)
-        if multimodal_credential_reusable:
+        del text_credential_reusable, multimodal_credential_reusable
+        for profile in reusable_mimo_profiles:
             self.credential_source.addItem(
-                "复用相同 MiMo 多模态密钥",
-                MULTIMODAL_CREDENTIAL_REF,
+                f"复用 MiMo PAYG Profile：{profile.display_name}",
+                f"profile:{profile.profile_id}",
             )
         self.secret_edit = QLineEdit()
         self.secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -104,6 +101,28 @@ class VoiceSettingsPage(QWidget):
         self.credential_source.currentIndexChanged.connect(self._sync_secret_enabled)
         self._reload_devices()
         self._select_data(self.credential_source, str(settings["credential_source"]))
+        self._sync_secret_enabled()
+
+    def update_reusable_mimo_profiles(
+        self,
+        profiles: tuple[ProviderProfile, ...],
+        *,
+        selected_source: str | None = None,
+    ) -> None:
+        """Refresh profile-backed voice choices after one provider transaction."""
+
+        selected = selected_source or str(self.credential_source.currentData() or "independent")
+        self.credential_source.blockSignals(True)
+        self.credential_source.clear()
+        self.credential_source.addItem("独立 MiMo 语音密钥", "independent")
+        for profile in profiles:
+            self.credential_source.addItem(
+                f"复用 MiMo PAYG Profile：{profile.display_name}",
+                f"profile:{profile.profile_id}",
+            )
+        if not self._select_data(self.credential_source, selected):
+            self.credential_source.setCurrentIndex(0)
+        self.credential_source.blockSignals(False)
         self._sync_secret_enabled()
 
     def apply_save_result(self, *, success: bool, message: str) -> None:
