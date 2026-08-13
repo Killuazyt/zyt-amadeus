@@ -12,7 +12,9 @@ P7F adds N.E.K.O.-inspired working, recent, fact/event, reflection, and persona-
 
 ## P7G validation status
 
-P7G is currently an implementation snapshot, not an accepted phase. Its provider catalog, Profile management, protocol adapters, task routing, migration, credential, backup, reset, packaging, and regression tests have been added, but pytest, Ruff, compileall, GUI/hardware smoke, Python package, onedir, installer, and CI verification have not been run for this snapshot. No real remote or local model endpoint has been contacted. A later verification pass must run the fake-credential/mock-transport tests and the complete P7C-P7F regression suite before P7G can be marked complete; real endpoint checks require separate user authorization. P8 remains unstarted and separate from this work.
+P7G local acceptance completed on 2026-08-13. The focused fake-credential/mock-transport, migration, credential, routing, settings, backup, and UI suite passed `212` tests; the final complete desktop suite passed `952` tests with `3` environment-specific skips. Ruff, format verification, `compileall`, `pip check`, Python wheel/sdist asset verification, tracked-source and artifact privacy scans, FTS-degraded onedir, fixed-model bundled onedir, WinCred probe, and the bundled `20/20` lifecycle matrix all passed. The unsigned Inno Setup 6.7.3 installer built successfully from the clean code candidate and has SHA-256 `853f31a44b5b7766c2587c82d7fa6941f7418b0266a44575877328892fee41e1`.
+
+The provider center also passed a real Windows display smoke on a `2048 x 1152`, DPR `1.25` screen: all 21 catalog entries loaded without degraded recovery, the Profile CRUD/test/save controls and four task assignments were visible, no connection test or credential access started, and visual inspection found no overlap or clipping. No real remote or local provider endpoint was contacted; such connectivity checks still require separate explicit authorization. P8 remains unstarted and separate from this work.
 
 ## Development
 
