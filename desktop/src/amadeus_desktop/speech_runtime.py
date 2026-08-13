@@ -73,9 +73,7 @@ class SpeechNetworkRuntime(QObject):
 
         with self._lock:
             return bool(
-                self._asr_future is not None
-                or self._tts_active is not None
-                or self._tts_pending
+                self._asr_future is not None or self._tts_active is not None or self._tts_pending
             )
 
     def set_services(

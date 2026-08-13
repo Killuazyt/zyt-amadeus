@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -71,14 +72,11 @@ _PROTOCOL_LABELS = {
     ProviderProtocol.OPENAI_CHAT_COMPLETIONS: "OpenAI Chat Completions",
     ProviderProtocol.ANTHROPIC_MESSAGES: "Anthropic Messages",
 }
-_TEST_PIXEL = (
-    "data:image/png;base64,"
-    + base64.b64encode(
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\xd7c\xf8\xcf"
-        b"\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
-    ).decode("ascii")
-)
+_TEST_PIXEL = "data:image/png;base64," + base64.b64encode(
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\xd7c\xf8\xcf"
+    b"\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
+).decode("ascii")
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,9 +115,7 @@ class _ProfileTestWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            result = asyncio.run(
-                self._run_test()
-            )
+            result = asyncio.run(self._run_test())
             self.succeeded.emit(
                 self._profile.profile_id,
                 self._role.value,
@@ -150,7 +146,10 @@ class _ProfileTestWorker(QObject):
         # Compatibility for injected P4 test doubles; production always uses
         # ProviderConnectionTester.test_profile and the exact captured snapshot.
         legacy_test = getattr(self._tester, "test", None)
-        if not callable(legacy_test) or snapshot.protocol is not ProviderProtocol.OPENAI_CHAT_COMPLETIONS:
+        if (
+            not callable(legacy_test)
+            or snapshot.protocol is not ProviderProtocol.OPENAI_CHAT_COMPLETIONS
+        ):
             raise RuntimeError("unsupported injected provider tester")
         from amadeus_desktop.provider_config import AuthMode, ProviderConfig, ProviderPreset
 
@@ -182,6 +181,7 @@ class ProviderSettingsPage(QWidget):
         *,
         credential_store_factory: Callable[[ProviderProfile], CredentialStore],
         tester: ProviderConnectionTester | None = None,
+        blocked_saved_credential_profile_ids: Iterable[str] = (),
     ) -> None:
         super().__init__()
         self.catalog = catalog
@@ -198,6 +198,7 @@ class ProviderSettingsPage(QWidget):
         self._test_thread: QThread | None = None
         self._test_worker: _ProfileTestWorker | None = None
         self._test_cancel: CancellationToken | None = None
+        self._blocked_saved_credential_profiles = set(blocked_saved_credential_profile_ids)
 
         self.profile_list = QListWidget()
         self.profile_list.setAccessibleName("模型提供商 Profile")
@@ -369,11 +370,23 @@ class ProviderSettingsPage(QWidget):
     def shutdown(self, wait_ms: int = 2_000) -> bool:
         self.cancel_test()
         thread = self._test_thread
-        return thread is None or not thread.isRunning() or thread.wait(max(0, wait_ms))
+        if thread is None:
+            return True
+        deadline = time.monotonic() + max(0, wait_ms) / 1_000
+        while thread.isRunning():
+            remaining_ms = max(0, round((deadline - time.monotonic()) * 1_000))
+            if remaining_ms <= 0 or not thread.wait(remaining_ms):
+                return False
+        # The queued ``thread.finished`` slot cannot run while the main UI
+        # thread is synchronously draining shutdown. Clear the completed
+        # worker references here so ``test_running`` reflects the real state.
+        self._clear_finished_test(thread)
+        return True
 
     def apply_save_result(self, *, success: bool, message: str) -> None:
         self._saving = False
         if success:
+            self._blocked_saved_credential_profiles.difference_update(self._secret_updates)
             self._settings = ProviderSettings(
                 tuple(self._profiles), MappingProxyType(dict(self._assignments))
             )
@@ -405,9 +418,15 @@ class ProviderSettingsPage(QWidget):
         self._deleted_profiles.clear()
         self._refresh_lists(select=0)
 
-    def require_new_secret(self) -> None:
+    def require_new_secret(self, *profile_ids: str) -> None:
         """Compatibility-safe fail-closed marker used by rollback recovery."""
 
+        targets = profile_ids or tuple(
+            profile.profile_id
+            for profile in self._profiles
+            if profile.credential_slot in {"legacy_chat", "legacy_vision"}
+        )
+        self._blocked_saved_credential_profiles.update(targets)
         self._secret_updates.clear()
         self._tested_secret_fingerprints.clear()
         self.secret_edit.clear()
@@ -419,14 +438,13 @@ class ProviderSettingsPage(QWidget):
         self.profile_list.clear()
         for profile in self._profiles:
             roles = [
-                role.value for role, profile_id in self._assignments.items()
+                role.value
+                for role, profile_id in self._assignments.items()
                 if profile_id == profile.profile_id
             ]
             state = "启用" if profile.enabled else "停用"
             tested = sum(
-                1
-                for role in ProviderRole
-                if profile.model_for(role) and profile.is_tested(role)
+                1 for role in ProviderRole if profile.model_for(role) and profile.is_tested(role)
             )
             configured = sum(1 for role in ProviderRole if profile.model_for(role))
             entry = self.catalog.entries.get(profile.catalog_id)
@@ -545,13 +563,17 @@ class ProviderSettingsPage(QWidget):
             self.auth_value.clear()
             if entry.custom_endpoint:
                 allowed_auth = (
-                    ProviderAuth.BEARER,
-                    ProviderAuth.API_KEY,
-                    ProviderAuth.NONE,
-                ) if entry.protocol is ProviderProtocol.OPENAI_CHAT_COMPLETIONS else (
-                    ProviderAuth.ANTHROPIC_X_API_KEY,
-                    ProviderAuth.BEARER,
-                    ProviderAuth.NONE,
+                    (
+                        ProviderAuth.BEARER,
+                        ProviderAuth.API_KEY,
+                        ProviderAuth.NONE,
+                    )
+                    if entry.protocol is ProviderProtocol.OPENAI_CHAT_COMPLETIONS
+                    else (
+                        ProviderAuth.ANTHROPIC_X_API_KEY,
+                        ProviderAuth.BEARER,
+                        ProviderAuth.NONE,
+                    )
                 )
             else:
                 allowed_auth = (entry.auth,)
@@ -563,7 +585,8 @@ class ProviderSettingsPage(QWidget):
             self.endpoint_combo.clear()
             for endpoint in entry.endpoints:
                 self.endpoint_combo.addItem(endpoint, endpoint)
-            self.endpoint_combo.setCurrentIndex(max(0, self.endpoint_combo.findData(profile.base_url)))
+            endpoint_index = self.endpoint_combo.findData(profile.base_url)
+            self.endpoint_combo.setCurrentIndex(max(0, endpoint_index))
             self.endpoint_edit.setText(profile.base_url)
             self.endpoint_combo.setVisible(not entry.custom_endpoint and len(entry.endpoints) > 1)
             self.endpoint_edit.setVisible(entry.custom_endpoint or len(entry.endpoints) <= 1)
@@ -572,9 +595,7 @@ class ProviderSettingsPage(QWidget):
             self.secret_edit.setEnabled(profile.auth is not ProviderAuth.NONE)
             for role, edit in self.role_models.items():
                 edit.setText(profile.model_for(role))
-                edit.setEnabled(
-                    role is not ProviderRole.VISION or entry.capabilities.image_input
-                )
+                edit.setEnabled(role is not ProviderRole.VISION or entry.capabilities.image_input)
             self.connect_timeout.setValue(round(profile.connect_timeout_seconds))
             self.request_timeout.setValue(round(profile.request_timeout_seconds))
             self.first_chunk_timeout.setValue(round(profile.first_chunk_timeout_seconds))
@@ -618,9 +639,7 @@ class ProviderSettingsPage(QWidget):
         current = self._profiles[row]
         catalog_id = self.catalog_combo.currentData()
         if not isinstance(catalog_id, str) or catalog_id not in self.catalog.entries:
-            raise ProviderProfileError(
-                "目录契约不可用；请先明确切换为安全自定义类型。"
-            )
+            raise ProviderProfileError("目录契约不可用；请先明确切换为安全自定义类型。")
         entry = self.catalog.entry(catalog_id)
         endpoint = (
             self.endpoint_edit.text().strip()
@@ -828,9 +847,7 @@ class ProviderSettingsPage(QWidget):
             return
         cancellation = CancellationToken()
         thread = QThread(self)
-        worker = _ProfileTestWorker(
-            self._tester, profile, role, self.catalog, secret, cancellation
-        )
+        worker = _ProfileTestWorker(self._tester, profile, role, self.catalog, secret, cancellation)
         worker.moveToThread(thread)
         self._test_thread = thread
         self._test_worker = worker
@@ -881,8 +898,7 @@ class ProviderSettingsPage(QWidget):
                     accepted = True
                 except (CredentialStoreError, ProviderProfileError):
                     self.status.setText(
-                        "连接已返回，但当前配置、凭据或本机绑定无法复核；"
-                        "Profile 未标记为已测试。"
+                        "连接已返回，但当前配置、凭据或本机绑定无法复核；Profile 未标记为已测试。"
                     )
                     return
                 break
@@ -919,14 +935,19 @@ class ProviderSettingsPage(QWidget):
         if thread is None:
             return
         thread.wait()
-        thread.deleteLater()
-        self._test_thread = None
-        self._test_worker = None
-        self._test_cancel = None
+        self._clear_finished_test(thread)
         row = self.profile_list.currentRow()
         if 0 <= row < len(self._profiles):
             self._sync_test_status(self._profiles[row], preserve=True)
         self._sync_buttons()
+
+    def _clear_finished_test(self, thread: QThread) -> None:
+        if self._test_thread is not thread:
+            return
+        thread.deleteLater()
+        self._test_thread = None
+        self._test_worker = None
+        self._test_cancel = None
 
     def _effective_secret(self, profile: ProviderProfile) -> str:
         if profile.auth is ProviderAuth.NONE:
@@ -936,6 +957,8 @@ class ProviderSettingsPage(QWidget):
             if candidate.casefold().startswith("tp-") or "\x00" in candidate:
                 raise ProviderProfileError("密钥格式无效或属于禁止的 Token Plan。")
             return candidate
+        if profile.profile_id in self._blocked_saved_credential_profiles:
+            raise ProviderProfileError("请输入对应的新 API 密钥并重新完成连接测试。")
         try:
             secret = self._credential_store_factory(profile).read_secret()
         except CredentialStoreError:
@@ -949,12 +972,7 @@ class ProviderSettingsPage(QWidget):
         if not raw:
             return None
         secret = raw.strip()
-        if (
-            not secret
-            or secret != raw
-            or "\x00" in secret
-            or secret.casefold().startswith("tp-")
-        ):
+        if not secret or secret != raw or "\x00" in secret or secret.casefold().startswith("tp-"):
             raise ProviderProfileError("密钥格式无效或属于禁止的 Token Plan。")
         return secret
 
@@ -972,30 +990,24 @@ class ProviderSettingsPage(QWidget):
                     self._tested_secret_fingerprints.pop(candidate.profile_id, None)
                     candidate = candidate.invalidate_tests()
                 self._profiles[row] = candidate
-            settings = ProviderSettings(
-                tuple(self._profiles), MappingProxyType(dict(self._assignments))
-            ).validated(self.catalog).require_assigned_tests()
+            settings = (
+                ProviderSettings(tuple(self._profiles), MappingProxyType(dict(self._assignments)))
+                .validated(self.catalog)
+                .require_assigned_tests()
+            )
             for role, profile_id in self._assignments.items():
                 if profile_id is None:
                     continue
                 profile = settings.profile(profile_id)
                 if profile is None or not profile.enabled:
-                    raise ProviderProfileError(
-                        f"{_ROLE_LABELS[role]}分配的 Profile 尚未启用。"
-                    )
+                    raise ProviderProfileError(f"{_ROLE_LABELS[role]}分配的 Profile 尚未启用。")
                 if profile.auth is not ProviderAuth.NONE:
                     self._effective_secret(profile)
             assigned_secret_updates = set(self._secret_updates).intersection(
-                profile_id
-                for profile_id in self._assignments.values()
-                if profile_id is not None
+                profile_id for profile_id in self._assignments.values() if profile_id is not None
             )
-            if not assigned_secret_updates.issubset(
-                self._tested_secret_fingerprints
-            ):
-                raise ProviderProfileError(
-                    "新密钥必须先完成当前被分配模型的连接测试。"
-                )
+            if not assigned_secret_updates.issubset(self._tested_secret_fingerprints):
+                raise ProviderProfileError("新密钥必须先完成当前被分配模型的连接测试。")
         except (ProviderProfileError, ValueError) as exc:
             self.status.setText(str(exc))
             return
@@ -1033,9 +1045,7 @@ class ProviderSettingsPage(QWidget):
             not busy and bool(self.catalog.entries) and len(self._profiles) < MAX_PROVIDER_PROFILES
         )
         self.copy_button.setEnabled(
-            not busy
-            and known_profile
-            and len(self._profiles) < MAX_PROVIDER_PROFILES
+            not busy and known_profile and len(self._profiles) < MAX_PROVIDER_PROFILES
         )
         self.delete_button.setEnabled(not busy and bool(self._profiles))
 
@@ -1059,11 +1069,18 @@ class ProviderSettingsPage(QWidget):
     @staticmethod
     def _capability_text(entry) -> str:
         capabilities = entry.capabilities
+        reasoning = (
+            "可关闭"
+            if capabilities.reasoning_can_disable
+            else "可能存在但无独立开关"
+            if capabilities.reasoning
+            else "未登记"
+        )
         return (
             f"流式：{'是' if capabilities.streaming else '否'}；"
             f"图片：{'是' if capabilities.image_input else '否'}；"
             "原生文件：否（文档由 Amadeus 本地抽取文本）；"
-            f"推理：{'可关闭' if capabilities.reasoning_can_disable else '可能存在但无独立开关' if capabilities.reasoning else '未登记'}；"
+            f"推理：{reasoning}；"
             f"建议上下文 {capabilities.suggested_context_tokens}，"
             f"建议输出 {capabilities.suggested_output_tokens}；"
             f"首包/空闲建议 {capabilities.first_chunk_timeout_seconds}/"

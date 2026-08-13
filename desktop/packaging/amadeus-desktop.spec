@@ -40,6 +40,7 @@ RUNTIME_DISTRIBUTIONS = (
     "packaging",
     "pillow",
     "protobuf",
+    "pypdf",
     "py-rust-stemmers",
     "PySide6",
     "PySide6-Addons",

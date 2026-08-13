@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from importlib import resources
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
@@ -15,10 +15,8 @@ def create_app_icon() -> QIcon:
 
     try:
         payload = (
-            resources.files("amadeus_desktop.resources")
-            .joinpath("app_icon", "amadeus-kurisu.png")
-            .read_bytes()
-        )
+            Path(__file__).resolve().parents[1] / "resources" / "app_icon" / "amadeus-kurisu.png"
+        ).read_bytes()
     except OSError:
         return _create_fallback_icon()
 

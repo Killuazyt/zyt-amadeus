@@ -8,10 +8,11 @@ import math
 import os
 import platform
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from types import MappingProxyType
-from typing import Any, Mapping, Self
+from typing import Any, Self
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -19,8 +20,8 @@ from amadeus_desktop.provider_catalog import (
     CachePolicy,
     ProviderAuth,
     ProviderCatalog,
-    ProviderCatalogError,
     ProviderCatalogEntry,
+    ProviderCatalogError,
     ProviderProtocol,
     ProviderRole,
     ReasoningPolicy,
@@ -205,7 +206,10 @@ class ProviderProfile:
         }
 
     def validated(self, catalog: ProviderCatalog | None = None) -> Self:
-        if not isinstance(self.profile_id, str) or PROFILE_ID_PATTERN.fullmatch(self.profile_id) is None:
+        if (
+            not isinstance(self.profile_id, str)
+            or PROFILE_ID_PATTERN.fullmatch(self.profile_id) is None
+        ):
             raise ProviderProfileError("Provider profile id is invalid.")
         if not isinstance(self.catalog_id, str) or len(self.catalog_id) > 48:
             raise ProviderProfileError("Provider catalog id is invalid.")
@@ -218,9 +222,13 @@ class ProviderProfile:
         if self.credential_slot not in _CREDENTIAL_SLOTS:
             raise ProviderProfileError("Provider credential slot is invalid.")
         if self.credential_slot == "legacy_chat" and self.profile_id != LEGACY_CHAT_PROFILE_ID:
-            raise ProviderProfileError("Legacy chat credential slot is bound to its migration profile.")
+            raise ProviderProfileError(
+                "Legacy chat credential slot is bound to its migration profile."
+            )
         if self.credential_slot == "legacy_vision" and self.profile_id != LEGACY_VISION_PROFILE_ID:
-            raise ProviderProfileError("Legacy vision credential slot is bound to its migration profile.")
+            raise ProviderProfileError(
+                "Legacy vision credential slot is bound to its migration profile."
+            )
         if not isinstance(self.models, Mapping) or set(self.models) != set(ProviderRole):
             raise ProviderProfileError("Provider model slots are invalid.")
         for model in self.models.values():
@@ -260,7 +268,9 @@ class ProviderProfile:
         if self.auth is ProviderAuth.NONE:
             hostname = urlsplit(self.base_url).hostname
             if hostname is None or hostname.rstrip(".").casefold() not in _LOOPBACK_HOSTS:
-                raise ProviderProfileError("Unauthenticated providers must use a loopback endpoint.")
+                raise ProviderProfileError(
+                    "Unauthenticated providers must use a loopback endpoint."
+                )
         if catalog is not None:
             entry = catalog.entry(self.catalog_id)
             if self.protocol is not entry.protocol:
@@ -279,9 +289,8 @@ class ProviderProfile:
                     raise ProviderProfileError("Custom provider authentication is invalid.")
             elif self.auth is not entry.auth:
                 raise ProviderProfileError("Built-in authentication cannot be changed.")
-            if not entry.custom_endpoint:
-                if self.base_url not in entry.endpoints:
-                    raise ProviderProfileError("Built-in endpoint is not in the catalog.")
+            if not entry.custom_endpoint and self.base_url not in entry.endpoints:
+                raise ProviderProfileError("Built-in endpoint is not in the catalog.")
             if self.stream_enabled and not entry.capabilities.streaming:
                 raise ProviderProfileError("Provider does not support streaming.")
             if self.models.get(ProviderRole.VISION) and not entry.capabilities.image_input:
@@ -320,14 +329,14 @@ class ProviderProfile:
             "test_kind": "vision" if role is ProviderRole.VISION else "text",
             "model": model,
             "timeouts": [
-                self.connect_timeout_seconds,
-                self.request_timeout_seconds,
-                self.first_chunk_timeout_seconds,
-                self.idle_timeout_seconds,
+                float(self.connect_timeout_seconds),
+                float(self.request_timeout_seconds),
+                float(self.first_chunk_timeout_seconds),
+                float(self.idle_timeout_seconds),
             ],
             "max_output_tokens": self.max_output_tokens,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
+            "temperature": float(self.temperature),
+            "top_p": float(self.top_p),
             "stream": self.stream_enabled,
             "cache": self.cache_enabled,
         }
@@ -413,9 +422,7 @@ class ProviderSettings:
     def to_mapping(self) -> dict[str, Any]:
         return {
             "profiles": [profile.to_mapping() for profile in self.profiles],
-            "assignments": {
-                role.value: self.assignments.get(role) for role in ProviderRole
-            },
+            "assignments": {role.value: self.assignments.get(role) for role in ProviderRole},
         }
 
     def validated(self, catalog: ProviderCatalog) -> Self:
@@ -702,9 +709,7 @@ def current_machine_binding_digest() -> str:
         material = f"{platform.system()}\0{platform.node()}\0{platform.machine()}"
         if not material.strip("\0"):
             raise ProviderProfileError("Provider machine binding is unavailable.")
-    return hashlib.sha256(
-        f"Amadeus/P7G/provider-test-binding\0{material}".encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(f"Amadeus/P7G/provider-test-binding\0{material}".encode()).hexdigest()
 
 
 def _legacy_catalog_id(config: ProviderConfig) -> str:
@@ -727,7 +732,12 @@ def normalize_provider_base_url(value: object) -> str:
         raise ProviderProfileError("Provider URL is invalid.") from None
     if parsed.scheme not in {"https", "http"} or not parsed.netloc or not parsed.hostname:
         raise ProviderProfileError("Provider URL requires an HTTP(S) host.")
-    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ProviderProfileError("Provider URL contains forbidden URL components.")
     if "%" in parsed.netloc:
         raise ProviderProfileError("Provider URL host must not be percent-encoded.")
@@ -766,9 +776,7 @@ def transient_credential_fingerprint(secret: str) -> str:
     try:
         encoded = secret.encode("utf-8")
     except UnicodeEncodeError:
-        raise ProviderProfileError(
-            "Provider credential fingerprint input is invalid."
-        ) from None
+        raise ProviderProfileError("Provider credential fingerprint input is invalid.") from None
     return hashlib.sha256(b"Amadeus/P7G/connection-test\0" + encoded).hexdigest()
 
 

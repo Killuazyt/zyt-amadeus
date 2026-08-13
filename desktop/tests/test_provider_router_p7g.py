@@ -22,7 +22,7 @@ from amadeus_desktop.chat_provider import (
     ProviderErrorCode,
 )
 from amadeus_desktop.credential_store import InMemoryCredentialStore
-from amadeus_desktop.provider_catalog import ProviderRole, load_provider_catalog
+from amadeus_desktop.provider_catalog import ProviderAuth, ProviderRole, load_provider_catalog
 from amadeus_desktop.provider_profiles import ProviderProfile, ProviderSettings
 from amadeus_desktop.provider_router import ProviderRouter, required_role
 
@@ -45,7 +45,7 @@ def _request(
 
 
 @pytest.mark.parametrize(
-    "request,expected",
+    "chat_request,expected",
     [
         (_request("conversation"), ProviderRole.CONVERSATION),
         (
@@ -66,8 +66,8 @@ def _request(
         ),
     ],
 )
-def test_locked_task_routes(request, expected) -> None:
-    assert required_role(request) is expected
+def test_locked_task_routes(chat_request, expected) -> None:
+    assert required_role(chat_request) is expected
 
 
 def test_image_content_has_priority_over_an_explicit_text_role() -> None:
@@ -90,6 +90,7 @@ def _settings() -> tuple[ProviderSettings, object]:
         display_name="Conversation Profile",
         enabled=True,
         base_url="https://conversation.invalid/v1",
+        auth=ProviderAuth.BEARER,
         models=MappingProxyType(
             {
                 ProviderRole.CONVERSATION: "conversation-model",
@@ -102,9 +103,7 @@ def _settings() -> tuple[ProviderSettings, object]:
     conversation = replace(
         conversation,
         test_fingerprints=MappingProxyType(
-            {
-                role: conversation.test_fingerprint(role) for role in ProviderRole
-            }
+            {role: conversation.test_fingerprint(role) for role in ProviderRole}
         ),
     )
     vision = replace(

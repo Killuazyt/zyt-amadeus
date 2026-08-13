@@ -81,6 +81,7 @@ def test_factory_reset_cleanup_deletes_only_fixed_and_enumerated_amadeus_targets
         "_enumerate_dynamic_profile_targets",
         lambda: (dynamic,) if dynamic in existing else (),
     )
+
     def delete(target: str) -> None:
         deleted.append(target)
         existing.discard(target)

@@ -48,10 +48,7 @@ def _request(content="hello") -> ChatRequest:
 def _collect(provider, request: ChatRequest | None = None) -> list[str]:
     async def run() -> list[str]:
         return [
-            chunk
-            async for chunk in provider.stream(
-                request or _request(), CancellationToken()
-            )
+            chunk async for chunk in provider.stream(request or _request(), CancellationToken())
         ]
 
     return asyncio.run(run())
@@ -100,7 +97,10 @@ def test_every_openai_preset_emits_its_locked_endpoint_auth_and_token_contract(
 ) -> None:
     catalog = load_provider_catalog()
     entry = catalog.entry(catalog_id)
-    profile = ProviderProfile.from_catalog(entry, profile_id=f"contract-{catalog_id}")
+    profile = ProviderProfile.from_catalog(
+        entry,
+        profile_id=f"contract-{catalog_id.replace('_', '-')}",
+    )
     if not profile.model_for(ProviderRole.CONVERSATION):
         profile = replace(
             profile,
@@ -261,16 +261,16 @@ def test_anthropic_sse_is_converted_to_plain_visible_chunks() -> None:
     )
     snapshot = request_snapshot(profile, ProviderRole.CONVERSATION, catalog)
     events = (
-        'data: {"type":"message_start","message":{"id":"msg"}}\n\n'
-        'data: {"type":"content_block_start","index":0,'
-        '"content_block":{"type":"text"}}\n\n'
-        'data: {"type":"content_block_delta","index":0,'
-        '"delta":{"type":"text_delta","text":"A"}}\n\n'
-        'data: {"type":"content_block_delta","index":0,'
-        '"delta":{"type":"text_delta","text":"B"}}\n\n'
-        'data: {"type":"content_block_stop","index":0}\n\n'
-        'data: {"type":"message_stop"}\n\n'
-    ).encode()
+        b'data: {"type":"message_start","message":{"id":"msg"}}\n\n'
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"text"}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"A"}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"B"}}\n\n'
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
 
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -295,9 +295,9 @@ def test_anthropic_stream_maps_max_token_termination_to_a_safe_model_error() -> 
     )
     snapshot = request_snapshot(profile, ProviderRole.CONVERSATION, catalog)
     events = (
-        'data: {"type":"message_start","message":{"id":"msg"}}\n\n'
-        'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n'
-    ).encode()
+        b'data: {"type":"message_start","message":{"id":"msg"}}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n'
+    )
 
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -324,14 +324,14 @@ def test_anthropic_stream_rejects_content_before_message_start_and_boolean_index
     )
     snapshot = request_snapshot(profile, ProviderRole.CONVERSATION, catalog)
     invalid_streams = (
-        'data: {"type":"content_block_start","index":0,'
-        '"content_block":{"type":"text"}}\n\n',
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}\n\n',
         'data: {"type":"message_start","message":{"id":"msg"}}\n\n'
         'data: {"type":"content_block_start","index":true,'
         '"content_block":{"type":"text"}}\n\n',
     )
 
     for events in invalid_streams:
+
         async def handler(
             _request: httpx.Request,
             body: bytes = events.encode(),
@@ -422,7 +422,7 @@ def test_nonstream_protocols_reject_non_json_success_responses(catalog_id) -> No
         return httpx.Response(
             200,
             headers={"content-type": "text/plain"},
-            content=b'not-a-provider-json-response',
+            content=b"not-a-provider-json-response",
         )
 
     provider = build_profile_provider(
@@ -557,9 +557,7 @@ def test_profile_provider_honors_preflight_cancellation() -> None:
         provider = build_profile_provider(
             snapshot,
             InMemoryCredentialStore("invalid-fake-provider-key"),
-            transport=httpx.MockTransport(
-                lambda _request: httpx.Response(500, json={"error": {}})
-            ),
+            transport=httpx.MockTransport(lambda _request: httpx.Response(500, json={"error": {}})),
         )
         async for _chunk in provider.stream(_request(), token):
             pass

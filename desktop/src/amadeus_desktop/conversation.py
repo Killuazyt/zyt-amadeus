@@ -23,6 +23,7 @@ from amadeus_desktop.chat_models import (
     PreparedPrompt,
     PromptMessage,
     PromptRole,
+    ProviderRoute,
     TurnTerminalReason,
 )
 from amadeus_desktop.chat_provider import (

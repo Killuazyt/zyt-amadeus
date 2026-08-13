@@ -8,12 +8,12 @@ small built-in recovery catalog so the settings center remains usable.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from importlib import resources
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import SplitResult, unquote, urlsplit, urlunsplit
 
 CATALOG_SCHEMA_VERSION = 1
@@ -144,8 +144,11 @@ def load_provider_catalog(path: Path | None = None) -> ProviderCatalog:
 
     try:
         if path is None:
-            resource = resources.files("amadeus_desktop.resources").joinpath(
-                "provider_catalog/providers.json"
+            resource = (
+                Path(__file__).resolve().parent
+                / "resources"
+                / "provider_catalog"
+                / "providers.json"
             )
             with resource.open("r", encoding="utf-8") as handle:
                 document = json.load(handle)
@@ -258,9 +261,7 @@ def _parse_entry(raw: object) -> ProviderCatalogEntry:
         raise ProviderCatalogError("Reasoning disable capability and policy are inconsistent.")
     context_tokens = _safe_integer(raw["context_tokens"], 1, 16_777_216)
     output_tokens = _safe_integer(raw["output_tokens"], 1, 1_048_576)
-    first_chunk_timeout_seconds = _safe_integer(
-        raw["first_chunk_timeout_seconds"], 1, 300
-    )
+    first_chunk_timeout_seconds = _safe_integer(raw["first_chunk_timeout_seconds"], 1, 300)
     idle_timeout_seconds = _safe_integer(raw["idle_timeout_seconds"], 1, 300)
     if output_tokens > context_tokens:
         raise ProviderCatalogError("Suggested output tokens exceed the context window.")
@@ -369,7 +370,12 @@ def _safe_endpoint(value: Any) -> str:
         raise ProviderCatalogError("Provider catalog endpoint is invalid.") from None
     if parsed.scheme not in {"https", "http"} or not parsed.netloc or not parsed.hostname:
         raise ProviderCatalogError("Provider catalog endpoint requires an HTTP(S) host.")
-    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ProviderCatalogError("Provider catalog endpoint has forbidden URL components.")
     if "%" in parsed.netloc:
         raise ProviderCatalogError("Provider catalog endpoint host must not be encoded.")

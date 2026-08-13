@@ -187,14 +187,23 @@ def test_python_package_asset_checker_verifies_both_archive_formats(tmp_path: Pa
 
 def test_pyinstaller_spec_has_p7_resources_and_excludes_unselected_qt_plugins() -> None:
     source = (PACKAGING_ROOT / "amadeus-desktop.spec").read_text(encoding="utf-8")
+    tray_source = (DESKTOP_ROOT / "src" / "amadeus_desktop" / "ui" / "tray.py").read_text(
+        encoding="utf-8"
+    )
+    catalog_source = (DESKTOP_ROOT / "src" / "amadeus_desktop" / "provider_catalog.py").read_text(
+        encoding="utf-8"
+    )
 
     assert 'hiddenimports = ["pywintypes", "win32api", "win32cred", "win32timezone"]' in source
+    assert '"pypdf",' in source
     assert "AMADEUS_PYINSTALLER_BUILD_INFO" in source
     assert "AMADEUS_PYINSTALLER_ICON" in source
     assert 'version=str(desktop_root / "packaging" / "amadeus-version-info.txt")' in source
     assert '"amadeus_desktop/resources/provider_catalog"' in source
     assert '"pyside6/plugins/imageformats/qpdf.dll"' in source
     assert '"pyside6/plugins/platforminputcontexts/qtvirtualkeyboardplugin.dll"' in source
+    assert "resources.files" not in tray_source
+    assert "resources.files" not in catalog_source
 
 
 def test_inno_script_locks_p7_identity_and_safe_uninstall_contract() -> None:

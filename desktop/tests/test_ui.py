@@ -23,6 +23,7 @@ from amadeus_desktop.controller import ApplicationController
 from amadeus_desktop.credential_store import CredentialStoreError, InMemoryCredentialStore
 from amadeus_desktop.paths import AppPaths
 from amadeus_desktop.provider_config import ProviderConfig, ProviderPreset
+from amadeus_desktop.provider_profiles import migrate_legacy_provider_settings
 from amadeus_desktop.settings import DEFAULT_SETTINGS, SettingsError, SettingsRepository
 from amadeus_desktop.ui.control_window import ControlWindow
 from amadeus_desktop.ui.tray import TrayController, create_app_icon
@@ -532,6 +533,7 @@ def test_crash_after_credential_replace_restarts_from_disabled_marker(
     repository = SettingsRepository(paths.settings_file)
     settings = deepcopy(DEFAULT_SETTINGS)
     settings["provider_enabled"] = True
+    settings["model_providers"] = migrate_legacy_provider_settings(settings)
     repository.save(settings)
     store = InMemoryCredentialStore("old-invalid-test-key")
     controller = ApplicationController(

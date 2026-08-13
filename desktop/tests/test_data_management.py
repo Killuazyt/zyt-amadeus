@@ -35,8 +35,8 @@ from amadeus_desktop.data_management import (
     UnsafeResetPlanError,
     apply_validated_restore,
     create_backup_archive,
-    discard_staged_restore,
     disable_provider_credential_reuse_for_restore,
+    discard_staged_restore,
     export_chat_json,
     export_memory_json,
     plan_factory_reset,
@@ -841,8 +841,7 @@ def test_restore_without_credential_reuse_disables_profiles_and_profile_voice(
         document = json.loads(disabled.settings_path.read_text(encoding="utf-8"))
 
         assert all(
-            profile["enabled"] is False
-            and set(profile["test_fingerprints"].values()) == {""}
+            profile["enabled"] is False and set(profile["test_fingerprints"].values()) == {""}
             for profile in document["model_providers"]["profiles"]
         )
         assert document["provider_enabled"] is False

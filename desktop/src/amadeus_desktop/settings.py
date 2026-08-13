@@ -14,6 +14,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from amadeus_desktop.provider_catalog import load_provider_catalog
 from amadeus_desktop.provider_config import (
     MIMO_SPEECH_CREDENTIAL_REF,
     MULTIMODAL_CREDENTIAL_REF,
@@ -22,7 +23,6 @@ from amadeus_desktop.provider_config import (
     ProviderConfigError,
     ProviderPreset,
 )
-from amadeus_desktop.provider_catalog import load_provider_catalog
 from amadeus_desktop.provider_profiles import (
     ProviderProfileError,
     ProviderSettings,
@@ -586,17 +586,16 @@ class SettingsRepository:
         enabled_profile_sources = {
             f"profile:{profile.profile_id}"
             for profile in provider_settings.profiles
-            if profile.enabled
-            and f"profile:{profile.profile_id}" in compatible_profile_sources
+            if profile.enabled and f"profile:{profile.profile_id}" in compatible_profile_sources
         }
         if credential_source not in {"independent", *compatible_profile_sources}:
             raise InvalidSettingsError("voice.credential_source is invalid.")
-        if voice.get("enabled") is True:
-            if (
-                credential_source != "independent"
-                and credential_source not in enabled_profile_sources
-            ):
-                raise InvalidSettingsError("Voice cannot reuse that provider credential.")
+        if (
+            voice.get("enabled") is True
+            and credential_source != "independent"
+            and credential_source not in enabled_profile_sources
+        ):
+            raise InvalidSettingsError("Voice cannot reuse that provider credential.")
         for key in ("connect_timeout_seconds", "request_timeout_seconds"):
             value = voice.get(key)
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 300:

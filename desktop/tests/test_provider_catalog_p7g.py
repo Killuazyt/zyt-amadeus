@@ -25,7 +25,6 @@ from amadeus_desktop.provider_profiles import (
 )
 from amadeus_desktop.settings import DEFAULT_SETTINGS
 
-
 EXPECTED_CATALOG_IDS = {
     "deepseek",
     "mimo_payg",
@@ -69,8 +68,7 @@ def test_bundled_catalog_has_locked_p7g_range_and_no_excluded_ecosystem() -> Non
     )
     assert catalog.entry("deepseek").endpoints == ("https://api.deepseek.com",)
     assert all(
-        len(entry.endpoints) <= 1 or entry.catalog_id == "qwen_intl"
-        for entry in catalog.all()
+        len(entry.endpoints) <= 1 or entry.catalog_id == "qwen_intl" for entry in catalog.all()
     )
     assert catalog.entry("ollama").default_endpoint == "http://localhost:11434/v1"
     assert catalog.entry("lm_studio").default_endpoint == "http://localhost:1234/v1"

@@ -116,6 +116,7 @@ from amadeus_desktop.proactive_controller import (
     ProactiveInteractionController,
     ProactiveVisualPlan,
 )
+from amadeus_desktop.provider_catalog import ProviderAuth, ProviderRole, load_provider_catalog
 from amadeus_desktop.provider_config import (
     MIMO_SPEECH_CREDENTIAL_REF,
     MULTIMODAL_CREDENTIAL_REF,
@@ -125,14 +126,13 @@ from amadeus_desktop.provider_config import (
     ProviderPreset,
     TokenLimitField,
 )
-from amadeus_desktop.provider_router import ProviderRouter
-from amadeus_desktop.provider_catalog import ProviderAuth, ProviderRole, load_provider_catalog
 from amadeus_desktop.provider_profiles import (
     ProviderProfile,
     ProviderProfileError,
     ProviderSettings,
     transient_credential_fingerprint,
 )
+from amadeus_desktop.provider_router import ProviderRouter
 from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
     InvalidSettingsError,
@@ -148,11 +148,11 @@ from amadeus_desktop.storage_models import PersonaKnowledgeDraft
 from amadeus_desktop.ui.chat_panel import ChatPanel
 from amadeus_desktop.ui.control_window import ControlWindow
 from amadeus_desktop.ui.greeting_bubble import GreetingBubble
+from amadeus_desktop.ui.pet_window import PetWindow
 from amadeus_desktop.ui.provider_settings import (
     ProviderSettingsChange,
     ProviderSettingsPage,
 )
-from amadeus_desktop.ui.pet_window import PetWindow
 from amadeus_desktop.ui.settings_window import SettingsWindow
 from amadeus_desktop.ui.tray import TrayController
 from amadeus_desktop.ui.visual_settings import VisualSettingsPage
@@ -306,18 +306,22 @@ class ApplicationController:
         conversation_profile = self.model_provider_settings.assigned_profile(
             ProviderRole.CONVERSATION
         )
-        has_provider_secret = self._profile_credential_available(conversation_profile)
+        has_provider_secret = bool(
+            conversation_profile
+            and conversation_profile.enabled
+            and allow_saved_provider
+            and self._profile_credential_available(conversation_profile)
+        )
 
         vision_profile = self.model_provider_settings.assigned_profile(ProviderRole.VISION)
-        has_multimodal_secret = self._profile_credential_available(vision_profile)
-        has_own_multimodal_secret = False
+        has_multimodal_secret = bool(
+            vision_profile
+            and vision_profile.enabled
+            and allow_saved_provider
+            and self._profile_credential_available(vision_profile)
+        )
         selected_multimodal_store: CredentialStore | None = None
         multimodal_settings = self.settings["multimodal"]
-        if allow_saved_provider:
-            try:
-                has_own_multimodal_secret = self.multimodal_credential_store.has_secret()
-            except CredentialStoreError:
-                has_own_multimodal_secret = False
         if (
             chat_provider is None
             and not mock_chat
@@ -546,9 +550,7 @@ class ApplicationController:
             conversation_metadata = self.model_provider_settings.assigned_profile(
                 ProviderRole.CONVERSATION
             )
-            vision_metadata = self.model_provider_settings.assigned_profile(
-                ProviderRole.VISION
-            )
+            vision_metadata = self.model_provider_settings.assigned_profile(ProviderRole.VISION)
             self.data_service.set_provider_metadata(
                 conversation_metadata.display_name if conversation_metadata else None,
                 conversation_metadata.model_for(ProviderRole.CONVERSATION)
@@ -639,6 +641,19 @@ class ApplicationController:
             self.provider_catalog,
             credential_store_factory=self._credential_store_for_profile,
             tester=connection_tester,
+            blocked_saved_credential_profile_ids=(
+                profile.profile_id
+                for profile in self.model_provider_settings.profiles
+                if not allow_saved_provider
+                or (
+                    profile.credential_slot == "legacy_chat"
+                    and settings.get("provider_enabled") is not True
+                )
+                or (
+                    profile.credential_slot == "legacy_vision"
+                    and multimodal_settings.get("enabled") is not True
+                )
+            ),
         )
         self.model_settings_window.save_requested.connect(self._save_model_provider_settings)
         self.voice_settings_page = VoiceSettingsPage(
@@ -2567,22 +2582,19 @@ class ApplicationController:
         for profile in self.model_provider_settings.profiles:
             valid_catalog_contract = profile.catalog_id in self.provider_catalog.entries
             assigned_tests_valid = all(
-                profile.is_tested(role)
-                for role in assigned_roles.get(profile.profile_id, set())
+                profile.is_tested(role) for role in assigned_roles.get(profile.profile_id, set())
             )
-            credential_valid = self._profile_credential_available(profile)
+            credential_valid = not profile.enabled or self._profile_credential_available(profile)
             should_disable = bool(
                 profile.enabled
-                and (
-                    not valid_catalog_contract
-                    or not assigned_tests_valid
-                    or not credential_valid
-                )
+                and (not valid_catalog_contract or not assigned_tests_valid or not credential_valid)
             )
             profiles.append(replace(profile, enabled=False) if should_disable else profile)
             disabled = disabled or should_disable
         if not disabled:
-            return "内置提供商目录损坏，当前仅开放安全自定义恢复入口。" if catalog_degraded else None
+            return (
+                "内置提供商目录损坏，当前仅开放安全自定义恢复入口。" if catalog_degraded else None
+            )
         reconciled = ProviderSettings(
             tuple(profiles),
             self.model_provider_settings.assignments,
@@ -2654,12 +2666,9 @@ class ApplicationController:
             candidate_settings = change_object.settings.validated(
                 self.provider_catalog
             ).require_assigned_tests()
-            candidate_profile_ids = {
-                profile.profile_id for profile in candidate_settings.profiles
-            }
+            candidate_profile_ids = {profile.profile_id for profile in candidate_settings.profiles}
             current_profiles = {
-                profile.profile_id: profile
-                for profile in self.model_provider_settings.profiles
+                profile.profile_id: profile for profile in self.model_provider_settings.profiles
             }
             if not set(change_object.secret_updates).issubset(candidate_profile_ids):
                 raise ProviderProfileError("模型凭据变更引用了不存在的 Profile。")
@@ -2670,17 +2679,12 @@ class ApplicationController:
                 for profile_id in candidate_settings.assignments.values()
                 if profile_id is not None
             )
-            if (
-                not tested_secret_ids.issubset(secret_update_ids)
-                or not assigned_secret_update_ids.issubset(tested_secret_ids)
-            ):
+            if not tested_secret_ids.issubset(
+                secret_update_ids
+            ) or not assigned_secret_update_ids.issubset(tested_secret_ids):
                 raise ProviderProfileError("模型凭据变更缺少对应的连接测试。")
-            deleted_profile_ids = [
-                profile.profile_id for profile in change_object.deleted_profiles
-            ]
-            expected_deleted_profile_ids = (
-                set(current_profiles) - candidate_profile_ids
-            )
+            deleted_profile_ids = [profile.profile_id for profile in change_object.deleted_profiles]
+            expected_deleted_profile_ids = set(current_profiles) - candidate_profile_ids
             if (
                 len(deleted_profile_ids) != len(set(deleted_profile_ids))
                 or any(profile_id in candidate_profile_ids for profile_id in deleted_profile_ids)
@@ -2700,9 +2704,7 @@ class ApplicationController:
                     or secret.casefold().startswith("tp-")
                 ):
                     raise ProviderProfileError("模型凭据变更无效。")
-            for profile_id, tested_fingerprint in (
-                change_object.tested_secret_fingerprints.items()
-            ):
+            for profile_id, tested_fingerprint in change_object.tested_secret_fingerprints.items():
                 secret = change_object.secret_updates[profile_id]
                 if (
                     not isinstance(profile_id, str)
@@ -2713,18 +2715,14 @@ class ApplicationController:
                         tested_fingerprint,
                     )
                 ):
-                    raise ProviderProfileError(
-                        "模型凭据变更未通过当前连接测试。"
-                    )
+                    raise ProviderProfileError("模型凭据变更未通过当前连接测试。")
             for profile_id in change_object.secret_updates:
                 profile = candidate_settings.profile(profile_id)
                 if profile is None or profile.auth is ProviderAuth.NONE:
                     raise ProviderProfileError("无鉴权 Profile 不得写入凭据。")
             voice_source = str(self.settings["voice"].get("credential_source", ""))
             if voice_source.startswith("profile:"):
-                voice_profile = candidate_settings.profile(
-                    voice_source.removeprefix("profile:")
-                )
+                voice_profile = candidate_settings.profile(voice_source.removeprefix("profile:"))
                 if (
                     voice_profile is None
                     or not voice_profile.enabled
@@ -2742,9 +2740,7 @@ class ApplicationController:
             self.deep_memory_jobs.resume()
             return
         previous_document = deepcopy(self.settings)
-        previous_voice_source = str(
-            previous_document["voice"].get("credential_source", "")
-        )
+        previous_voice_source = str(previous_document["voice"].get("credential_source", ""))
         voice_profile_changed = False
         if previous_voice_source.startswith("profile:"):
             voice_profile_id = previous_voice_source.removeprefix("profile:")
@@ -2780,9 +2776,7 @@ class ApplicationController:
         previous_profiles = {
             profile.profile_id: profile for profile in self.model_provider_settings.profiles
         }
-        changed_profiles = {
-            profile.profile_id: profile for profile in candidate_settings.profiles
-        }
+        changed_profiles = {profile.profile_id: profile for profile in candidate_settings.profiles}
         retired_profiles: list[ProviderProfile] = []
         for profile_id, previous_profile in previous_profiles.items():
             candidate_profile = changed_profiles.get(profile_id)
@@ -2941,8 +2935,7 @@ class ApplicationController:
             else:
                 fail_closed_settings = ProviderSettings(
                     tuple(
-                        replace(profile, enabled=False)
-                        for profile in candidate_settings.profiles
+                        replace(profile, enabled=False) for profile in candidate_settings.profiles
                     ),
                     candidate_settings.assignments,
                 ).runtime_validated(self.provider_catalog)
@@ -3004,16 +2997,12 @@ class ApplicationController:
                 speech_client = MiMoSpeechClient(speech_config, voice_store)
                 if not self.speech_network.set_services(speech_client, speech_client):
                     self._voice_configured = False
-                    self.logger.warning(
-                        "Voice runtime was still busy after provider transaction"
-                    )
+                    self.logger.warning("Voice runtime was still busy after provider transaction")
                 else:
                     self._voice_configured = bool(
                         candidate_document["voice"].get("enabled") is True
                         and self._profile_credential_available(
-                            candidate_settings.profile(
-                                voice_source.removeprefix("profile:")
-                            )
+                            candidate_settings.profile(voice_source.removeprefix("profile:"))
                         )
                     )
         self.voice_settings_page.update_reusable_mimo_profiles(
@@ -4417,14 +4406,10 @@ class ApplicationController:
                 provider_name = snapshot.provider_name
                 model_name = snapshot.model
             else:
-                profile = self.model_provider_settings.assigned_profile(
-                    ProviderRole.CONVERSATION
-                )
+                profile = self.model_provider_settings.assigned_profile(ProviderRole.CONVERSATION)
                 provider_name = profile.display_name if profile is not None else None
                 model_name = (
-                    profile.model_for(ProviderRole.CONVERSATION)
-                    if profile is not None
-                    else None
+                    profile.model_for(ProviderRole.CONVERSATION) if profile is not None else None
                 )
         self.logger.info(
             "Conversation evidence provider=%s model=%s turn=%s attempt=%s status=%s "

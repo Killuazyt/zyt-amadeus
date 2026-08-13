@@ -47,7 +47,7 @@ def test_profile_copy_has_new_stable_id_and_does_not_copy_secret_or_tests(qtbot)
         tester=_Tester(),
     )
     qtbot.addWidget(page)
-    stores["ui-main"].write_secret("invalid-fake-original-key")
+    factory(page._profiles[0]).write_secret("invalid-fake-original-key")
 
     page._copy_profile()
 
@@ -100,17 +100,14 @@ def test_assigned_profile_cannot_be_deleted_and_profile_limit_is_enforced(qtbot)
 
     source = page._profiles[0]
     page._profiles = [
-        replace(source, profile_id=f"profile-{index}")
-        for index in range(MAX_PROVIDER_PROFILES)
+        replace(source, profile_id=f"profile-{index}") for index in range(MAX_PROVIDER_PROFILES)
     ]
     page._add_profile()
     assert len(page._profiles) == MAX_PROVIDER_PROFILES
     assert "32" in page.status.text()
 
 
-def test_last_profile_can_be_deleted_after_every_task_is_cancelled(
-    qtbot, monkeypatch
-) -> None:
+def test_last_profile_can_be_deleted_after_every_task_is_cancelled(qtbot, monkeypatch) -> None:
     page = ProviderSettingsPage(
         _settings(),
         load_provider_catalog(),
@@ -127,10 +124,14 @@ def test_last_profile_can_be_deleted_after_every_task_is_cancelled(
 
     page._delete_profile()
 
-    candidate = ProviderSettings(
-        tuple(page._profiles),
-        MappingProxyType(dict(page._assignments)),
-    ).validated(load_provider_catalog()).require_assigned_tests()
+    candidate = (
+        ProviderSettings(
+            tuple(page._profiles),
+            MappingProxyType(dict(page._assignments)),
+        )
+        .validated(load_provider_catalog())
+        .require_assigned_tests()
+    )
     assert candidate.profiles == ()
     assert all(profile_id is None for profile_id in candidate.assignments.values())
     assert [profile.profile_id for profile in page._deleted_profiles] == ["ui-main"]
@@ -198,9 +199,7 @@ def test_tested_transient_secret_survives_an_unrelated_profile_name_edit(qtbot) 
     page = ProviderSettingsPage(
         _settings(),
         load_provider_catalog(),
-        credential_store_factory=lambda _profile: InMemoryCredentialStore(
-            "invalid-fake-old-key"
-        ),
+        credential_store_factory=lambda _profile: InMemoryCredentialStore("invalid-fake-old-key"),
         tester=_Tester(),
     )
     qtbot.addWidget(page)
@@ -217,9 +216,7 @@ def test_explicitly_clearing_the_password_editor_discards_its_transient_update(q
     page = ProviderSettingsPage(
         _settings(),
         load_provider_catalog(),
-        credential_store_factory=lambda _profile: InMemoryCredentialStore(
-            "invalid-fake-old-key"
-        ),
+        credential_store_factory=lambda _profile: InMemoryCredentialStore("invalid-fake-old-key"),
         tester=_Tester(),
     )
     qtbot.addWidget(page)
@@ -301,13 +298,7 @@ def test_settings_change_contains_only_profile_settings_and_transient_secret_upd
     change = ProviderSettingsChange(
         _settings(),
         MappingProxyType({"ui-main": "invalid-fake-key"}),
-        MappingProxyType(
-            {
-                "ui-main": transient_credential_fingerprint(
-                    "invalid-fake-key"
-                )
-            }
-        ),
+        MappingProxyType({"ui-main": transient_credential_fingerprint("invalid-fake-key")}),
         (),
     )
 

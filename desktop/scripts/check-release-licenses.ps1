@@ -121,7 +121,7 @@ $kurisuNotice = Get-Content -LiteralPath (Join-Path $LicenseRoot 'KURISU-ASSET-N
 if (
     $kurisuNotice -notmatch 'NOASSERTION' -or
     $kurisuNotice -notmatch 'cca259ac33ffc7c8170b401a315f9a177a865eb063ba44a4da87c3ab13fa90b7' -or
-    $kurisuNotice -notmatch 'not independently verified'
+    $kurisuNotice -notmatch 'not\s+independently\s+verified'
 ) {
     throw 'Built-in Kurisu asset risk notice is incomplete'
 }
@@ -140,7 +140,7 @@ $kurisuIconNotice = Get-Content -LiteralPath (Join-Path $LicenseRoot 'KURISU-ICO
 if (
     $kurisuIconNotice -notmatch 'NOASSERTION' -or
     $kurisuIconNotice -notmatch 'ded30eeb568f26e3df64998131698e472603bf48d531885b27a7c04293d3b0b5' -or
-    $kurisuIconNotice -notmatch 'not independently verified'
+    $kurisuIconNotice -notmatch 'not\s+independently\s+verified'
 ) {
     throw 'Kurisu application icon risk notice is incomplete'
 }
@@ -213,7 +213,7 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
     $packagedPetNotice = Get-Content -LiteralPath $packagedPetNoticePath -Raw -Encoding UTF8
     if (
         $packagedPetNotice -notmatch 'NOASSERTION' -or
-        $packagedPetNotice -notmatch 'not independently verified'
+        $packagedPetNotice -notmatch 'not\s+independently\s+verified'
     ) {
         throw 'Packaged built-in pet notice is incomplete'
     }
@@ -235,7 +235,7 @@ if (-not [string]::IsNullOrWhiteSpace($OnedirPath)) {
     $packagedIconNoticeText = Get-Content -LiteralPath $packagedIconNotice -Raw -Encoding UTF8
     if (
         $packagedIconNoticeText -notmatch 'NOASSERTION' -or
-        $packagedIconNoticeText -notmatch 'not independently verified'
+        $packagedIconNoticeText -notmatch 'not\s+independently\s+verified'
     ) {
         throw 'Packaged Kurisu application icon notice is incomplete'
     }

@@ -26,17 +26,17 @@ from amadeus_desktop.chat_models import (
     TextPart,
 )
 from amadeus_desktop.credential_store import CredentialStore
-from amadeus_desktop.provider_config import (
-    AuthMode,
-    ProviderConfig,
-    ProviderPreset,
-    TokenLimitField,
-)
 from amadeus_desktop.provider_catalog import (
     CachePolicy,
     ProviderAuth,
     ProviderProtocol,
     ReasoningPolicy,
+)
+from amadeus_desktop.provider_config import (
+    AuthMode,
+    ProviderConfig,
+    ProviderPreset,
+    TokenLimitField,
 )
 from amadeus_desktop.provider_profiles import ProviderRequestSnapshot
 
@@ -756,7 +756,11 @@ class AnthropicMessagesChatProvider(OpenAICompatibleChatProvider):
                 index = payload.get("index")
                 if not isinstance(block, dict) or not _is_event_index(index):
                     raise ChatProviderError(ProviderErrorCode.PROTOCOL)
-                if index in text_blocks or index in ignored_thinking_blocks or index in closed_blocks:
+                if (
+                    index in text_blocks
+                    or index in ignored_thinking_blocks
+                    or index in closed_blocks
+                ):
                     raise ChatProviderError(ProviderErrorCode.PROTOCOL)
                 block_type = block.get("type")
                 if block_type in {"thinking", "redacted_thinking"}:
@@ -1102,7 +1106,12 @@ def _parse_image_data_url(value: object) -> tuple[str, str]:
     if not isinstance(value, str) or len(value) > 36 * 1024 * 1024:
         raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
     prefix, separator, data = value.partition(",")
-    if not separator or not data or not prefix.startswith("data:") or not prefix.endswith(";base64"):
+    if (
+        not separator
+        or not data
+        or not prefix.startswith("data:")
+        or not prefix.endswith(";base64")
+    ):
         raise ChatProviderError(ProviderErrorCode.MODEL_OR_PARAMETER)
     media_type = prefix[5:-7]
     if media_type not in {"image/png", "image/jpeg", "image/webp"}:
@@ -1244,8 +1253,7 @@ def _content_from_payload(payload: object, *, streaming: bool) -> tuple[str, ...
         container = {
             key: value
             for key, value in container.items()
-            if key
-            not in {"reasoning", "reasoning_content", "thinking", "thought", "analysis"}
+            if key not in {"reasoning", "reasoning_content", "thinking", "thought", "analysis"}
         }
     if container.get("refusal"):
         raise ChatProviderError(ProviderErrorCode.CONTENT_FILTER)

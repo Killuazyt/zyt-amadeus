@@ -123,7 +123,7 @@ class WinCredentialStore:
         _delete_secret(self.target_name)
 
     @classmethod
-    def for_profile(cls, profile: ProviderProfile) -> "WinCredentialStore":
+    def for_profile(cls, profile: ProviderProfile) -> WinCredentialStore:
         """Resolve a fixed legacy slot or deterministic P7G profile target."""
 
         legacy_ref = legacy_credential_ref(profile)
@@ -137,14 +137,13 @@ def profile_credential_target(profile: ProviderProfile) -> str:
 
     profile.validated(None)
     identifier_digest = hashlib.sha256(profile.profile_id.encode("utf-8")).hexdigest()[:32]
-    return (
-        f"{WINCRED_PROFILE_TARGET_PREFIX}{identifier_digest}/"
-        f"{profile.credential_scope_digest}"
-    )
+    return f"{WINCRED_PROFILE_TARGET_PREFIX}{identifier_digest}/{profile.credential_scope_digest}"
 
 
 def validate_owned_profile_target(target_name: object) -> str:
-    if not isinstance(target_name, str) or not target_name.startswith(WINCRED_PROFILE_TARGET_PREFIX):
+    if not isinstance(target_name, str) or not target_name.startswith(
+        WINCRED_PROFILE_TARGET_PREFIX
+    ):
         raise ValueError("credential target is not owned by Amadeus")
     suffix = target_name[len(WINCRED_PROFILE_TARGET_PREFIX) :]
     parts = suffix.split("/")
@@ -187,11 +186,17 @@ def delete_all_amadeus_credentials() -> None:
         _delete_secret(target)
     for target in _enumerate_dynamic_profile_targets():
         _delete_secret(target)
-    if any(_read_secret(target) is not None for target in (
-        WINCRED_TARGET_NAME,
-        WINCRED_MULTIMODAL_TARGET_NAME,
-        WINCRED_MIMO_SPEECH_TARGET_NAME,
-    )) or _enumerate_dynamic_profile_targets():
+    if (
+        any(
+            _read_secret(target) is not None
+            for target in (
+                WINCRED_TARGET_NAME,
+                WINCRED_MULTIMODAL_TARGET_NAME,
+                WINCRED_MIMO_SPEECH_TARGET_NAME,
+            )
+        )
+        or _enumerate_dynamic_profile_targets()
+    ):
         raise CredentialStoreError("Amadeus credential removal could not be verified.")
 
 
