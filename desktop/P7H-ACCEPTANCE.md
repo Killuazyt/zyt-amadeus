@@ -42,6 +42,12 @@ three-day use, P8 eight-hour stability run, or P8 physical-display matrix was ex
 
 ## GitHub validation
 
-The exact-SHA test-only Desktop CI run will be recorded here after the implementation commit is
-pushed. If that evidence update creates a documentation commit, a second test-only run will verify
-the final documentation SHA.
+Implementation commit `11e6b15ac66429f0f16f89b72b844306254850d2` was pushed normally to
+`main` with `[skip ci]`. Manually dispatched test-only Desktop CI run `32155341664` precisely
+matched that SHA and succeeded: `987 passed, 1 skipped in 244.86s`, 246 source files scanned with
+zero violations, project installation and all Python package/isolated wheel/onedir steps skipped,
+`package-installer` skipped, and zero artifacts.
+
+This evidence update creates a documentation-only commit. A second manually dispatched test-only
+run will verify the final documentation SHA; its run ID and exact SHA are recorded in the local Plan
+evidence without creating a third recursive documentation commit.
