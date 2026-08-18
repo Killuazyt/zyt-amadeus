@@ -113,6 +113,7 @@ class PromptMemory:
     confidence: float = 1.0
     pinned: bool = False
     memory_version_id: str = ""
+    user_confirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

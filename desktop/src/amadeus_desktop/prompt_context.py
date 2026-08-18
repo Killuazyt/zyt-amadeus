@@ -390,6 +390,8 @@ def _select_persona_knowledge(
 def _render_memory(memory: PromptMemory) -> str:
     content = " ".join(memory.content.split())
     label = _MEMORY_LABELS[memory.kind]
+    if memory.kind is MemoryKind.RELATIONSHIP and memory.user_confirmed:
+        label += "·用户已确认"
     return f"- [{label}] {content}"
 
 

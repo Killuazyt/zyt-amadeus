@@ -123,6 +123,139 @@ def test_recent_recall_is_visible_and_sortable(qtbot) -> None:
     assert searches[-1][-1] == "recalled_desc"
 
 
+def test_companion_cue_view_supports_review_filter_confirm_and_lifecycle_actions(
+    qtbot,
+    monkeypatch,
+) -> None:
+    page = make_page(qtbot)
+    confirmed: list[tuple[str, str, str, bool]] = []
+    rejected: list[str] = []
+    resolved: list[str] = []
+    deleted: list[str] = []
+    retained: list[tuple[str, bool]] = []
+    opened: list[str] = []
+    page.cue_confirm_requested.connect(lambda *values: confirmed.append(values))
+    page.cue_reject_requested.connect(rejected.append)
+    page.cue_resolve_requested.connect(resolved.append)
+    page.cue_delete_requested.connect(deleted.append)
+    page.cue_keep_requested.connect(lambda *values: retained.append(values))
+    page.cue_open_requested.connect(opened.append)
+    cues = (
+        {
+            "memory_id": "cue-proposed",
+            "layer": "cue",
+            "kind": "conversation_followup",
+            "status": "proposed",
+            "topic_key": "项目结果",
+            "content": "草稿待续文本",
+            "confidence": 0.91,
+            "source_label": "待续话题",
+            "reason": "user_promised_update",
+            "created_at": "2026-08-18",
+            "updated_at": "2026-08-18",
+        },
+        {
+            "memory_id": "cue-active",
+            "layer": "cue",
+            "kind": "memory_followup",
+            "status": "active",
+            "topic_key": "饮品偏好",
+            "content": "已冻结的授权文本",
+            "confidence": 1.0,
+            "source_label": "已授权记忆",
+            "reason": "memory_authorized",
+            "confirmed_at": "2026-08-18",
+            "expires_at": "2026-09-17",
+            "created_at": "2026-08-18",
+            "updated_at": "2026-08-18",
+        },
+        {
+            "memory_id": "cue-expired",
+            "layer": "cue",
+            "kind": "conversation_followup",
+            "status": "expired",
+            "topic_key": "旧线索",
+            "content": "已过期",
+            "confidence": 0.9,
+            "created_at": "2026-07-01",
+            "updated_at": "2026-08-18",
+        },
+    )
+    page.layer_combo.setCurrentIndex(page.layer_combo.findData("cue"))
+    page.set_layer_data(cues=cues, selected_id="cue-proposed")
+
+    assert page.current_layer == "cue"
+    assert page.status_combo.findData("proposed") >= 0
+    assert page.status_combo.findData("active") >= 0
+    assert page.status_combo.findData("surfaced") >= 0
+    assert page.status_combo.findData("resolved") >= 0
+    assert page.status_combo.findData("expired") >= 0
+    assert page.detail_edit.isReadOnly() is False
+    page.cue_topic_edit.setText("确认后的项目结果")
+    page.detail_edit.setPlainText("确认后冻结的待续文本")
+    page.keep_cue_check.setChecked(True)
+    page.confirm_button.click()
+    assert confirmed == [("cue-proposed", "确认后的项目结果", "确认后冻结的待续文本", True)]
+    page.deny_button.click()
+    assert rejected == ["cue-proposed"]
+
+    assert page.select_memory("cue-active")
+    assert page.detail_edit.isReadOnly()
+    assert not page.resolve_cue_button.isHidden()
+    assert not page.open_cue_button.isHidden()
+    page.resolve_cue_button.click()
+    page.open_cue_button.click()
+    page.keep_cue_check.setChecked(True)
+    assert resolved == ["cue-active"]
+    assert opened == ["cue-active"]
+    assert retained == [("cue-active", True)]
+
+    page.status_combo.setCurrentIndex(page.status_combo.findData("expired"))
+    assert page.memory_table.rowCount() == 1
+    assert page.current_memory_id == "cue-expired"
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    page.delete_button.click()
+    assert deleted == ["cue-expired"]
+
+
+def test_exact_memory_version_authorization_toggle_creates_or_revokes_local_draft(qtbot) -> None:
+    page = make_page(qtbot)
+    changes: list[tuple[str, str, bool]] = []
+    page.memory_authorization_changed.connect(lambda *values: changes.append(values))
+    fact = {
+        "memory_id": "fact-authorization",
+        "version_id": "fact-version-2",
+        "layer": "fact",
+        "kind": "preference",
+        "status": "active",
+        "content": "用户偏好红茶",
+        "topic_key": "饮品",
+        "importance": 0.8,
+        "confidence": 1.0,
+        "version_number": 2,
+        "created_at": "2026-08-01",
+        "updated_at": "2026-08-18",
+    }
+    page.set_layer_data(facts=(fact,))
+
+    assert not page.memory_authorization_check.isHidden()
+    assert "本地可编辑草稿" in page.memory_authorization_check.toolTip()
+    page.memory_authorization_check.click()
+    assert changes == [("fact", "fact-version-2", True)]
+
+    page.set_layer_data(
+        facts=({**fact, "companion_cue_id": "cue-memory", "companion_cue_status": "active"},)
+    )
+    assert page.memory_authorization_check.isChecked()
+    page.memory_authorization_check.click()
+    assert changes[-1] == ("fact", "fact-version-2", False)
+
+
 def test_retrieval_status_and_actions_use_only_safe_metadata(qtbot) -> None:
     page = make_page(qtbot)
     verified: list[bool] = []

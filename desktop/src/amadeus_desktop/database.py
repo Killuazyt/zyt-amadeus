@@ -1,4 +1,4 @@
-"""SQLite schema v6, consistent migration backups, and fail-closed opening."""
+"""SQLite schema v7, consistent migration backups, and fail-closed opening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 AMADEUS_APPLICATION_ID = int.from_bytes(b"AMDS", "big")
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
@@ -918,6 +918,273 @@ def _migrate_to_v6(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+_SCHEMA_V7: tuple[str, ...] = (
+    """
+    CREATE TABLE companion_cues (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('conversation_followup', 'memory_followup')),
+        topic TEXT NOT NULL CHECK (length(topic) BETWEEN 1 AND 120),
+        frozen_text TEXT NOT NULL CHECK (length(frozen_text) BETWEEN 1 AND 240),
+        status TEXT NOT NULL CHECK (status IN (
+            'proposed', 'active', 'surfaced', 'resolved', 'rejected', 'expired'
+        )),
+        reason TEXT NOT NULL CHECK (reason IN (
+            'explicit_return', 'pending_result', 'user_promised_update', 'memory_authorized'
+        )),
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        keep_until_resolved INTEGER NOT NULL DEFAULT 0
+            CHECK (keep_until_resolved IN (0, 1)),
+        dedupe_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        expires_at TEXT,
+        surfaced_at TEXT,
+        resolved_at TEXT,
+        CHECK (
+            status IN ('proposed', 'rejected', 'expired')
+            OR confirmed_at IS NOT NULL
+        ),
+        CHECK (keep_until_resolved = 0 OR expires_at IS NULL)
+    )
+    """,
+    """
+    CREATE INDEX companion_cues_selection_idx
+    ON companion_cues(profile_id, status, kind, expires_at, created_at)
+    """,
+    """
+    CREATE UNIQUE INDEX companion_cues_live_dedupe_idx
+    ON companion_cues(profile_id, dedupe_key)
+    WHERE status IN ('proposed', 'active', 'surfaced')
+    """,
+    """
+    CREATE TRIGGER companion_cues_frozen_after_confirmation
+    BEFORE UPDATE OF topic, frozen_text, dedupe_key ON companion_cues
+    WHEN OLD.status <> 'proposed'
+    BEGIN
+        SELECT RAISE(ABORT, 'confirmed companion cue text is immutable');
+    END
+    """,
+    """
+    CREATE TABLE companion_cue_sources (
+        id TEXT PRIMARY KEY,
+        cue_id TEXT NOT NULL REFERENCES companion_cues(id) ON DELETE CASCADE,
+        source_kind TEXT NOT NULL CHECK (source_kind IN (
+            'user_message', 'fact_version', 'reflection_version', 'persona_version'
+        )),
+        source_message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+        fact_version_id TEXT REFERENCES memory_versions(id) ON DELETE CASCADE,
+        reflection_version_id TEXT
+            REFERENCES memory_reflection_versions(id) ON DELETE CASCADE,
+        persona_version_id TEXT
+            REFERENCES memory_persona_impression_versions(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        CHECK (
+            (source_message_id IS NOT NULL)
+            + (fact_version_id IS NOT NULL)
+            + (reflection_version_id IS NOT NULL)
+            + (persona_version_id IS NOT NULL) = 1
+        ),
+        CHECK (
+            (source_kind = 'user_message' AND source_message_id IS NOT NULL)
+            OR (source_kind = 'fact_version' AND fact_version_id IS NOT NULL)
+            OR (source_kind = 'reflection_version' AND reflection_version_id IS NOT NULL)
+            OR (source_kind = 'persona_version' AND persona_version_id IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE INDEX companion_cue_sources_cue_idx
+    ON companion_cue_sources(cue_id)
+    """,
+    """
+    CREATE INDEX companion_cue_sources_message_idx
+    ON companion_cue_sources(source_message_id)
+    """,
+    """
+    CREATE INDEX companion_cue_sources_fact_idx
+    ON companion_cue_sources(fact_version_id)
+    """,
+    """
+    CREATE INDEX companion_cue_sources_reflection_idx
+    ON companion_cue_sources(reflection_version_id)
+    """,
+    """
+    CREATE INDEX companion_cue_sources_persona_idx
+    ON companion_cue_sources(persona_version_id)
+    """,
+    """
+    CREATE TABLE companion_cue_audit_events (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        cue_id TEXT NOT NULL,
+        cue_kind TEXT NOT NULL CHECK (cue_kind IN ('conversation_followup', 'memory_followup')),
+        event_type TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        previous_status TEXT,
+        resulting_status TEXT,
+        occurred_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX companion_cue_audit_profile_time_idx
+    ON companion_cue_audit_events(profile_id, occurred_at DESC)
+    """,
+    """
+    CREATE INDEX companion_cue_audit_cue_time_idx
+    ON companion_cue_audit_events(cue_id, occurred_at DESC)
+    """,
+    """
+    CREATE TRIGGER companion_cue_audit_events_are_immutable
+    BEFORE UPDATE ON companion_cue_audit_events
+    BEGIN
+        SELECT RAISE(ABORT, 'companion cue audit events are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cues_audit_status_change
+    AFTER UPDATE OF status ON companion_cues
+    WHEN OLD.status <> NEW.status
+    BEGIN
+        INSERT INTO companion_cue_audit_events (
+            id, profile_id, cue_id, cue_kind, event_type, reason_code,
+            previous_status, resulting_status, occurred_at
+        ) VALUES (
+            lower(hex(randomblob(16))), NEW.profile_id, NEW.id, NEW.kind, 'status_changed',
+            CASE WHEN NEW.status = 'expired' THEN 'source_or_time_invalidated'
+                 ELSE 'user_or_runtime_transition' END,
+            OLD.status, NEW.status,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cues_audit_delete
+    BEFORE DELETE ON companion_cues
+    BEGIN
+        INSERT INTO companion_cue_audit_events (
+            id, profile_id, cue_id, cue_kind, event_type, reason_code,
+            previous_status, resulting_status, occurred_at
+        ) VALUES (
+            lower(hex(randomblob(16))), OLD.profile_id, OLD.id, OLD.kind, 'deleted',
+            'content_and_sources_removed', OLD.status, NULL,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cue_source_delete_removes_cue
+    AFTER DELETE ON companion_cue_sources
+    WHEN EXISTS (SELECT 1 FROM companion_cues WHERE id = OLD.cue_id)
+    BEGIN
+        DELETE FROM companion_cues WHERE id = OLD.cue_id;
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cues_invalidate_fact_version
+    AFTER UPDATE OF current_version_id, status ON memory_groups
+    BEGIN
+        UPDATE companion_cues
+        SET status = 'expired', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            expires_at = COALESCE(expires_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        WHERE status IN ('proposed', 'active', 'surfaced')
+          AND id IN (
+              SELECT cue_id FROM companion_cue_sources
+              WHERE fact_version_id IS NOT NULL
+                AND fact_version_id IN (
+                    SELECT id FROM memory_versions WHERE memory_id = NEW.id
+                )
+          )
+          AND (NEW.status <> 'active' OR NEW.current_version_id IS NULL
+               OR id IN (
+                   SELECT cue_id FROM companion_cue_sources
+                   WHERE fact_version_id IS NOT NEW.current_version_id
+               ));
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cues_invalidate_reflection_version
+    AFTER UPDATE OF current_version_id, status ON memory_reflections
+    BEGIN
+        UPDATE companion_cues
+        SET status = 'expired', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            expires_at = COALESCE(expires_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        WHERE status IN ('proposed', 'active', 'surfaced')
+          AND id IN (
+              SELECT cue_id FROM companion_cue_sources
+              WHERE reflection_version_id IS NOT NULL
+                AND reflection_version_id IN (
+                    SELECT id FROM memory_reflection_versions WHERE reflection_id = NEW.id
+                )
+          )
+          AND (NEW.status NOT IN ('confirmed', 'promoted') OR NEW.current_version_id IS NULL
+               OR id IN (
+                   SELECT cue_id FROM companion_cue_sources
+                   WHERE reflection_version_id IS NOT NEW.current_version_id
+               ));
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cues_invalidate_persona_version
+    AFTER UPDATE OF current_version_id, status ON memory_persona_impressions
+    BEGIN
+        UPDATE companion_cues
+        SET status = 'expired', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            expires_at = COALESCE(expires_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        WHERE status IN ('proposed', 'active', 'surfaced')
+          AND id IN (
+              SELECT cue_id FROM companion_cue_sources
+              WHERE persona_version_id IS NOT NULL
+                AND persona_version_id IN (
+                    SELECT id FROM memory_persona_impression_versions
+                    WHERE impression_id = NEW.id
+                )
+          )
+          AND (NEW.status <> 'active' OR NEW.current_version_id IS NULL
+               OR id IN (
+                   SELECT cue_id FROM companion_cue_sources
+                   WHERE persona_version_id IS NOT NEW.current_version_id
+               ));
+    END
+    """,
+    """
+    CREATE TRIGGER companion_cues_invalidate_open_conflict
+    AFTER INSERT ON memory_conflicts
+    WHEN NEW.status = 'open'
+    BEGIN
+        UPDATE companion_cues
+        SET status = 'expired', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            expires_at = COALESCE(expires_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        WHERE status IN ('proposed', 'active', 'surfaced')
+          AND id IN (
+              SELECT cue_id FROM companion_cue_sources
+              WHERE (NEW.target_layer = 'fact' AND fact_version_id = NEW.incumbent_version_id)
+                 OR (NEW.target_layer = 'reflection'
+                     AND reflection_version_id = NEW.incumbent_version_id)
+                 OR (NEW.target_layer = 'persona'
+                     AND persona_version_id = NEW.incumbent_version_id)
+          );
+    END
+    """,
+    "ALTER TABLE proactive_events ADD COLUMN cue_id TEXT",
+    """
+    ALTER TABLE messages ADD COLUMN companion_cue_id TEXT
+        REFERENCES companion_cues(id) ON DELETE SET NULL
+    """,
+    """
+    CREATE INDEX messages_companion_cue_idx
+    ON messages(companion_cue_id)
+    """,
+)
+
+
+def _migrate_to_v7(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V7:
+        connection.execute(statement)
+
+
 _DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
@@ -925,6 +1192,7 @@ _DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
     4: _migrate_to_v4,
     5: _migrate_to_v5,
     6: _migrate_to_v6,
+    7: _migrate_to_v7,
 }
 _REQUIRED_TABLES = {
     "profiles",
@@ -965,6 +1233,9 @@ _REQUIRED_TABLES = {
     "memory_conflicts",
     "memory_audit_events",
     "memory_pipeline_state",
+    "companion_cues",
+    "companion_cue_sources",
+    "companion_cue_audit_events",
 }
 _REQUIRED_TRIGGER_SQL_MARKERS = {
     "memory_versions_are_immutable": (
@@ -1000,6 +1271,15 @@ _REQUIRED_TRIGGER_SQL_MARKERS = {
         "before update on memory_audit_events",
         "raise(abort, 'memory audit events are immutable')",
     ),
+    "companion_cue_audit_events_are_immutable": (
+        "before update on companion_cue_audit_events",
+        "raise(abort, 'companion cue audit events are immutable')",
+    ),
+    "companion_cues_frozen_after_confirmation": (
+        "before update of topic, frozen_text, dedupe_key on companion_cues",
+        "when old.status <> 'proposed'",
+        "raise(abort, 'confirmed companion cue text is immutable')",
+    ),
 }
 _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
     "memory_embedding_one_active_idx": (
@@ -1026,6 +1306,11 @@ _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
         "create unique index",
         "on memory_conflicts(target_layer, target_group_id)",
         "where status = 'open'",
+    ),
+    "companion_cues_live_dedupe_idx": (
+        "create unique index",
+        "on companion_cues(profile_id, dedupe_key)",
+        "where status in ('proposed', 'active', 'surfaced')",
     ),
 }
 _REQUIRED_INDEX_SQL_MARKERS = {
@@ -1054,6 +1339,7 @@ _REQUIRED_COLUMNS = {
         "completed_at",
         "origin",
         "input_modality",
+        "companion_cue_id",
     },
     "attachments": {
         "id",
@@ -1157,6 +1443,7 @@ _REQUIRED_COLUMNS = {
         "displayed_at",
         "disposition",
         "message_id",
+        "cue_id",
     },
     "memory_groups": {
         "id",
@@ -1376,6 +1663,46 @@ _REQUIRED_COLUMNS = {
         "last_maintenance_at",
         "created_at",
         "updated_at",
+    },
+    "companion_cues": {
+        "id",
+        "profile_id",
+        "conversation_id",
+        "kind",
+        "topic",
+        "frozen_text",
+        "status",
+        "reason",
+        "confidence",
+        "keep_until_resolved",
+        "dedupe_key",
+        "created_at",
+        "updated_at",
+        "confirmed_at",
+        "expires_at",
+        "surfaced_at",
+        "resolved_at",
+    },
+    "companion_cue_sources": {
+        "id",
+        "cue_id",
+        "source_kind",
+        "source_message_id",
+        "fact_version_id",
+        "reflection_version_id",
+        "persona_version_id",
+        "created_at",
+    },
+    "companion_cue_audit_events": {
+        "id",
+        "profile_id",
+        "cue_id",
+        "cue_kind",
+        "event_type",
+        "reason_code",
+        "previous_status",
+        "resulting_status",
+        "occurred_at",
     },
 }
 _REQUIRED_FTS_COLUMNS = {

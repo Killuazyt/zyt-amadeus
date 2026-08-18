@@ -278,6 +278,34 @@ def test_message_apis_update_prepend_and_reject_duplicate_ids(panel, qtbot) -> N
     assert not panel.empty_state.isHidden()
 
 
+def test_companion_source_label_is_visible_only_in_chat_and_opens_exact_cue(
+    panel,
+    qtbot,
+) -> None:
+    requested: list[str] = []
+    panel.companion_cue_requested.connect(requested.append)
+    assistant = panel.append_message(
+        "cue-message",
+        "assistant",
+        "你确认过的待续原文。",
+        companion_cue_id="cue-1",
+        companion_source_label="待续话题",
+    )
+    user = panel.append_message(
+        "cue-user",
+        "user",
+        "不会显示来源按钮",
+        companion_cue_id="cue-2",
+        companion_source_label="已授权记忆",
+    )
+
+    assert not assistant.source_button.isHidden()
+    assert assistant.source_button.text() == "基于：待续话题"
+    assert user.source_button.isHidden()
+    qtbot.mouseClick(assistant.source_button, Qt.MouseButton.LeftButton)
+    assert requested == ["cue-1"]
+
+
 def test_render_turn_is_idempotent_and_retry_emits_turn_id(panel, qtbot) -> None:
     panel.show()
     qtbot.waitUntil(panel.isVisible)

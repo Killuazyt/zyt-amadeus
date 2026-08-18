@@ -390,6 +390,7 @@ def test_user_send_waits_for_slow_proactive_cancel_without_provider_overlap(
         qtbot.waitUntil(
             lambda: (
                 not controller.memory_jobs.has_active_job
+                and not controller.deep_memory_jobs.has_active_job
                 and not controller.background_generation.is_running
             )
         )

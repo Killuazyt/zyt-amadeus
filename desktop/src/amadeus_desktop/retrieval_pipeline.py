@@ -15,13 +15,16 @@ from amadeus_desktop.chat_models import (
     AttachmentKind,
     AttachmentSnapshot,
     AttachmentSource,
+    CompanionContextSnapshot,
     ImagePart,
+    InputModality,
     PreparedPrompt,
     PromptContent,
     PromptMessage,
     PromptRole,
     ProviderRoute,
 )
+from amadeus_desktop.companion_context import build_companion_context_snapshot
 from amadeus_desktop.hybrid_retrieval import (
     MAX_SOURCE_HITS,
     RankedRetrievalHit,
@@ -49,6 +52,7 @@ from amadeus_desktop.prompt_context import DefaultPromptContextService, PromptCo
 from amadeus_desktop.storage_models import (
     DEFAULT_PROFILE_ID,
     MemoryRecord,
+    MemoryVersionOrigin,
     PersonaKnowledge,
     RecallStats,
     StoredMessageRole,
@@ -120,6 +124,7 @@ class PromptRetrievalSeed:
     current_prompt_content: PromptContent
     attachments: tuple[AttachmentSnapshot, ...] = ()
     provider_route: ProviderRoute = ProviderRoute.TEXT
+    companion_context: CompanionContextSnapshot = CompanionContextSnapshot()
     user_fts_hits: tuple[RankedRetrievalHit, ...] = ()
     reflection_fts_hits: tuple[RankedRetrievalHit, ...] = ()
     persona_impression_fts_hits: tuple[RankedRetrievalHit, ...] = ()
@@ -146,6 +151,7 @@ def collect_prompt_retrieval_seed(
     memory_enabled: bool,
     deep_memory_enabled: bool = True,
     persona_id: str = DEFAULT_PERSONA_ID,
+    companion_context: CompanionContextSnapshot | None = None,
 ) -> PromptRetrievalSeed:
     """Collect recent context and independent FTS candidate lists."""
 
@@ -164,6 +170,8 @@ def collect_prompt_retrieval_seed(
     attachment_positions = set(user_positions[-3:])
     current_position = user_positions[-1] if user_positions else None
     current_prompt_content: PromptContent = current_user_message
+    current_attachments: tuple[AttachmentSnapshot, ...] = ()
+    current_input_modality = InputModality.TEXT
     for position, message in enumerate(recent_stored):
         if message.role is StoredMessageRole.USER:
             role = PromptRole.USER
@@ -191,6 +199,10 @@ def collect_prompt_retrieval_seed(
                     content = parts[0].text
                 prompt_attachments.extend(snapshots)
             if position == current_position:
+                current_attachments = tuple(
+                    _attachment_snapshot(item) for item in message.attachments
+                )
+                current_input_modality = InputModality(message.input_modality.value)
                 current_prompt_content = content
                 continue
         recent.append(PromptMessage(role, content))
@@ -291,6 +303,14 @@ def collect_prompt_retrieval_seed(
                 for message in (*recent, PromptMessage(PromptRole.USER, current_prompt_content))
             )
             else ProviderRoute.TEXT
+        ),
+        companion_context=(
+            companion_context
+            if companion_context is not None
+            else build_companion_context_snapshot(
+                input_modality=current_input_modality,
+                attachments=current_attachments,
+            )
         ),
         user_fts_hits=user_fts,
         reflection_fts_hits=reflection_fts,
@@ -430,6 +450,11 @@ def finalize_prepared_prompt(
             importance=result.item.importance,
             confidence=result.item.confidence,
             pinned=result.item.pinned,
+            user_confirmed=(
+                memories_by_version[result.item.target_id].kind.value == "relationship"
+                and memories_by_version[result.item.target_id].current_version.origin
+                is MemoryVersionOrigin.MANUAL
+            ),
         )
         for result in bundle.user_memories
     )
@@ -457,7 +482,7 @@ def finalize_prepared_prompt(
     )
     context = prompt_service.build(
         PromptContextInput(
-            safety_boundary=build_capability_safety_boundary(),
+            safety_boundary=build_capability_safety_boundary(seed.companion_context),
             persona=build_persona_core_prompt(follow_user_language=follow_user_language),
             current_date=date.today(),
             current_user_message=seed.current_user_message,
@@ -523,6 +548,7 @@ def finalize_prepared_prompt(
             query=seed.current_user_message,
             selected=tuple(working_items),
         ),
+        companion_context=seed.companion_context,
     )
 
 

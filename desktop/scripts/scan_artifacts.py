@@ -237,8 +237,10 @@ def _is_local_data_export(payload: bytes) -> bool:
     return isinstance(document, dict) and document.get("format") in {
         "amadeus-chat-export/v1",
         "amadeus-chat-export/v2",
+        "amadeus-chat-export/v3",
         "amadeus-memory-export/v1",
         "amadeus-memory-export/v2",
+        "amadeus-memory-export/v3",
     }
 
 

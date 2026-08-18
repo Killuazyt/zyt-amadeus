@@ -44,6 +44,8 @@ _TYPE_LABELS = {
     "summary": "滚动摘要",
     "user": "用户消息",
     "assistant": "助手消息",
+    "conversation_followup": "待续话题",
+    "memory_followup": "授权记忆",
 }
 _STATUS_LABELS = {
     "active": "有效",
@@ -57,6 +59,11 @@ _STATUS_LABELS = {
     "disputed": "有争议",
     "denied": "已否认",
     "readonly": "只读",
+    "proposed": "待确认",
+    "surfaced": "已展示",
+    "resolved": "已解决",
+    "rejected": "已拒绝",
+    "expired": "已过期",
 }
 _LAYER_LABELS = {
     "working": "工作层",
@@ -67,7 +74,22 @@ _LAYER_LABELS = {
     "static_persona": "静态角色资料",
     "timeline": "事件时间线",
     "audit": "审计",
+    "cue": "待续",
 }
+_FACT_STATUS_OPTIONS = (
+    ("全部状态", ""),
+    ("有效", "active"),
+    ("已归档", "archived"),
+)
+_CUE_STATUS_OPTIONS = (
+    ("全部线索", ""),
+    ("待确认", "proposed"),
+    ("可主动使用", "active"),
+    ("已展示", "surfaced"),
+    ("已解决", "resolved"),
+    ("已拒绝", "rejected"),
+    ("已过期", "expired"),
+)
 _SCOPE_LABELS = {
     "user": "用户",
     "companion": "助手",
@@ -151,6 +173,13 @@ class MemoryPage(QWidget):
     export_requested = Signal()
     backup_requested = Signal()
     clear_all_requested = Signal()
+    cue_confirm_requested = Signal(str, str, str, bool)
+    cue_reject_requested = Signal(str)
+    cue_resolve_requested = Signal(str)
+    cue_delete_requested = Signal(str)
+    cue_keep_requested = Signal(str, bool)
+    cue_open_requested = Signal(str)
+    memory_authorization_changed = Signal(str, str, bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -242,11 +271,7 @@ class MemoryPage(QWidget):
             self.type_combo.addItem(label, value)
         self.status_combo = QComboBox()
         self.status_combo.setObjectName("memoryStatusFilter")
-        for label, value in (
-            ("全部状态", ""),
-            ("有效", "active"),
-            ("已归档", "archived"),
-        ):
+        for label, value in _FACT_STATUS_OPTIONS:
             self.status_combo.addItem(label, value)
         self.pinned_combo = QComboBox()
         self.pinned_combo.setObjectName("memoryPinnedFilter")
@@ -277,6 +302,7 @@ class MemoryPage(QWidget):
             ("人格层", "persona"),
             ("事件时间线", "timeline"),
             ("审计", "audit"),
+            ("待续", "cue"),
         ):
             self.layer_combo.addItem(label, value)
         self.layer_combo.setCurrentIndex(2)
@@ -316,6 +342,10 @@ class MemoryPage(QWidget):
         self.detail_edit.setAccessibleName("记忆内容编辑器")
         self.detail_edit.setPlaceholderText("选择记忆后可编辑内容")
         self.detail_edit.setMinimumHeight(100)
+        self.cue_topic_edit = QLineEdit()
+        self.cue_topic_edit.setObjectName("companionCueTopicEditor")
+        self.cue_topic_edit.setPlaceholderText("待续主题")
+        self.cue_topic_edit.setVisible(False)
 
         self.save_edit_button = QPushButton("保存修改")
         self.pin_button = QPushButton("置顶")
@@ -327,6 +357,16 @@ class MemoryPage(QWidget):
         self.rollback_combo = QComboBox()
         self.rollback_combo.setObjectName("memoryVersionRollback")
         self.rollback_button = QPushButton("复制旧版本回滚")
+        self.memory_authorization_check = QCheckBox("允许她主动提起")
+        self.memory_authorization_check.setObjectName("memoryProactiveAuthorization")
+        self.memory_authorization_check.setVisible(False)
+        self.keep_cue_check = QCheckBox("保留至解决")
+        self.keep_cue_check.setObjectName("keepCompanionCueUntilResolved")
+        self.keep_cue_check.setVisible(False)
+        self.resolve_cue_button = QPushButton("标记已解决")
+        self.resolve_cue_button.setVisible(False)
+        self.open_cue_button = QPushButton("在聊天中打开")
+        self.open_cue_button.setVisible(False)
 
         memory_actions = QHBoxLayout()
         memory_actions.addWidget(self.save_edit_button)
@@ -335,6 +375,10 @@ class MemoryPage(QWidget):
         memory_actions.addWidget(self.restore_button)
         memory_actions.addWidget(self.confirm_button)
         memory_actions.addWidget(self.deny_button)
+        memory_actions.addWidget(self.resolve_cue_button)
+        memory_actions.addWidget(self.open_cue_button)
+        memory_actions.addWidget(self.keep_cue_check)
+        memory_actions.addWidget(self.memory_authorization_check)
         memory_actions.addStretch(1)
         memory_actions.addWidget(self.delete_button)
 
@@ -372,8 +416,8 @@ class MemoryPage(QWidget):
         source_actions.addWidget(self.open_lineage_button)
         source_actions.addStretch(1)
 
-        sources_group = QGroupBox("来源")
-        sources_layout = QVBoxLayout(sources_group)
+        self.sources_group = QGroupBox("来源")
+        sources_layout = QVBoxLayout(self.sources_group)
         sources_layout.addWidget(self.source_list)
         sources_layout.addWidget(self.source_preview)
         sources_layout.addLayout(source_actions)
@@ -383,12 +427,13 @@ class MemoryPage(QWidget):
         detail_layout.setContentsMargins(8, 0, 0, 0)
         detail_layout.addWidget(self.detail_title_label)
         detail_layout.addWidget(self.detail_meta_label)
+        detail_layout.addWidget(self.cue_topic_edit)
         detail_layout.addWidget(self.detail_edit)
         detail_layout.addLayout(memory_actions)
         detail_layout.addLayout(version_actions)
         detail_layout.addWidget(self.conflict_notice)
         detail_layout.addLayout(conflict_actions)
-        detail_layout.addWidget(sources_group, 1)
+        detail_layout.addWidget(self.sources_group, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("memorySplitter")
@@ -466,6 +511,10 @@ class MemoryPage(QWidget):
         self.export_button.clicked.connect(self.export_requested.emit)
         self.backup_button.clicked.connect(self.backup_requested.emit)
         self.clear_all_button.clicked.connect(self._request_clear_all)
+        self.resolve_cue_button.clicked.connect(self._request_resolve_cue)
+        self.open_cue_button.clicked.connect(self._request_open_cue)
+        self.keep_cue_check.toggled.connect(self._request_keep_cue)
+        self.memory_authorization_check.toggled.connect(self._request_memory_authorization)
         self._sync_enabled_notice()
         self._sync_memory_detail()
         self._sync_task_action()
@@ -511,6 +560,7 @@ class MemoryPage(QWidget):
         timeline: Iterable[object] = (),
         audit: Iterable[object] = (),
         conflicts: Iterable[object] = (),
+        cues: Iterable[object] = (),
         selected_id: str | None = None,
     ) -> None:
         self._layer_rows = {
@@ -521,9 +571,15 @@ class MemoryPage(QWidget):
             "persona": [*personas, *static_persona],
             "timeline": list(timeline),
             "audit": list(audit),
+            "cue": list(cues),
         }
         self.set_conflicts(conflicts)
-        self._render_memories(self._layer_rows.get(self.current_layer, ()), selected_id)
+        if self.current_layer == "cue":
+            self._render_cue_filter()
+            if selected_id is not None:
+                self.select_memory(selected_id)
+        else:
+            self._render_memories(self._layer_rows.get(self.current_layer, ()), selected_id)
 
     def set_memories(
         self,
@@ -737,24 +793,53 @@ class MemoryPage(QWidget):
     @Slot()
     def _on_layer_changed(self, *_args: object) -> None:
         layer = self.current_layer
-        editable_filter = layer == "fact"
-        for widget in (
-            self.type_combo,
-            self.status_combo,
-            self.pinned_combo,
-            self.sort_combo,
-        ):
-            widget.setEnabled(editable_filter)
-        self._render_memories(self._layer_rows.get(layer, ()))
+        self._sync_status_options(layer)
+        self.type_combo.setEnabled(layer == "fact")
+        self.status_combo.setEnabled(layer in {"fact", "cue"})
+        self.pinned_combo.setEnabled(layer == "fact")
+        self.sort_combo.setEnabled(layer == "fact")
+        if layer == "cue":
+            self._render_cue_filter()
+        else:
+            self._render_memories(self._layer_rows.get(layer, ()))
 
     @Slot()
     def _emit_search(self, *_args: object) -> None:
+        if self.current_layer == "cue":
+            self._render_cue_filter()
+            return
         self.search_requested.emit(
             self.search_edit.text().strip(),
             str(self.type_combo.currentData() or ""),
             str(self.status_combo.currentData() or ""),
             str(self.sort_combo.currentData() or "updated_desc"),
         )
+
+    def _sync_status_options(self, layer: str) -> None:
+        options = _CUE_STATUS_OPTIONS if layer == "cue" else _FACT_STATUS_OPTIONS
+        current = str(self.status_combo.currentData() or "")
+        valid = {value for _label, value in options}
+        with QSignalBlocker(self.status_combo):
+            self.status_combo.clear()
+            for label, value in options:
+                self.status_combo.addItem(label, value)
+            index = self.status_combo.findData(current if current in valid else "")
+            self.status_combo.setCurrentIndex(max(0, index))
+
+    def _render_cue_filter(self) -> None:
+        status = str(self.status_combo.currentData() or "")
+        query = self.search_edit.text().strip().casefold()
+        values = [
+            value
+            for value in self._layer_rows.get("cue", ())
+            if (not status or _enum_text(_member(value, "status", default="")) == status)
+            and (
+                not query
+                or query in str(_member(value, "topic", "topic_key", default="")).casefold()
+                or query in str(_member(value, "frozen_text", "content", default="")).casefold()
+            )
+        ]
+        self._render_memories(values)
 
     @Slot()
     def _on_memory_selection_changed(self) -> None:
@@ -829,6 +914,16 @@ class MemoryPage(QWidget):
         if layer in {"fact", "reflection", "persona"}:
             self.set_status("正在计算永久删除的血缘影响范围。")
             self.delete_impact_requested.emit(layer, memory_id)
+        elif layer == "cue":
+            answer = QMessageBox.question(
+                self,
+                "删除这条陪伴线索？",
+                "将永久清除线索文本和全部来源关系，只保留不含正文的审计事件。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.cue_delete_requested.emit(memory_id)
 
     @Slot()
     def _request_confirm(self) -> None:
@@ -837,6 +932,18 @@ class MemoryPage(QWidget):
             layer = str(self._memories[memory_id]["layer"])
             if layer in {"reflection", "persona"}:
                 self.derived_confirm_requested.emit(layer, memory_id)
+            elif layer == "cue":
+                topic = self.cue_topic_edit.text().strip()
+                frozen_text = self.detail_edit.toPlainText().strip()
+                if not topic or not frozen_text:
+                    self.set_status("主题和确认文本都不能为空。", error=True)
+                    return
+                self.cue_confirm_requested.emit(
+                    memory_id,
+                    topic,
+                    frozen_text,
+                    self.keep_cue_check.isChecked(),
+                )
 
     @Slot()
     def _request_deny(self) -> None:
@@ -845,6 +952,47 @@ class MemoryPage(QWidget):
             layer = str(self._memories[memory_id]["layer"])
             if layer in {"reflection", "persona"}:
                 self.derived_deny_requested.emit(layer, memory_id)
+            elif layer == "cue":
+                self.cue_reject_requested.emit(memory_id)
+
+    @Slot()
+    def _request_resolve_cue(self) -> None:
+        memory_id = self.current_memory_id
+        if memory_id is not None and self.current_layer == "cue":
+            self.cue_resolve_requested.emit(memory_id)
+
+    @Slot()
+    def _request_open_cue(self) -> None:
+        memory_id = self.current_memory_id
+        if memory_id is not None and self.current_layer == "cue":
+            self.cue_open_requested.emit(memory_id)
+
+    @Slot(bool)
+    def _request_keep_cue(self, enabled: bool) -> None:
+        memory_id = self.current_memory_id
+        memory = self._memories.get(memory_id or "")
+        if (
+            memory is not None
+            and memory["layer"] == "cue"
+            and memory["status"] in {"active", "surfaced"}
+            and bool(memory.get("keep_until_resolved")) != bool(enabled)
+        ):
+            self.cue_keep_requested.emit(memory_id or "", bool(enabled))
+
+    @Slot(bool)
+    def _request_memory_authorization(self, enabled: bool) -> None:
+        memory_id = self.current_memory_id
+        memory = self._memories.get(memory_id or "")
+        if memory is None or memory["layer"] not in {"fact", "reflection", "persona"}:
+            return
+        currently_enabled = bool(memory.get("companion_cue_id"))
+        if currently_enabled == bool(enabled):
+            return
+        self.memory_authorization_changed.emit(
+            str(memory["layer"]),
+            str(memory["version_id"]),
+            bool(enabled),
+        )
 
     @Slot()
     def _request_rollback(self) -> None:
@@ -954,6 +1102,12 @@ class MemoryPage(QWidget):
             self.detail_title_label.setText("请选择一条记忆")
             self.detail_meta_label.clear()
             self.detail_edit.clear()
+            self.cue_topic_edit.clear()
+            self.cue_topic_edit.setVisible(False)
+            self.memory_authorization_check.setVisible(False)
+            self.keep_cue_check.setVisible(False)
+            self.resolve_cue_button.setVisible(False)
+            self.open_cue_button.setVisible(False)
             self.archive_button.setVisible(True)
             self.restore_button.setVisible(False)
             self.source_list.clear()
@@ -975,41 +1129,101 @@ class MemoryPage(QWidget):
                 self.keep_conflict_button,
                 self.accept_conflict_button,
                 self.merge_conflict_button,
+                self.resolve_cue_button,
+                self.open_cue_button,
+                self.keep_cue_check,
+                self.memory_authorization_check,
             ):
                 widget.setEnabled(False)
             return
         layer = str(memory["layer"])
-        editable = layer in {"fact", "reflection", "persona"}
+        cue_layer = layer == "cue"
+        cue_proposed = cue_layer and memory["status"] == "proposed"
+        cue_confirmed = cue_layer and memory["status"] in {"active", "surfaced"}
+        editable = layer in {"fact", "reflection", "persona"} or cue_proposed
         derived = layer in {"reflection", "persona"}
-        self.detail_edit.setReadOnly(not editable)
+        self.detail_edit.setReadOnly(not editable or (cue_layer and not cue_proposed))
         self.detail_edit.setEnabled(enabled)
-        self.save_edit_button.setEnabled(editable)
-        self.pin_button.setEnabled(editable)
-        self.delete_button.setEnabled(editable)
-        self.confirm_button.setEnabled(derived)
-        self.deny_button.setEnabled(derived)
+        self.save_edit_button.setVisible(not cue_layer)
+        self.save_edit_button.setEnabled(editable and not cue_layer)
+        self.pin_button.setVisible(not cue_layer)
+        self.pin_button.setEnabled(editable and not cue_layer)
+        self.delete_button.setEnabled(editable or cue_layer)
+        self.confirm_button.setEnabled(derived or cue_proposed)
+        self.deny_button.setEnabled(
+            derived or memory["status"] in {"proposed", "active", "surfaced"}
+        )
         self.detail_title_label.setText(
-            f"{memory['type_label']} · {memory['status_label']} · 版本 {memory['version']}"
+            f"{memory['type_label']} · {memory['status_label']}"
+            if cue_layer
+            else f"{memory['type_label']} · {memory['status_label']} · 版本 {memory['version']}"
         )
-        self.detail_meta_label.setText(
-            f"主题：{memory['topic_key'] or '未设置'}　"
-            f"重要性：{_score_text(memory['importance'])}　"
-            f"置信度：{_score_text(memory['confidence'])}\n"
-            f"层级：{memory['layer_label']}　范围：{memory['subject_scope_label']}　"
-            f"证据分：{memory['evidence_score_text']}\n"
-            f"创建：{memory['created_at'] or '未知'}　"
-            f"更新：{memory['updated_at'] or '未知'}　"
-            f"最近召回：{memory['last_recalled_at'] or '从未'}"
-        )
+        if cue_layer:
+            expiry_text = memory["expires_at"] or (
+                "保留至解决" if memory["keep_until_resolved"] else "未设置"
+            )
+            self.detail_meta_label.setText(
+                f"来源类别：{memory['source_label']}　原因：{memory['reason'] or '用户授权'}　"
+                f"置信度：{_score_text(memory['confidence'])}\n"
+                f"确认：{memory['confirmed_at'] or '尚未确认'}　"
+                f"过期：{expiry_text}　"
+                f"展示：{memory['surfaced_at'] or '尚未展示'}"
+            )
+        else:
+            self.detail_meta_label.setText(
+                f"主题：{memory['topic_key'] or '未设置'}　"
+                f"重要性：{_score_text(memory['importance'])}　"
+                f"置信度：{_score_text(memory['confidence'])}\n"
+                f"层级：{memory['layer_label']}　范围：{memory['subject_scope_label']}　"
+                f"证据分：{memory['evidence_score_text']}\n"
+                f"创建：{memory['created_at'] or '未知'}　"
+                f"更新：{memory['updated_at'] or '未知'}　"
+                f"最近召回：{memory['last_recalled_at'] or '从未'}"
+            )
         self.detail_edit.setPlainText(memory["content"])
+        self.cue_topic_edit.setVisible(cue_layer)
+        self.cue_topic_edit.setReadOnly(not cue_proposed)
+        self.cue_topic_edit.setText(memory["topic_key"])
         self.pin_button.setText("取消置顶" if memory["pinned"] else "置顶")
         archived = memory["status"] == "archived"
-        self.archive_button.setVisible(editable and not archived)
-        self.archive_button.setEnabled(editable and not archived)
-        self.restore_button.setVisible(editable and archived)
-        self.restore_button.setEnabled(editable and archived)
-        self.confirm_button.setVisible(derived)
-        self.deny_button.setVisible(derived)
+        self.archive_button.setVisible(not cue_layer and editable and not archived)
+        self.archive_button.setEnabled(not cue_layer and editable and not archived)
+        self.restore_button.setVisible(not cue_layer and editable and archived)
+        self.restore_button.setEnabled(not cue_layer and editable and archived)
+        self.confirm_button.setVisible(derived or cue_proposed)
+        self.confirm_button.setText("确认并启用" if cue_layer else "确认")
+        self.deny_button.setVisible(
+            derived or (cue_layer and memory["status"] in {"proposed", "active", "surfaced"})
+        )
+        self.deny_button.setText("拒绝 / 撤销" if cue_layer else "否认")
+        self.resolve_cue_button.setVisible(cue_confirmed)
+        self.resolve_cue_button.setEnabled(cue_confirmed)
+        self.open_cue_button.setVisible(cue_confirmed)
+        self.open_cue_button.setEnabled(cue_confirmed)
+        self.keep_cue_check.setVisible(cue_proposed or cue_confirmed)
+        self.keep_cue_check.setEnabled(cue_proposed or cue_confirmed)
+        with QSignalBlocker(self.keep_cue_check):
+            self.keep_cue_check.setChecked(bool(memory.get("keep_until_resolved")))
+        authorization_eligible = (
+            (layer == "fact" and memory["status"] == "active" and not memory["conflicted"])
+            or (
+                layer == "reflection"
+                and memory["status"] in {"confirmed", "promoted"}
+                and not memory["conflicted"]
+            )
+            or (layer == "persona" and memory["status"] == "active" and not memory["conflicted"])
+        )
+        has_authorization = bool(memory.get("companion_cue_id"))
+        self.memory_authorization_check.setVisible(
+            layer in {"fact", "reflection", "persona"}
+            and (authorization_eligible or has_authorization)
+        )
+        self.memory_authorization_check.setEnabled(authorization_eligible or has_authorization)
+        with QSignalBlocker(self.memory_authorization_check):
+            self.memory_authorization_check.setChecked(has_authorization)
+        self.memory_authorization_check.setToolTip(
+            "开启后先生成本地可编辑草稿，仍需在“待续”中确认；不会调用远程模型。"
+        )
         self._render_sources(layer, memory["memory_id"])
         self._render_versions(layer, memory["memory_id"])
         conflict = self._conflicts_by_target.get((layer, memory["memory_id"]))
@@ -1030,7 +1244,9 @@ class MemoryPage(QWidget):
         with QSignalBlocker(self.source_list):
             self.source_list.clear()
             for source in sources:
-                if source["method"] == "manual":
+                if source["method"] == "companion_cue_source":
+                    prefix = source["content"]
+                elif source["method"] == "manual":
                     prefix = "手工编辑"
                 elif not source["available"]:
                     prefix = "来源已删除"
@@ -1180,6 +1396,15 @@ def _memory_row(value: object) -> dict[str, Any]:
                 default="",
             )
         ),
+        "companion_cue_id": str(_member(record, "companion_cue_id", default="") or ""),
+        "companion_cue_status": str(_member(record, "companion_cue_status", default="") or ""),
+        "keep_until_resolved": bool(_member(record, "keep_until_resolved", default=False)),
+        "source_label": str(_member(record, "source_label", default="") or ""),
+        "reason": _enum_text(_member(record, "reason", default="")),
+        "confirmed_at": _display_value(_member(record, "confirmed_at", default="")),
+        "expires_at": _display_value(_member(record, "expires_at", default="")),
+        "surfaced_at": _display_value(_member(record, "surfaced_at", default="")),
+        "resolved_at": _display_value(_member(record, "resolved_at", default="")),
     }
 
 
@@ -1263,6 +1488,27 @@ def _generation_text(generation: str, status: str, count: int) -> str:
 
 
 def _source_row(value: object) -> dict[str, Any]:
+    cue_source_kind = str(_member(value, "source_kind", default="") or "")
+    cue_source_target = str(_member(value, "source_target_id", default="") or "")
+    if cue_source_kind:
+        label = {
+            "user_message": "用户消息",
+            "fact_version": "事实版本",
+            "reflection_version": "反思版本",
+            "persona_version": "人格印象版本",
+        }.get(cue_source_kind, cue_source_kind)
+        return {
+            "conversation_id": "",
+            "message_id": cue_source_target if cue_source_kind == "user_message" else "",
+            "content": f"{label} · {cue_source_target}",
+            "created_at": "",
+            "method": "companion_cue_source",
+            "available": False,
+            "version_number": 0,
+            "parent_version_id": (cue_source_target if cue_source_kind != "user_message" else ""),
+            "parent_group_id": "",
+            "parent_layer": "",
+        }
     method = str(_member(value, "method", "extraction_method", default=""))
     deleted = bool(_member(value, "deleted", "is_deleted", "source_deleted", default=False))
     available = bool(_member(value, "available", default=not deleted)) and not deleted

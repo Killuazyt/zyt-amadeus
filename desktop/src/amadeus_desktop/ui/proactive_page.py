@@ -35,6 +35,7 @@ class ProactivePage(QWidget):
     daily_limit_changed = Signal(int)
     pause_today_changed = Signal(bool)
     ai_greetings_enabled_changed = Signal(bool)
+    contextual_followups_enabled_changed = Signal(bool)
     greeting_file_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -96,6 +97,19 @@ class ProactivePage(QWidget):
         source_group = QGroupBox("问候来源")
         source_group.setLayout(source_layout)
 
+        self.contextual_followups_enabled = QCheckBox("允许使用逐条确认的陪伴线索")
+        self.contextual_followups_enabled.setObjectName("contextualFollowupsEnabled")
+        contextual_note = QLabel(
+            "默认关闭。线索必须逐条审阅并确认；桌面气泡只显示泛化提示，"
+            "每条只主动展示一次，默认确认后 30 天过期。点击后才会在聊天中展开原文。"
+        )
+        contextual_note.setWordWrap(True)
+        contextual_layout = QVBoxLayout()
+        contextual_layout.addWidget(self.contextual_followups_enabled)
+        contextual_layout.addWidget(contextual_note)
+        contextual_group = QGroupBox("上下文待续")
+        contextual_group.setLayout(contextual_layout)
+
         self.status_label = QLabel()
         self.status_label.setObjectName("proactiveStatus")
         self.status_label.setWordWrap(True)
@@ -105,6 +119,7 @@ class ProactivePage(QWidget):
         layout.addWidget(explanation)
         layout.addWidget(policy_group)
         layout.addWidget(source_group)
+        layout.addWidget(contextual_group)
         layout.addWidget(self.status_label)
         layout.addStretch(1)
 
@@ -114,6 +129,9 @@ class ProactivePage(QWidget):
         self.daily_limit.valueChanged.connect(self.daily_limit_changed.emit)
         self.pause_today.toggled.connect(self.pause_today_changed.emit)
         self.ai_greetings_enabled.toggled.connect(self.ai_greetings_enabled_changed.emit)
+        self.contextual_followups_enabled.toggled.connect(
+            self.contextual_followups_enabled_changed.emit
+        )
         self.import_greetings_button.clicked.connect(self._choose_greeting_file)
 
     def apply_settings(
@@ -125,6 +143,7 @@ class ProactivePage(QWidget):
         daily_limit: int,
         paused_today: bool,
         ai_greetings_enabled: bool,
+        contextual_followups_enabled: bool = False,
     ) -> None:
         index = self.mode_combo.findData(mode)
         selected_index = index if index >= 0 else self.mode_combo.findData("off")
@@ -140,6 +159,8 @@ class ProactivePage(QWidget):
             self.pause_today.setChecked(bool(paused_today))
         with QSignalBlocker(self.ai_greetings_enabled):
             self.ai_greetings_enabled.setChecked(bool(ai_greetings_enabled))
+        with QSignalBlocker(self.contextual_followups_enabled):
+            self.contextual_followups_enabled.setChecked(bool(contextual_followups_enabled))
 
     def set_paused_local_date(
         self,

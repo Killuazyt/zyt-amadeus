@@ -115,6 +115,32 @@ def test_persona_knowledge_is_separate_limited_and_never_counted_as_user_memory(
     assert result.memory_character_count <= int(DEFAULT_CHARACTER_BUDGET * 0.20)
 
 
+def test_only_explicitly_confirmed_relationship_memory_receives_confirmation_marker() -> None:
+    result = DefaultPromptContextService().build(
+        build_input(
+            memories=(
+                PromptMemory(
+                    "relationship-unconfirmed",
+                    MemoryKind.RELATIONSHIP,
+                    "互动越来越稳定",
+                    memory_version_id="relationship-v1",
+                ),
+                PromptMemory(
+                    "relationship-confirmed",
+                    MemoryKind.RELATIONSHIP,
+                    "用户确认把她视为长期桌面伙伴",
+                    memory_version_id="relationship-v2",
+                    user_confirmed=True,
+                ),
+            )
+        )
+    )
+    visible = "\n".join(str(message.content) for message in result.messages)
+
+    assert "[关系状态] 互动越来越稳定" in visible
+    assert "[关系状态·用户已确认] 用户确认把她视为长期桌面伙伴" in visible
+
+
 def test_inactive_duplicate_and_oversized_persona_fragments_are_skipped() -> None:
     result = DefaultPromptContextService().build(
         build_input(

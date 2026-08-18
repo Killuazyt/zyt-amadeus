@@ -307,6 +307,10 @@ def test_versioned_exports_are_atomic_utf8_and_do_not_read_settings_or_credentia
         "summaries",
         "attachments",
         "message_attachments",
+        "companion_cues",
+        "companion_cue_sources",
+        "proactive_events",
+        "companion_cue_audit_events",
     }
     assert set(memory) == {
         "format",
@@ -316,6 +320,7 @@ def test_versioned_exports_are_atomic_utf8_and_do_not_read_settings_or_credentia
         "evidence_signals",
         "conflicts",
         "audit_events",
+        "companion_followups",
     }
     assert set(memory["layers"]) == {
         "recent",
@@ -331,7 +336,7 @@ def test_versioned_exports_are_atomic_utf8_and_do_not_read_settings_or_credentia
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_memory_export_v2_contains_lineage_evidence_conflicts_and_bodyless_audit(
+def test_memory_export_v3_contains_lineage_evidence_conflicts_and_bodyless_audit(
     tmp_path: Path,
 ) -> None:
     database = _seed_database(tmp_path)
@@ -386,7 +391,7 @@ def test_memory_export_v2_contains_lineage_evidence_conflicts_and_bodyless_audit
         database.close()
 
     payload = json.loads(destination.read_text(encoding="utf-8"))
-    assert payload["format"] == "amadeus-memory-export/v2"
+    assert payload["format"] == "amadeus-memory-export/v3"
     reflection_layer = payload["layers"]["reflections"]
     persona_layer = payload["layers"]["persona_impressions"]
     assert reflection_layer["groups"][0]["id"] == reflection.group_id
@@ -884,7 +889,7 @@ def test_old_v5_database_and_v8_settings_backup_restores_then_migrates_to_p7f(
             backup_dir=paths.directory(AppDirectory.BACKUPS),
         ).open()
         try:
-            assert migrated_database.schema_version == 6
+            assert migrated_database.schema_version == 7
             assert "memory_reflections" in {
                 row[0]
                 for row in migrated_database.connection.execute(

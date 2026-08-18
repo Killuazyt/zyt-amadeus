@@ -63,6 +63,40 @@ class AttachmentSource(StrEnum):
     CAMERA = "camera"
 
 
+class CompanionRequestKind(StrEnum):
+    """The user-authorized request boundary represented by one snapshot."""
+
+    CONVERSATION = "conversation"
+    PROACTIVE = "proactive"
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionContextSnapshot:
+    """Immutable evidence of what this exact request actually contains.
+
+    The snapshot deliberately records supplied data instead of device
+    availability.  A camera becoming available later therefore cannot widen a
+    retry that originally contained only text.
+    """
+
+    request_kind: CompanionRequestKind = CompanionRequestKind.CONVERSATION
+    input_modality: InputModality = InputModality.TEXT
+    visual_sources: tuple[AttachmentSource, ...] = ()
+    has_document_attachment: bool = False
+
+    def __post_init__(self) -> None:
+        normalized = tuple(dict.fromkeys(AttachmentSource(value) for value in self.visual_sources))
+        object.__setattr__(self, "visual_sources", normalized)
+
+    @property
+    def has_visual_evidence(self) -> bool:
+        return bool(self.visual_sources)
+
+    @property
+    def is_voice_transcript(self) -> bool:
+        return self.input_modality is InputModality.VOICE
+
+
 class ProviderCapability(StrEnum):
     """Provider feature sets used by the local router."""
 
@@ -152,6 +186,8 @@ class ChatMessage:
     error: str | None = None
     attachments: tuple[AttachmentSnapshot, ...] = ()
     input_modality: InputModality = InputModality.TEXT
+    companion_cue_id: str | None = None
+    companion_source_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +202,7 @@ class ConversationTurn:
     provider_error_code: str | None = None
     status_text: str | None = None
     error: str | None = None
+    companion_context: CompanionContextSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +261,7 @@ class ChatRequest:
     attachments: tuple[AttachmentSnapshot, ...] = ()
     provider_route: ProviderRoute = ProviderRoute.TEXT
     provider_role: str | None = None
+    companion_context: CompanionContextSnapshot = field(default_factory=CompanionContextSnapshot)
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,3 +278,4 @@ class PreparedPrompt:
     attachments: tuple[AttachmentSnapshot, ...] = ()
     provider_route: ProviderRoute = ProviderRoute.TEXT
     working_memory_snapshot: WorkingMemorySnapshot | None = None
+    companion_context: CompanionContextSnapshot = field(default_factory=CompanionContextSnapshot)

@@ -228,6 +228,7 @@ class ApplicationController:
         self._shutdown_clean: bool | None = None
         self._restore_scheduled = False
         self._chat_reposition_scheduled = False
+        self._pending_companion_cue_selection: str | None = None
         self._turn_started_at: dict[str, float] = {}
         self._active_focus_decision = FocusModeDecision()
         if (
@@ -509,6 +510,7 @@ class ApplicationController:
                 resource.jobs,
                 resource.memories,
                 resource.deep_memories,
+                resource.companion_cues,
             ),
             memory_enabled=bool(self.settings["memory"]["enabled"]),
             parent=application,
@@ -874,6 +876,7 @@ class ApplicationController:
             daily_limit=int(proactive["daily_limit"]),
             paused_today=self._proactive_is_paused_today(),
             ai_greetings_enabled=bool(proactive["ai_greetings_enabled"]),
+            contextual_followups_enabled=bool(proactive.get("contextual_followups_enabled", False)),
         )
         greeting_file = self.paths.directory(AppDirectory.PERSONAS) / "kurisu" / "greetings.json"
         self.proactive_page.set_greeting_source(
@@ -914,6 +917,9 @@ class ApplicationController:
         self.proactive_page.pause_today_changed.connect(self._set_proactive_paused_today)
         self.proactive_page.ai_greetings_enabled_changed.connect(
             lambda value: self._set_proactive_value("ai_greetings_enabled", value)
+        )
+        self.proactive_page.contextual_followups_enabled_changed.connect(
+            lambda value: self._set_proactive_value("contextual_followups_enabled", value)
         )
         self.proactive_page.greeting_file_requested.connect(self._import_greeting_catalog)
 
@@ -2007,6 +2013,14 @@ class ApplicationController:
         self.settings_window.show_and_activate("memory")
         self.data_service.refresh_memories()
 
+    def _show_companion_cue_from_chat(self, cue_id: str) -> None:
+        if self._exiting:
+            return
+        self.hide_chat()
+        self._pending_companion_cue_selection = cue_id
+        self.settings_window.show_and_activate("memory")
+        self.data_service.refresh_memories()
+
     def _connect_data_ui(self) -> None:
         self.data_service.startup_loaded.connect(self._on_data_startup_loaded)
         self.data_service.startup_failed.connect(self._on_data_startup_failed)
@@ -2024,6 +2038,8 @@ class ApplicationController:
         self.data_service.deletion_impact_loaded.connect(self.memory_page.confirm_delete_impact)
         self.data_service.source_context_loaded.connect(self._on_source_context_loaded)
         self.data_service.operation_failed.connect(self._on_data_operation_failed)
+        self.data_service.companion_cue_changed.connect(self._on_companion_cue_changed)
+        self.data_service.companion_cue_opened.connect(lambda _cue_id: self.show_chat())
         self.data_service.index_rebuild_requested.connect(self._request_incremental_index_refresh)
         self.vector_index.status_changed.connect(self.memory_page.set_retrieval_status)
         self.vector_index.status_changed.connect(self._queue_vector_index_status)
@@ -2033,6 +2049,7 @@ class ApplicationController:
         self.chat_panel.conversation_switch_requested.connect(self._request_conversation_switch)
         self.chat_panel.new_conversation_requested.connect(self._request_new_conversation)
         self.chat_panel.history_requested.connect(self._show_history_settings_from_chat)
+        self.chat_panel.companion_cue_requested.connect(self._show_companion_cue_from_chat)
         self.history_page.refresh_requested.connect(self.data_service.refresh_history)
         self.history_page.conversation_selected.connect(self._request_conversation_switch)
         self.history_page.new_conversation_requested.connect(self._request_new_conversation)
@@ -2071,6 +2088,15 @@ class ApplicationController:
         self.memory_page.retry_task_requested.connect(self.data_service.retry_failed_job)
         self.memory_page.verify_model_requested.connect(self._verify_local_embedding_model)
         self.memory_page.rebuild_index_requested.connect(self._request_index_rebuild)
+        self.memory_page.cue_confirm_requested.connect(self.data_service.confirm_companion_cue)
+        self.memory_page.cue_reject_requested.connect(self.data_service.reject_companion_cue)
+        self.memory_page.cue_resolve_requested.connect(self.data_service.resolve_companion_cue)
+        self.memory_page.cue_delete_requested.connect(self.data_service.delete_companion_cue)
+        self.memory_page.cue_keep_requested.connect(self.data_service.set_companion_cue_keep)
+        self.memory_page.cue_open_requested.connect(self.data_service.open_companion_cue)
+        self.memory_page.memory_authorization_changed.connect(
+            self._set_memory_followup_authorization
+        )
 
     def _on_data_startup_loaded(self, snapshot_object: object) -> None:
         if not isinstance(snapshot_object, ConversationSnapshot):
@@ -2320,8 +2346,13 @@ class ApplicationController:
             timeline=snapshot_object.timeline_rows,
             audit=snapshot_object.audit_rows,
             conflicts=snapshot_object.conflict_rows,
+            cues=snapshot_object.cue_rows,
             selected_id=selected,
         )
+        pending_cue_id = self._pending_companion_cue_selection
+        if pending_cue_id is not None:
+            self._pending_companion_cue_selection = None
+            self.memory_page.select_layer_memory("cue", pending_cue_id)
         self.memory_page.set_failed_tasks(snapshot_object.failed_jobs)
         persistent_count = (
             len(snapshot_object.rows)
@@ -2329,6 +2360,27 @@ class ApplicationController:
             + len(snapshot_object.persona_rows)
         )
         self.memory_page.set_status(f"已加载 {persistent_count} 条持久语义记忆。")
+
+    def _on_companion_cue_changed(self, value: object) -> None:
+        cue_id = getattr(value, "cue_id", None)
+        kind = str(getattr(getattr(value, "kind", None), "value", ""))
+        status = str(getattr(getattr(value, "status", None), "value", ""))
+        if isinstance(cue_id, str) and kind == "memory_followup" and status == "proposed":
+            self._pending_companion_cue_selection = cue_id
+            self.memory_page.set_status("已生成本地可编辑草稿，请确认后才能主动使用。")
+        else:
+            self.memory_page.set_status("陪伴线索已更新。")
+
+    def _set_memory_followup_authorization(
+        self,
+        layer: str,
+        version_id: str,
+        enabled: bool,
+    ) -> None:
+        if enabled:
+            self.data_service.authorize_memory_followup(layer, version_id)
+        else:
+            self.data_service.revoke_memory_followup(layer, version_id)
 
     def _on_vector_index_status_changed(self, status: object) -> None:
         if self._exiting:
@@ -2501,7 +2553,7 @@ class ApplicationController:
             category,
         )
         self._last_safe_error_category = "storage_error"
-        self.proactive_interactions.persistence_failed(operation)
+        self.proactive_interactions.persistence_failed(operation, category)
         if operation == "clear_memories":
             self.deep_memory_jobs.resume()
             self.memory_jobs.resume()

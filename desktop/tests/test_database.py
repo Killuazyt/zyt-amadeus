@@ -15,10 +15,10 @@ from amadeus_desktop.database import (
 from amadeus_desktop.memory_store import MemoryStore
 
 
-def test_schema_v6_enables_required_pragmas_and_entities(tmp_path) -> None:
+def test_schema_v7_enables_required_pragmas_and_entities(tmp_path) -> None:
     path = tmp_path / "data" / "amadeus.sqlite3"
     with SQLiteDatabase(path, busy_timeout_ms=3_210) as database:
-        assert database.schema_version == SCHEMA_VERSION == 6
+        assert database.schema_version == SCHEMA_VERSION == 7
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert str(database.pragma_value("journal_mode")).lower() == "wal"
         assert database.pragma_value("foreign_keys") == 1
@@ -64,7 +64,7 @@ def test_schema_v6_enables_required_pragmas_and_entities(tmp_path) -> None:
     assert path.parent.name == "data"
 
 
-def test_schema_v1_is_backed_up_and_migrated_to_v6_without_losing_data(tmp_path) -> None:
+def test_schema_v1_is_backed_up_and_migrated_to_v7_without_losing_data(tmp_path) -> None:
     path = tmp_path / "amadeus.sqlite3"
     legacy = sqlite3.connect(path)
     legacy.execute("PRAGMA foreign_keys = ON")
@@ -79,7 +79,7 @@ def test_schema_v1_is_backed_up_and_migrated_to_v6_without_losing_data(tmp_path)
     database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
     try:
         assert not database.read_only
-        assert database.schema_version == 6
+        assert database.schema_version == 7
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         assert database.last_backup_path is not None
         assert (
@@ -158,7 +158,7 @@ def test_schema_v2_migrates_messages_and_application_identity_without_data_loss(
     backup_path = database.last_backup_path
     try:
         assert not database.read_only
-        assert database.schema_version == 6
+        assert database.schema_version == 7
         assert database.pragma_value("application_id") == AMADEUS_APPLICATION_ID
         row = database.connection.execute(
             "SELECT content, origin, input_modality FROM messages WHERE id = 'm'"
@@ -199,7 +199,7 @@ def test_schema_v2_migrates_messages_and_application_identity_without_data_loss(
         backup.close()
 
 
-def test_schema_v5_to_v6_keeps_history_out_of_deep_backfill_until_user_edit(tmp_path) -> None:
+def test_schema_v5_to_v7_keeps_history_out_of_deep_backfill_until_user_edit(tmp_path) -> None:
     path = tmp_path / "amadeus.sqlite3"
     legacy = sqlite3.connect(path)
     legacy.execute("PRAGMA foreign_keys = ON")
@@ -268,7 +268,7 @@ def test_schema_v5_to_v6_keeps_history_out_of_deep_backfill_until_user_edit(tmp_
 
     database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
     try:
-        assert database.schema_version == 6
+        assert database.schema_version == 7
         assert (
             database.connection.execute(
                 "SELECT deep_memory_eligible FROM memory_versions WHERE id = 'fact-v1'"

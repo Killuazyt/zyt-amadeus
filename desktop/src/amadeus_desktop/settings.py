@@ -29,7 +29,7 @@ from amadeus_desktop.provider_profiles import (
     migrate_legacy_provider_settings,
 )
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 
 _SAFE_PET_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -109,6 +109,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "daily_limit": 2,
         "paused_local_date": None,
         "ai_greetings_enabled": False,
+        "contextual_followups_enabled": False,
     },
 }
 
@@ -296,6 +297,16 @@ def _migrate_v9_to_v10(
     return migrated
 
 
+def _migrate_v10_to_v11(source: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(source)
+    migrated["schema_version"] = 11
+    proactive = migrated.setdefault("proactive", deepcopy(DEFAULT_SETTINGS["proactive"]))
+    if not isinstance(proactive, dict):
+        raise InvalidSettingsError("The proactive settings section must be an object.")
+    proactive.setdefault("contextual_followups_enabled", False)
+    return migrated
+
+
 _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
     1: _migrate_v1_to_v2,
@@ -307,6 +318,7 @@ _MIGRATIONS: Mapping[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     7: _migrate_v7_to_v8,
     8: _migrate_v8_to_v9,
     9: _migrate_v9_to_v10,
+    10: _migrate_v10_to_v11,
 }
 
 
@@ -658,6 +670,8 @@ class SettingsRepository:
             cls._validate_local_date(paused_local_date)
         if not isinstance(proactive.get("ai_greetings_enabled"), bool):
             raise InvalidSettingsError("proactive.ai_greetings_enabled must be a boolean.")
+        if not isinstance(proactive.get("contextual_followups_enabled"), bool):
+            raise InvalidSettingsError("proactive.contextual_followups_enabled must be a boolean.")
 
     @staticmethod
     def _require_exact_fields(

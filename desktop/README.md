@@ -3,8 +3,8 @@
 P7 adds reproducible Windows packaging, legacy-architecture auditing, and a clean-machine installer
 acceptance workflow on top of the complete P6 settings, tray, proactive-interaction, and local-data-management
 closure and the tested P1 application foundation, P2 desktop-pet engine, P3 attached chat flow, P4 secure
-text-model integration, and P5 auditable hybrid memory. P7C-P7E extend that same conversation state
-machine with managed image/document attachments, sentence-level low-latency voice, and opt-in screen,
+text-model integration, and P5 auditable hybrid memory. P7C-P7H extend that same conversation state
+machine with managed image/document attachments, sentence-level low-latency voice, opt-in screen,
 window, camera, and manual-region visual input. The application includes safe local pet
 import/switch/removal, fixed-clock animation, transparent hit testing, manual drag placement,
 multi-screen recovery, the pinned P7B high-resolution built-in Kurisu spritesheet, cancellable chat states, and an exact
@@ -19,6 +19,12 @@ settings window, verified HKCU startup control, restrained greetings, diagnostic
 exports, attachment-inclusive backup/restore, and fail-closed factory reset. Capture is always opt-in
 and off at application startup; privacy mode stops and releases active media sources. Tool execution,
 autonomous desktop actions, WebRTC, and continuous background listening remain outside scope.
+
+P7H freezes a request-scoped capability snapshot for text, completed voice transcripts, attachments,
+and explicitly shared visual frames. It also adds user-reviewed companion cues bound to exact memory
+versions, an off-by-default contextual-follow-up switch, one-shot privacy-safe bubbles, local-only cue
+opening, and a cue-management view. SQLite is schema v7, settings are schema v11, chat and memory
+exports are v3, and the backup remains v2. See [P7H-ACCEPTANCE.md](P7H-ACCEPTANCE.md).
 
 ## Development commands
 

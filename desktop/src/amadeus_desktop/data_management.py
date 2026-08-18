@@ -41,8 +41,8 @@ from amadeus_desktop.settings import (
     validate_settings_document,
 )
 
-CHAT_EXPORT_FORMAT = "amadeus-chat-export/v2"
-MEMORY_EXPORT_FORMAT = "amadeus-memory-export/v2"
+CHAT_EXPORT_FORMAT = "amadeus-chat-export/v3"
+MEMORY_EXPORT_FORMAT = "amadeus-memory-export/v3"
 BACKUP_FORMAT = "amadeus-backup/v2"
 LEGACY_BACKUP_FORMAT = "amadeus-backup/v1"
 
@@ -150,6 +150,10 @@ class ChatExportBundle:
     summaries: tuple[Mapping[str, object], ...]
     attachments: tuple[Mapping[str, object], ...] = ()
     message_attachments: tuple[Mapping[str, object], ...] = ()
+    companion_cues: tuple[Mapping[str, object], ...] = ()
+    companion_cue_sources: tuple[Mapping[str, object], ...] = ()
+    proactive_events: tuple[Mapping[str, object], ...] = ()
+    companion_cue_audit_events: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +175,9 @@ class MemoryExportBundle:
     evidence_signals: tuple[Mapping[str, object], ...] = ()
     conflicts: tuple[Mapping[str, object], ...] = ()
     audit_events: tuple[Mapping[str, object], ...] = ()
+    companion_cues: tuple[Mapping[str, object], ...] = ()
+    companion_cue_sources: tuple[Mapping[str, object], ...] = ()
+    companion_cue_audit_events: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +281,11 @@ class SQLiteExportRepository:
         modality_expression = (
             "input_modality" if "input_modality" in message_columns else "'text' AS input_modality"
         )
+        companion_expression = (
+            "companion_cue_id"
+            if "companion_cue_id" in message_columns
+            else "NULL AS companion_cue_id"
+        )
         conversations = self._rows(
             """
             SELECT id, profile_id, title, status, created_at, updated_at, last_activity_at
@@ -284,7 +296,7 @@ class SQLiteExportRepository:
         messages = self._rows(
             f"""
             SELECT sequence, id, conversation_id, turn_id, role, {origin_expression},
-                   {modality_expression},
+                   {modality_expression}, {companion_expression},
                    content, status, attempt, terminal_reason, provider_name, model_name,
                    failure_code, participates_in_memory, created_at, updated_at, completed_at
             FROM messages
@@ -307,6 +319,10 @@ class SQLiteExportRepository:
         }
         attachments: tuple[Mapping[str, object], ...] = ()
         message_attachments: tuple[Mapping[str, object], ...] = ()
+        companion_cues: tuple[Mapping[str, object], ...] = ()
+        companion_cue_sources: tuple[Mapping[str, object], ...] = ()
+        proactive_events: tuple[Mapping[str, object], ...] = ()
+        companion_cue_audit_events: tuple[Mapping[str, object], ...] = ()
         if {"attachments", "message_attachments"}.issubset(table_names):
             attachments = self._rows(
                 """
@@ -323,6 +339,58 @@ class SQLiteExportRepository:
                 ORDER BY message_id, ordinal, attachment_id
                 """
             )
+        if schema >= 7 and {
+            "companion_cues",
+            "companion_cue_sources",
+            "proactive_events",
+        }.issubset(table_names):
+            companion_cues = self._rows(
+                """
+                SELECT id, profile_id, conversation_id, kind, topic, frozen_text,
+                       status, reason, confidence, keep_until_resolved, created_at,
+                       updated_at, confirmed_at, expires_at, surfaced_at, resolved_at
+                FROM companion_cues
+                WHERE kind = 'conversation_followup'
+                   OR id IN (
+                       SELECT companion_cue_id FROM messages
+                       WHERE companion_cue_id IS NOT NULL
+                   )
+                ORDER BY created_at, id
+                """
+            )
+            companion_cue_sources = self._rows(
+                """
+                SELECT source.id, source.cue_id, source.source_kind,
+                       source.source_message_id, source.fact_version_id,
+                       source.reflection_version_id, source.persona_version_id,
+                       source.created_at
+                FROM companion_cue_sources source
+                JOIN companion_cues cue ON cue.id = source.cue_id
+                WHERE cue.kind = 'conversation_followup'
+                   OR cue.id IN (
+                       SELECT companion_cue_id FROM messages
+                       WHERE companion_cue_id IS NOT NULL
+                   )
+                ORDER BY source.created_at, source.id
+                """
+            )
+            proactive_events = self._rows(
+                """
+                SELECT id, profile_id, local_date, trigger_kind, displayed_at,
+                       disposition, message_id, cue_id
+                FROM proactive_events
+                ORDER BY displayed_at, id
+                """
+            )
+            companion_cue_audit_events = self._rows(
+                """
+                SELECT id, profile_id, cue_id, cue_kind, event_type, reason_code,
+                       previous_status, resulting_status, occurred_at
+                FROM companion_cue_audit_events
+                WHERE cue_kind = 'conversation_followup'
+                ORDER BY occurred_at, id
+                """
+            )
         return ChatExportBundle(
             schema,
             conversations,
@@ -330,6 +398,10 @@ class SQLiteExportRepository:
             summaries,
             attachments,
             message_attachments,
+            companion_cues,
+            companion_cue_sources,
+            proactive_events,
+            companion_cue_audit_events,
         )
 
     def load_memory_bundle(self) -> MemoryExportBundle:
@@ -475,6 +547,40 @@ class SQLiteExportRepository:
                 """
             )
         )
+        companion_cues: tuple[Mapping[str, object], ...] = ()
+        companion_cue_sources: tuple[Mapping[str, object], ...] = ()
+        companion_cue_audit_events: tuple[Mapping[str, object], ...] = ()
+        if schema >= 7:
+            companion_cues = self._rows(
+                """
+                SELECT id, profile_id, kind, topic, frozen_text, status, reason,
+                       confidence, keep_until_resolved, created_at, updated_at,
+                       confirmed_at, expires_at, surfaced_at, resolved_at
+                FROM companion_cues
+                WHERE kind = 'memory_followup'
+                ORDER BY created_at, id
+                """
+            )
+            companion_cue_sources = self._rows(
+                """
+                SELECT source.id, source.cue_id, source.source_kind,
+                       source.fact_version_id, source.reflection_version_id,
+                       source.persona_version_id, source.created_at
+                FROM companion_cue_sources source
+                JOIN companion_cues cue ON cue.id = source.cue_id
+                WHERE cue.kind = 'memory_followup'
+                ORDER BY source.created_at, source.id
+                """
+            )
+            companion_cue_audit_events = self._rows(
+                """
+                SELECT id, profile_id, cue_id, cue_kind, event_type, reason_code,
+                       previous_status, resulting_status, occurred_at
+                FROM companion_cue_audit_events
+                WHERE cue_kind = 'memory_followup'
+                ORDER BY occurred_at, id
+                """
+            )
         return MemoryExportBundle(
             schema,
             groups,
@@ -491,6 +597,9 @@ class SQLiteExportRepository:
             evidence_signals,
             conflicts,
             audit_events,
+            companion_cues,
+            companion_cue_sources,
+            companion_cue_audit_events,
         )
 
     def _schema_version(self) -> int:
@@ -542,6 +651,10 @@ def export_chat_json(
         "summaries": list(bundle.summaries),
         "attachments": list(bundle.attachments),
         "message_attachments": list(bundle.message_attachments),
+        "companion_cues": list(bundle.companion_cues),
+        "companion_cue_sources": list(bundle.companion_cue_sources),
+        "proactive_events": list(bundle.proactive_events),
+        "companion_cue_audit_events": list(bundle.companion_cue_audit_events),
     }
     return _atomic_write_json(Path(destination), payload, error_type=ExportError)
 
@@ -552,7 +665,7 @@ def export_memory_json(
     *,
     exported_at: datetime | None = None,
 ) -> Path:
-    """Export persistent five-layer semantics without vectors or chat-body copies."""
+    """Export persistent semantics and authorizations without vectors or chat-body copies."""
 
     bundle = load_bundle()
     if not isinstance(bundle, MemoryExportBundle):
@@ -585,6 +698,11 @@ def export_memory_json(
         "evidence_signals": list(bundle.evidence_signals),
         "conflicts": list(bundle.conflicts),
         "audit_events": list(bundle.audit_events),
+        "companion_followups": {
+            "cues": list(bundle.companion_cues),
+            "sources": list(bundle.companion_cue_sources),
+            "audit_events": list(bundle.companion_cue_audit_events),
+        },
     }
     return _atomic_write_json(Path(destination), payload, error_type=ExportError)
 

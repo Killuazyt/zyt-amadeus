@@ -114,6 +114,7 @@ class MessageBubble(QFrame):
     """One selectable message plus its terminal status and retry action."""
 
     retry_clicked = Signal(str)
+    companion_cue_clicked = Signal(str)
 
     def __init__(
         self,
@@ -127,6 +128,8 @@ class MessageBubble(QFrame):
         attachments: tuple[AttachmentSnapshot, ...] = (),
         attachment_root: Path | None = None,
         input_modality: object = "text",
+        companion_cue_id: str | None = None,
+        companion_source_label: str | None = None,
     ) -> None:
         super().__init__()
         self.message_id = message_id
@@ -136,6 +139,7 @@ class MessageBubble(QFrame):
         self._retryable = retryable
         self._attachments = tuple(attachments)
         self._attachment_root = attachment_root
+        self.companion_cue_id = companion_cue_id
 
         self.setObjectName("userBubble" if role == "user" else "assistantBubble")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
@@ -174,10 +178,20 @@ class MessageBubble(QFrame):
         self.retry_button.setObjectName("retryButton")
         self.retry_button.setAutoDefault(False)
         self.retry_button.clicked.connect(self._emit_retry)
+        self.source_button = QPushButton(
+            f"基于：{companion_source_label}" if companion_source_label else ""
+        )
+        self.source_button.setObjectName("companionCueSource")
+        self.source_button.setAutoDefault(False)
+        self.source_button.setVisible(
+            bool(companion_cue_id and companion_source_label and role == "assistant")
+        )
+        self.source_button.clicked.connect(self._emit_companion_cue)
 
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         footer.addWidget(self.status_label, 1)
+        footer.addWidget(self.source_button, 0)
         footer.addWidget(self.retry_button, 0)
 
         layout = QVBoxLayout(self)
@@ -299,6 +313,10 @@ class MessageBubble(QFrame):
     def _emit_retry(self) -> None:
         self.retry_clicked.emit(self.retry_id)
 
+    def _emit_companion_cue(self) -> None:
+        if self.companion_cue_id:
+            self.companion_cue_clicked.emit(self.companion_cue_id)
+
 
 class ChatPanel(QWidget):
     """Compact independent tool window driven only by application-layer events."""
@@ -323,6 +341,7 @@ class ChatPanel(QWidget):
     new_conversation_requested = Signal()
     history_requested = Signal()
     load_older_requested = Signal()
+    companion_cue_requested = Signal(str)
     visibility_changed = Signal(bool)
 
     def __init__(self, *, always_on_top: bool = True) -> None:
@@ -992,6 +1011,8 @@ class ChatPanel(QWidget):
         retry_id: str | None = None,
         attachments: tuple[AttachmentSnapshot, ...] = (),
         input_modality: object = "text",
+        companion_cue_id: str | None = None,
+        companion_source_label: str | None = None,
     ) -> MessageBubble:
         if message_id in self._messages:
             raise ValueError(f"A chat message with id {message_id!r} already exists.")
@@ -1005,6 +1026,8 @@ class ChatPanel(QWidget):
             retry_id=retry_id,
             attachments=attachments,
             input_modality=input_modality,
+            companion_cue_id=companion_cue_id,
+            companion_source_label=companion_source_label,
         )
         self._message_order.append(message_id)
         self.message_layout.addWidget(bubble, 0, _bubble_alignment(bubble.role))
@@ -1056,6 +1079,8 @@ class ChatPanel(QWidget):
             retry_id,
             attachments,
             input_modality,
+            companion_cue_id,
+            companion_source_label,
         ) in enumerate(specs):
             bubble = self._create_bubble(
                 message_id,
@@ -1066,6 +1091,8 @@ class ChatPanel(QWidget):
                 retry_id=retry_id,
                 attachments=attachments,
                 input_modality=input_modality,
+                companion_cue_id=companion_cue_id,
+                companion_source_label=companion_source_label,
             )
             self._message_order.insert(index, message_id)
             self.message_layout.insertWidget(index + 1, bubble, 0, _bubble_alignment(role))
@@ -1132,6 +1159,10 @@ class ChatPanel(QWidget):
                         "retryable": False,
                         "retry_id": turn_id,
                         "attachments": tuple(_member(message, "attachments", default=())),
+                        "companion_cue_id": _member(message, "companion_cue_id", default=None),
+                        "companion_source_label": _member(
+                            message, "companion_source_label", default=None
+                        ),
                     }
                 )
         self.prepend_messages(specs)
@@ -1350,6 +1381,8 @@ class ChatPanel(QWidget):
         retry_id: str | None,
         attachments: tuple[AttachmentSnapshot, ...] = (),
         input_modality: object = "text",
+        companion_cue_id: str | None = None,
+        companion_source_label: str | None = None,
     ) -> MessageBubble:
         bubble = MessageBubble(
             message_id,
@@ -1361,8 +1394,11 @@ class ChatPanel(QWidget):
             attachments=attachments,
             attachment_root=self._attachment_root,
             input_modality=input_modality,
+            companion_cue_id=companion_cue_id,
+            companion_source_label=companion_source_label,
         )
         bubble.retry_clicked.connect(self.retry_requested.emit)
+        bubble.companion_cue_clicked.connect(self.companion_cue_requested.emit)
         bubble.set_bubble_width(self._bubble_width())
         bubble.set_retry_enabled(not self._turn_locked)
         self._messages[message_id] = bubble
@@ -1381,6 +1417,12 @@ class ChatPanel(QWidget):
         text = str(_member(message, "content", "text", default=""))
         attachments = tuple(_member(message, "attachments", default=()))
         input_modality = _member(message, "input_modality", default="text")
+        companion_cue_id = _member(message, "companion_cue_id", default=None)
+        companion_source_label = _member(
+            message,
+            "companion_source_label",
+            default=None,
+        )
         if status is None:
             status = _member(message, "status", default=None)
         if message_id in self._messages:
@@ -1402,6 +1444,10 @@ class ChatPanel(QWidget):
                 retry_id=turn_id,
                 attachments=attachments,
                 input_modality=input_modality,
+                companion_cue_id=(None if companion_cue_id is None else str(companion_cue_id)),
+                companion_source_label=(
+                    None if companion_source_label is None else str(companion_source_label)
+                ),
             )
 
     def _after_message_change(self) -> None:
@@ -1473,6 +1519,8 @@ def _message_spec(
     str | None,
     tuple[AttachmentSnapshot, ...],
     object,
+    str | None,
+    str | None,
 ]:
     message_id = str(_member(message, "message_id", "id"))
     role = _normalise_role(_member(message, "role"))
@@ -1482,6 +1530,8 @@ def _message_spec(
     retry_id = _member(message, "retry_id", "turn_id", default=None)
     attachments = tuple(_member(message, "attachments", default=()))
     input_modality = _member(message, "input_modality", default="text")
+    companion_cue_id = _member(message, "companion_cue_id", default=None)
+    companion_source_label = _member(message, "companion_source_label", default=None)
     return (
         message_id,
         role,
@@ -1491,6 +1541,8 @@ def _message_spec(
         None if retry_id is None else str(retry_id),
         attachments,
         input_modality,
+        None if companion_cue_id is None else str(companion_cue_id),
+        None if companion_source_label is None else str(companion_source_label),
     )
 
 

@@ -27,6 +27,7 @@ from amadeus_desktop.chat_models import (
     ProviderRoute,
     TurnTerminalReason,
 )
+from amadeus_desktop.companion_cues import CompanionCueStore
 from amadeus_desktop.conversation_store import (
     BackgroundJobStore,
     ConversationStore,
@@ -53,6 +54,8 @@ from amadeus_desktop.retrieval_pipeline import (
 from amadeus_desktop.storage_models import (
     DEFAULT_PROFILE_ID,
     BackgroundJob,
+    CompanionCueSourceKind,
+    CompanionCueStatus,
     Conversation,
     MemoryRecord,
     MemorySource,
@@ -94,6 +97,7 @@ class LocalDataStores:
     jobs: BackgroundJobStore
     proactive: ProactiveInteractionStore
     attachments: AttachmentStore
+    companion_cues: CompanionCueStore
 
     def close(self) -> None:
         self.database.close()
@@ -144,6 +148,7 @@ class MemoryListSnapshot:
     timeline_rows: tuple[dict[str, object], ...] = ()
     audit_rows: tuple[dict[str, object], ...] = ()
     conflict_rows: tuple[dict[str, object], ...] = ()
+    cue_rows: tuple[dict[str, object], ...] = ()
     layer_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -256,6 +261,7 @@ def create_local_data_stores(
     from amadeus_desktop.memory_store import MemoryStore
 
     database = SQLiteDatabase(database_path, backup_dir=backup_directory).open()
+    companion_cues = CompanionCueStore(database)
     return LocalDataStores(
         database=database,
         conversations=ConversationStore(database),
@@ -264,12 +270,13 @@ def create_local_data_stores(
         personas=PersonaRepository(database),
         vectors=VectorStore(database),
         jobs=BackgroundJobStore(database),
-        proactive=ProactiveInteractionStore(database),
+        proactive=ProactiveInteractionStore(database, companion_cues=companion_cues),
         attachments=(
             attachment_directory
             if isinstance(attachment_directory, AttachmentStore)
             else AttachmentStore(attachment_directory or database_path.parent / "attachments")
         ),
+        companion_cues=companion_cues,
     )
 
 
@@ -293,9 +300,12 @@ class LocalDataService(QObject):
     jobs_enqueued = Signal()
     index_rebuild_requested = Signal(str)
     proactive_count_loaded = Signal(str, int)
+    proactive_presentation_loaded = Signal(object)
     proactive_event_displayed = Signal(object)
     proactive_event_dismissed = Signal(object)
     proactive_greeting_persisted = Signal(object, object)
+    companion_cue_changed = Signal(object)
+    companion_cue_opened = Signal(str)
     _vector_query_completed = Signal(str, object)
 
     def __init__(
@@ -482,6 +492,7 @@ class LocalDataService(QObject):
                 _effective_user_text(turn.user_message.content),
                 memory_enabled=memory_enabled,
                 deep_memory_enabled=deep_memory_enabled,
+                companion_context=turn.companion_context,
             )
 
         return (
@@ -551,6 +562,7 @@ class LocalDataService(QObject):
                 _effective_user_text(turn.user_message.content),
                 memory_enabled=memory_enabled,
                 deep_memory_enabled=deep_memory_enabled,
+                companion_context=turn.companion_context,
             )
 
         return (
@@ -954,6 +966,28 @@ class LocalDataService(QObject):
             return False
         return True
 
+    def load_contextual_proactive_presentation(
+        self,
+        *,
+        include_deep: bool = True,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> bool:
+        """Select at most one authorized cue without copying private text to events."""
+
+        request_id = self.runtime.submit(
+            lambda stores: stores.companion_cues.select_proactive_presentation(
+                profile_id=profile_id,
+                include_deep=include_deep,
+            ),
+            priority=DataPriority.FOREGROUND,
+            on_success=self.proactive_presentation_loaded.emit,
+            on_failure=lambda category: self.operation_failed.emit("proactive_context", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("proactive_context")
+            return False
+        return True
+
     def record_proactive_display(
         self,
         trigger: ProactiveTrigger | str,
@@ -962,6 +996,7 @@ class LocalDataService(QObject):
         profile_id: str = DEFAULT_PROFILE_ID,
         event_id: str | None = None,
         displayed_at: datetime | None = None,
+        cue_id: str | None = None,
     ) -> bool:
         if not self._writable:
             self.operation_failed.emit("proactive_display", "DatabaseReadOnlyError")
@@ -973,6 +1008,7 @@ class LocalDataService(QObject):
                 profile_id=profile_id,
                 event_id=event_id,
                 displayed_at=displayed_at,
+                cue_id=cue_id,
             ),
             priority=DataPriority.FOREGROUND,
             on_success=self.proactive_event_displayed.emit,
@@ -1376,6 +1412,60 @@ class LocalDataService(QObject):
                     limit=500,
                 )
             )
+            if not stores.database.read_only:
+                stores.companion_cues.expire_due(profile_id=DEFAULT_PROFILE_ID)
+            companion_cues = stores.companion_cues.list(profile_id=DEFAULT_PROFILE_ID)
+            cue_rows = tuple(_companion_cue_view_row(cue) for cue in companion_cues)
+            memory_authorizations: dict[str, tuple[str, str]] = {}
+            for cue in companion_cues:
+                if cue.status not in {
+                    CompanionCueStatus.PROPOSED,
+                    CompanionCueStatus.ACTIVE,
+                    CompanionCueStatus.SURFACED,
+                }:
+                    continue
+                for source in cue.sources:
+                    if source.source_kind is not CompanionCueSourceKind.USER_MESSAGE:
+                        memory_authorizations[source.source_target_id] = (
+                            cue.cue_id,
+                            cue.status.value,
+                        )
+            rows = tuple(
+                {
+                    **row,
+                    "companion_cue_id": memory_authorizations.get(
+                        str(row["version_id"]), (None, None)
+                    )[0],
+                    "companion_cue_status": memory_authorizations.get(
+                        str(row["version_id"]), (None, None)
+                    )[1],
+                }
+                for row in rows
+            )
+            reflection_rows = tuple(
+                {
+                    **row,
+                    "companion_cue_id": memory_authorizations.get(
+                        str(row["version_id"]), (None, None)
+                    )[0],
+                    "companion_cue_status": memory_authorizations.get(
+                        str(row["version_id"]), (None, None)
+                    )[1],
+                }
+                for row in reflection_rows
+            )
+            persona_rows = tuple(
+                {
+                    **row,
+                    "companion_cue_id": memory_authorizations.get(
+                        str(row["version_id"]), (None, None)
+                    )[0],
+                    "companion_cue_status": memory_authorizations.get(
+                        str(row["version_id"]), (None, None)
+                    )[1],
+                }
+                for row in persona_rows
+            )
             working_rows = _working_view_rows(working_snapshot)
             failed = tuple(_job_view_row(job) for job in stores.jobs.list_failed())
             return MemoryListSnapshot(
@@ -1389,6 +1479,7 @@ class LocalDataService(QObject):
                 timeline_rows=timeline_rows,
                 audit_rows=audit_rows,
                 conflict_rows=conflict_rows,
+                cue_rows=cue_rows,
                 layer_counts={
                     "working": len(working_rows),
                     "recent": len(recent_rows),
@@ -1397,6 +1488,7 @@ class LocalDataService(QObject):
                     "persona": len(persona_rows),
                     "timeline": len(timeline_rows),
                     "audit": len(audit_rows),
+                    "cue": len(cue_rows),
                 },
             )
 
@@ -1429,6 +1521,142 @@ class LocalDataService(QObject):
             self._on_persistence_submission_failed("clear_memories")
             return False
         return True
+
+    def confirm_companion_cue(
+        self,
+        cue_id: str,
+        topic: str,
+        frozen_text: str,
+        keep_until_resolved: bool = False,
+    ) -> None:
+        self._companion_cue_write(
+            "confirm_companion_cue",
+            lambda stores: stores.companion_cues.confirm(
+                cue_id,
+                topic=topic,
+                frozen_text=frozen_text,
+                keep_until_resolved=keep_until_resolved,
+            ),
+        )
+
+    def reject_companion_cue(self, cue_id: str) -> None:
+        self._companion_cue_write(
+            "reject_companion_cue",
+            lambda stores: stores.companion_cues.reject(cue_id),
+        )
+
+    def resolve_companion_cue(self, cue_id: str) -> None:
+        self._companion_cue_write(
+            "resolve_companion_cue",
+            lambda stores: stores.companion_cues.resolve(cue_id),
+        )
+
+    def set_companion_cue_keep(self, cue_id: str, enabled: bool) -> None:
+        self._companion_cue_write(
+            "retain_companion_cue",
+            lambda stores: stores.companion_cues.set_keep_until_resolved(
+                cue_id,
+                enabled,
+            ),
+        )
+
+    def delete_companion_cue(self, cue_id: str) -> None:
+        def operation(stores: LocalDataStores) -> None:
+            stores.companion_cues.delete(cue_id)
+            stores.database.purge_deleted_content()
+
+        self._companion_cue_write("delete_companion_cue", operation)
+
+    def authorize_memory_followup(self, layer: str, version_id: str) -> None:
+        source_kind = {
+            MemoryLayer.FACT.value: CompanionCueSourceKind.FACT_VERSION,
+            MemoryLayer.REFLECTION.value: CompanionCueSourceKind.REFLECTION_VERSION,
+            MemoryLayer.PERSONA.value: CompanionCueSourceKind.PERSONA_VERSION,
+        }.get(layer)
+        if source_kind is None:
+            self.operation_failed.emit("authorize_companion_cue", "InvalidMemoryLayer")
+            return
+        self._companion_cue_write(
+            "authorize_companion_cue",
+            lambda stores: stores.companion_cues.propose_memory_followup(
+                source_kind,
+                version_id,
+            ),
+        )
+
+    def revoke_memory_followup(self, layer: str, version_id: str) -> None:
+        source_kind = {
+            MemoryLayer.FACT.value: CompanionCueSourceKind.FACT_VERSION,
+            MemoryLayer.REFLECTION.value: CompanionCueSourceKind.REFLECTION_VERSION,
+            MemoryLayer.PERSONA.value: CompanionCueSourceKind.PERSONA_VERSION,
+        }.get(layer)
+        if source_kind is None:
+            self.operation_failed.emit("revoke_companion_cue", "InvalidMemoryLayer")
+            return
+        self._companion_cue_write(
+            "revoke_companion_cue",
+            lambda stores: stores.companion_cues.revoke_memory_authorization(
+                source_kind,
+                version_id,
+            ),
+        )
+
+    def open_companion_cue(
+        self,
+        cue_id: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
+        target_conversation_id = conversation_id or self._current_conversation_id
+        if not self._writable or target_conversation_id is None:
+            self.operation_failed.emit("open_companion_cue", "ConversationUnavailable")
+            return
+
+        def operation(stores: LocalDataStores) -> ConversationSnapshot:
+            stores.proactive.persist_companion_cue_manual_open(
+                cue_id,
+                target_conversation_id,
+            )
+            conversation = stores.conversations.get_conversation(target_conversation_id)
+            return _conversation_snapshot(stores, conversation)
+
+        def completed(snapshot: ConversationSnapshot) -> None:
+            if self._current_conversation_id == target_conversation_id:
+                self._on_conversation_loaded(snapshot, failure_operation="open_companion_cue")
+            self.companion_cue_opened.emit(cue_id)
+            self.refresh_history()
+            self.refresh_memories()
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.INTERACTIVE,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit("open_companion_cue", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("open_companion_cue")
+
+    def _companion_cue_write(
+        self,
+        operation_name: str,
+        operation: Callable[[LocalDataStores], object],
+    ) -> None:
+        if not self._writable:
+            self.operation_failed.emit(operation_name, "DatabaseReadOnlyError")
+            return
+
+        def completed(value: object) -> None:
+            self.companion_cue_changed.emit(value)
+            self.refresh_memories()
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.INTERACTIVE,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit(operation_name, category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed(operation_name)
 
     def load_memory_sources(self, memory_id: str) -> None:
         def operation(stores: LocalDataStores) -> tuple[dict[str, object], ...]:
@@ -1918,6 +2146,10 @@ def _build_prompt(
                     importance=result.memory.current_version.importance,
                     confidence=result.memory.current_version.confidence,
                     pinned=result.memory.pinned,
+                    user_confirmed=(
+                        result.memory.kind.value == "relationship"
+                        and result.memory.current_version.origin is MemoryVersionOrigin.MANUAL
+                    ),
                 )
                 for result in stores.memories.search(current_user_message, limit=30)
             )
@@ -2059,6 +2291,8 @@ def _chat_message(message: StoredMessage, *, error: str | None = None) -> ChatMe
         error=error,
         attachments=tuple(_attachment_snapshot(item) for item in message.attachments),
         input_modality=InputModality(message.input_modality.value),
+        companion_cue_id=message.companion_cue_id,
+        companion_source_label=message.companion_source_label,
     )
 
 
@@ -2189,6 +2423,42 @@ def _derived_view_row(record) -> dict[str, object]:
         "updated_at": record.updated_at,
         "last_recalled_at": None,
         "successful_recall_count": 0,
+    }
+
+
+def _companion_cue_view_row(cue) -> dict[str, object]:
+    sources = tuple(
+        {
+            "source_kind": source.source_kind.value,
+            "source_target_id": source.source_target_id,
+        }
+        for source in cue.sources
+    )
+    return {
+        "memory_id": cue.cue_id,
+        "group_id": cue.cue_id,
+        "version_id": cue.cue_id,
+        "cue_id": cue.cue_id,
+        "layer": "cue",
+        "kind": cue.kind.value,
+        "status": cue.status.value,
+        "content": cue.frozen_text,
+        "frozen_text": cue.frozen_text,
+        "topic_key": cue.topic,
+        "topic": cue.topic,
+        "reason": cue.reason.value,
+        "confidence": cue.confidence,
+        "keep_until_resolved": cue.keep_until_resolved,
+        "source_label": ("待续话题" if cue.kind.value == "conversation_followup" else "已授权记忆"),
+        "sources": sources,
+        "conversation_id": cue.conversation_id,
+        "confirmed_at": cue.confirmed_at,
+        "expires_at": cue.expires_at,
+        "surfaced_at": cue.surfaced_at,
+        "resolved_at": cue.resolved_at,
+        "pinned": cue.keep_until_resolved,
+        "created_at": cue.created_at,
+        "updated_at": cue.updated_at,
     }
 
 

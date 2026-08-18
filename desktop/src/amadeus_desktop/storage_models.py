@@ -89,6 +89,34 @@ class ProactiveDisposition(StrEnum):
     DISMISSED = "dismissed"
 
 
+class CompanionCueKind(StrEnum):
+    CONVERSATION_FOLLOWUP = "conversation_followup"
+    MEMORY_FOLLOWUP = "memory_followup"
+
+
+class CompanionCueStatus(StrEnum):
+    PROPOSED = "proposed"
+    ACTIVE = "active"
+    SURFACED = "surfaced"
+    RESOLVED = "resolved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+class CompanionCueSourceKind(StrEnum):
+    USER_MESSAGE = "user_message"
+    FACT_VERSION = "fact_version"
+    REFLECTION_VERSION = "reflection_version"
+    PERSONA_VERSION = "persona_version"
+
+
+class CompanionCueReason(StrEnum):
+    EXPLICIT_RETURN = "explicit_return"
+    PENDING_RESULT = "pending_result"
+    USER_PROMISED_UPDATE = "user_promised_update"
+    MEMORY_AUTHORIZED = "memory_authorized"
+
+
 class MemoryStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
@@ -189,6 +217,8 @@ class StoredMessage:
     completed_at: datetime | None
     input_modality: StoredInputModality = StoredInputModality.TEXT
     attachments: tuple[StoredAttachment, ...] = ()
+    companion_cue_id: str | None = None
+    companion_source_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +230,61 @@ class ProactiveInteractionEvent:
     displayed_at: datetime
     disposition: ProactiveDisposition
     message_id: str | None
+    cue_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionCueSource:
+    source_id: str
+    cue_id: str
+    source_kind: CompanionCueSourceKind
+    source_target_id: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionCue:
+    cue_id: str
+    profile_id: str
+    conversation_id: str | None
+    kind: CompanionCueKind
+    topic: str
+    frozen_text: str
+    status: CompanionCueStatus
+    reason: CompanionCueReason
+    confidence: float
+    keep_until_resolved: bool
+    dedupe_key: str
+    created_at: datetime
+    updated_at: datetime
+    confirmed_at: datetime | None
+    expires_at: datetime | None
+    surfaced_at: datetime | None
+    resolved_at: datetime | None
+    sources: tuple[CompanionCueSource, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionCueAuditEvent:
+    event_id: str
+    profile_id: str
+    cue_id: str
+    cue_kind: CompanionCueKind
+    event_type: str
+    reason_code: str
+    previous_status: CompanionCueStatus | None
+    resulting_status: CompanionCueStatus | None
+    occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ProactivePresentation:
+    """Privacy-safe bubble preview and authorized post-click expansion."""
+
+    preview_text: str
+    expanded_text: str
+    cue_id: str | None = None
+    source_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

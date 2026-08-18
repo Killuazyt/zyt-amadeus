@@ -22,14 +22,19 @@ from amadeus_desktop.memory_models import (
     SourceRole,
 )
 from amadeus_desktop.memory_search import normalize_topic_key
+from amadeus_desktop.storage_models import CompanionCueReason
 
 MAX_CANDIDATES = 5
 MAX_EXTRACTION_PAYLOAD_CHARS = 65_536
 MAX_MEMORY_CONTENT_CHARS = 2_000
 MAX_TOPIC_KEY_CHARS = 200
 MAX_SOURCE_IDS = 20
+MAX_COMPANION_CUES = 2
+MAX_COMPANION_CUE_TOPIC_CHARS = 120
+MAX_COMPANION_CUE_TEXT_CHARS = 240
 
-_ROOT_FIELDS = frozenset({"candidates"})
+_LEGACY_ROOT_FIELDS = frozenset({"candidates"})
+_ROOT_FIELDS = frozenset({"candidates", "companion_cues"})
 _LEGACY_CANDIDATE_FIELDS = frozenset(
     {
         "type",
@@ -48,6 +53,25 @@ _CANDIDATE_FIELDS = _LEGACY_CANDIDATE_FIELDS | {
     "time_confidence",
     "correction_explicit",
 }
+_COMPANION_CUE_FIELDS = frozenset(
+    {"topic", "follow_up_text", "reason", "confidence", "source_message_ids"}
+)
+
+_EXPLICIT_RETURN = re.compile(
+    r"(?:稍后|晚点|回头|下次|之后|以后).{0,20}(?:继续|再聊|回来|接着)|"
+    r"(?:continue|come back|talk about).{0,24}(?:later|next time)",
+    re.IGNORECASE,
+)
+_PENDING_RESULT = re.compile(
+    r"(?:等|等待).{0,24}(?:结果|回复|消息|答复)|(?:结果|回复|消息|答复).{0,16}(?:出来|到了|收到)|"
+    r"(?:wait(?:ing)? for|when I get).{0,30}(?:result|reply|response|news)",
+    re.IGNORECASE,
+)
+_PROMISED_UPDATE = re.compile(
+    r"(?:我会|我再|到时候|之后|回头).{0,24}(?:告诉你|跟你说|更新|反馈|汇报)|"
+    r"(?:I(?:'ll| will)).{0,30}(?:tell you|update you|let you know|report back)",
+    re.IGNORECASE,
+)
 
 _DO_NOT_REMEMBER_PATTERNS = (
     re.compile(r"(?:不要|别|不用|不必|不准)(?:帮我)?(?:记住|记录|记下来|保存|存储)"),
@@ -159,6 +183,16 @@ class CandidateRejectionReason(StrEnum):
     THIRD_PARTY_INFERENCE = "third_party_inference"
 
 
+class CompanionCueRejectionReason(StrEnum):
+    DO_NOT_REMEMBER = "do_not_remember"
+    UNKNOWN_SOURCE = "unknown_source"
+    NON_USER_SOURCE = "non_user_source"
+    LOW_CONFIDENCE = "low_confidence"
+    SENSITIVE_CONTENT = "sensitive_content"
+    UNSUPPORTED_INTENT = "unsupported_intent"
+    DUPLICATE = "duplicate"
+
+
 @dataclass(frozen=True, slots=True)
 class RejectedCandidate:
     """A rejected candidate paired only with a stable local reason."""
@@ -174,6 +208,28 @@ class ExtractionValidationResult:
     accepted: tuple[MemoryCandidate, ...]
     rejected: tuple[RejectedCandidate, ...]
     do_not_remember: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionCueCandidate:
+    topic: str
+    follow_up_text: str
+    reason: CompanionCueReason
+    confidence: float
+    source_message_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedCompanionCueCandidate:
+    candidate: CompanionCueCandidate
+    reason: CompanionCueRejectionReason
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionBundleValidationResult:
+    memories: ExtractionValidationResult
+    companion_cues: tuple[CompanionCueCandidate, ...]
+    rejected_companion_cues: tuple[RejectedCompanionCueCandidate, ...]
 
 
 class SensitiveCategory(StrEnum):
@@ -220,14 +276,30 @@ def parse_extraction_candidates(raw_json: str) -> tuple[MemoryCandidate, ...]:
     except (json.JSONDecodeError, _InvalidJsonConstant, RecursionError) as exc:
         raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_JSON) from exc
 
-    if not isinstance(payload, dict) or frozenset(payload) != _ROOT_FIELDS:
-        raise ExtractionPayloadError(ExtractionPayloadErrorCode.ROOT_SCHEMA)
-    raw_candidates = payload["candidates"]
-    if not isinstance(raw_candidates, list):
-        raise ExtractionPayloadError(ExtractionPayloadErrorCode.ROOT_SCHEMA)
-    if len(raw_candidates) > MAX_CANDIDATES:
-        raise ExtractionPayloadError(ExtractionPayloadErrorCode.TOO_MANY_CANDIDATES)
-    return tuple(_parse_candidate(candidate) for candidate in raw_candidates)
+    candidates, _cues = _parse_payload_object(payload)
+    return candidates
+
+
+def parse_extraction_payload(
+    raw_json: str,
+) -> tuple[tuple[MemoryCandidate, ...], tuple[CompanionCueCandidate, ...]]:
+    """Parse the v7 extraction contract while accepting legacy candidate-only output."""
+
+    if not isinstance(raw_json, str):
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_JSON)
+    if len(raw_json) > MAX_EXTRACTION_PAYLOAD_CHARS:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.TOO_LARGE)
+    try:
+        payload = json.loads(
+            raw_json,
+            object_pairs_hook=_object_without_duplicate_fields,
+            parse_constant=_reject_json_constant,
+        )
+    except _DuplicateField as exc:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.DUPLICATE_FIELD) from exc
+    except (json.JSONDecodeError, _InvalidJsonConstant, RecursionError) as exc:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_JSON) from exc
+    return _parse_payload_object(payload)
 
 
 def validate_extraction_candidates(
@@ -271,6 +343,39 @@ def parse_and_validate_extraction(
     """Strictly parse and then locally validate one extraction response."""
 
     return validate_extraction_candidates(parse_extraction_candidates(raw_json), sources)
+
+
+def parse_and_validate_extraction_bundle(
+    raw_json: str,
+    sources: Mapping[str, ExtractionSource],
+) -> ExtractionBundleValidationResult:
+    """Validate memories and follow-up suggestions from the same model response."""
+
+    memories, cues = parse_extraction_payload(raw_json)
+    memory_result = validate_extraction_candidates(memories, sources)
+    accepted: list[CompanionCueCandidate] = []
+    rejected: list[RejectedCompanionCueCandidate] = []
+    seen: set[tuple[object, ...]] = set()
+    opt_out = any(
+        source.role is SourceRole.USER and contains_do_not_remember(source.content)
+        for source in sources.values()
+    )
+    for cue in cues:
+        reason = _companion_cue_rejection_reason(cue, sources, opt_out=opt_out)
+        dedupe = (
+            unicodedata.normalize("NFKC", cue.topic).casefold(),
+            unicodedata.normalize("NFKC", cue.follow_up_text).casefold(),
+            cue.reason,
+            cue.source_message_ids,
+        )
+        if reason is None and dedupe in seen:
+            reason = CompanionCueRejectionReason.DUPLICATE
+        if reason is None:
+            seen.add(dedupe)
+            accepted.append(cue)
+        else:
+            rejected.append(RejectedCompanionCueCandidate(cue, reason))
+    return ExtractionBundleValidationResult(memory_result, tuple(accepted), tuple(rejected))
 
 
 def contains_do_not_remember(text: str) -> bool:
@@ -388,6 +493,47 @@ def _parse_candidate(value: Any) -> MemoryCandidate:
     )
 
 
+def _parse_payload_object(
+    payload: Any,
+) -> tuple[tuple[MemoryCandidate, ...], tuple[CompanionCueCandidate, ...]]:
+    if not isinstance(payload, dict) or frozenset(payload) not in {
+        _LEGACY_ROOT_FIELDS,
+        _ROOT_FIELDS,
+    }:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.ROOT_SCHEMA)
+    raw_candidates = payload["candidates"]
+    raw_cues = payload.get("companion_cues", [])
+    if not isinstance(raw_candidates, list) or not isinstance(raw_cues, list):
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.ROOT_SCHEMA)
+    if len(raw_candidates) > MAX_CANDIDATES or len(raw_cues) > MAX_COMPANION_CUES:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.TOO_MANY_CANDIDATES)
+    return (
+        tuple(_parse_candidate(candidate) for candidate in raw_candidates),
+        tuple(_parse_companion_cue(candidate) for candidate in raw_cues),
+    )
+
+
+def _parse_companion_cue(value: Any) -> CompanionCueCandidate:
+    if not isinstance(value, dict) or frozenset(value) != _COMPANION_CUE_FIELDS:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.CANDIDATE_SCHEMA)
+    try:
+        reason = CompanionCueReason(_required_text(value["reason"], 64))
+    except ValueError as exc:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE) from exc
+    if reason is CompanionCueReason.MEMORY_AUTHORIZED:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
+    source_message_ids = _source_ids(value["source_message_ids"])
+    if len(source_message_ids) > 3:
+        raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
+    return CompanionCueCandidate(
+        topic=_required_text(value["topic"], MAX_COMPANION_CUE_TOPIC_CHARS),
+        follow_up_text=_required_text(value["follow_up_text"], MAX_COMPANION_CUE_TEXT_CHARS),
+        reason=reason,
+        confidence=_unit_number(value["confidence"]),
+        source_message_ids=source_message_ids,
+    )
+
+
 def _required_text(value: Any, maximum: int) -> str:
     if not isinstance(value, str):
         raise ExtractionPayloadError(ExtractionPayloadErrorCode.INVALID_VALUE)
@@ -454,6 +600,41 @@ def _candidate_rejection_reason(
             if category is not None:
                 break
     return _SENSITIVE_TO_REJECTION.get(category) if category is not None else None
+
+
+def _companion_cue_rejection_reason(
+    candidate: CompanionCueCandidate,
+    sources: Mapping[str, ExtractionSource],
+    *,
+    opt_out: bool,
+) -> CompanionCueRejectionReason | None:
+    if opt_out:
+        return CompanionCueRejectionReason.DO_NOT_REMEMBER
+    referenced: list[ExtractionSource] = []
+    for source_id in candidate.source_message_ids:
+        source = sources.get(source_id)
+        if source is None:
+            return CompanionCueRejectionReason.UNKNOWN_SOURCE
+        if source.role is not SourceRole.USER:
+            return CompanionCueRejectionReason.NON_USER_SOURCE
+        referenced.append(source)
+    if candidate.confidence < 0.80:
+        return CompanionCueRejectionReason.LOW_CONFIDENCE
+    if detect_sensitive_content(candidate.topic) or detect_sensitive_content(
+        candidate.follow_up_text
+    ):
+        return CompanionCueRejectionReason.SENSITIVE_CONTENT
+    if any(detect_sensitive_content(source.content) for source in referenced):
+        return CompanionCueRejectionReason.SENSITIVE_CONTENT
+    combined = "\n".join(source.content for source in referenced)
+    pattern = {
+        CompanionCueReason.EXPLICIT_RETURN: _EXPLICIT_RETURN,
+        CompanionCueReason.PENDING_RESULT: _PENDING_RESULT,
+        CompanionCueReason.USER_PROMISED_UPDATE: _PROMISED_UPDATE,
+    }[candidate.reason]
+    if pattern.search(combined) is None:
+        return CompanionCueRejectionReason.UNSUPPORTED_INTENT
+    return None
 
 
 class _DuplicateField(ValueError):

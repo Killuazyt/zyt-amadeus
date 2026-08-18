@@ -23,6 +23,7 @@ from amadeus_desktop.proactive_controller import (
     ProactiveInteractionController,
     ProactiveVisualPlan,
 )
+from amadeus_desktop.storage_models import ProactivePresentation
 
 
 def _policy(
@@ -171,13 +172,22 @@ class _FakeData(QObject):
     proactive_event_displayed = Signal(object)
     proactive_event_dismissed = Signal(object)
     proactive_greeting_persisted = Signal(object, object)
+    proactive_presentation_loaded = Signal(object)
 
-    def __init__(self, *, count: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        count: int = 0,
+        presentation: ProactivePresentation | None = None,
+    ) -> None:
         super().__init__()
         self.count = count
+        self.presentation = presentation
+        self.context_calls: list[bool] = []
         self.display_calls: list[tuple[str, str]] = []
         self.display_event_ids: list[str] = []
         self.display_times: list[datetime] = []
+        self.display_cue_ids: list[str | None] = []
         self.persist_calls: list[tuple[str, str]] = []
         self.persist_metadata: list[tuple[str | None, str | None]] = []
         self.click_times: list[datetime] = []
@@ -187,11 +197,17 @@ class _FakeData(QObject):
         self.proactive_count_loaded.emit(local_date.isoformat(), self.count)
         return True
 
+    def load_contextual_proactive_presentation(self, *, include_deep: bool = True) -> bool:
+        self.context_calls.append(include_deep)
+        self.proactive_presentation_loaded.emit(self.presentation)
+        return True
+
     def record_proactive_display(self, trigger, local_date, **kwargs) -> bool:
         self.display_calls.append((trigger.value, local_date.isoformat()))
         event_id = kwargs["event_id"]
         self.display_event_ids.append(event_id)
         self.display_times.append(kwargs["displayed_at"])
+        self.display_cue_ids.append(kwargs["cue_id"])
         self.proactive_event_displayed.emit(SimpleNamespace(event_id=event_id))
         return True
 
@@ -386,6 +402,187 @@ def test_controller_local_first_display_counts_only_after_show_and_click_persist
     assert data.persist_calls == [(data.display_event_ids[0], bubble.text)]
     assert data.click_times[0].tzinfo is not None
     assert opened == [True]
+    controller.stop()
+
+
+def test_contextual_followup_uses_generic_bubble_and_frozen_click_text_without_network(
+    qtbot,
+) -> None:
+    now = datetime(2026, 8, 3, 10)
+    presentation = ProactivePresentation(
+        preview_text="有件你之前提过的事，我还记着。想继续聊聊吗？",
+        expanded_text="你确认过：等项目结果出来后，再继续聊这个话题。",
+        cue_id="cue-1",
+        source_label="待续话题",
+    )
+    data = _FakeData(presentation=presentation)
+    bubble = _FakeBubble()
+    runner = _FakeRunner()
+    opened: list[bool] = []
+    settings = {
+        "memory": {"enabled": True, "deep_memory_enabled": True},
+        "proactive": {
+            "mode": "restrained",
+            "quiet_start_minute": 23 * 60,
+            "quiet_end_minute": 8 * 60,
+            "daily_limit": 2,
+            "paused_local_date": None,
+            "ai_greetings_enabled": True,
+            "contextual_followups_enabled": True,
+        },
+    }
+    controller = ProactiveInteractionController(
+        data=data,
+        bubble=bubble,  # type: ignore[arg-type]
+        generation_runner=runner,  # type: ignore[arg-type]
+        presence_probe=_FakePresence(),
+        settings_reader=lambda: settings,
+        clock=lambda: now,
+        pet_visible=lambda: True,
+        conversation_active=lambda: False,
+        settings_open=lambda: False,
+        data_writable=lambda: True,
+        exiting=lambda: False,
+        pet_geometry=lambda: QRect(),
+        work_areas=lambda: [QRect(0, 0, 100, 100)],
+        provider_configured=lambda: True,
+        provider_metadata=lambda: ("must-not-run", "must-not-run"),
+        acquire_ai_lane=lambda: True,
+        release_ai_lane=lambda: None,
+        cancel_ai_lane=lambda _wait: True,
+        open_chat=lambda: opened.append(True),
+        startup_delay_ms=1,
+        poll_interval_ms=60_000,
+    )
+
+    controller.start()
+    qtbot.waitUntil(lambda: bubble.visible)
+
+    assert data.context_calls == [True]
+    assert bubble.text == presentation.preview_text
+    assert presentation.expanded_text not in bubble.text
+    assert data.display_cue_ids == [presentation.cue_id]
+    assert runner.starts == 0
+    bubble.clicked.emit()
+    assert data.persist_calls == [(data.display_event_ids[0], presentation.expanded_text)]
+    assert data.persist_metadata == [(None, None)]
+    assert opened == [True]
+    controller.stop()
+
+
+def test_contextual_followup_off_skips_context_lookup_and_keeps_generic_path(qtbot) -> None:
+    now = datetime(2026, 8, 3, 10)
+    data = _FakeData(
+        presentation=ProactivePresentation(
+            preview_text="private-preview-must-not-be-used",
+            expanded_text="private-expanded-must-not-be-used",
+            cue_id="cue-disabled",
+        )
+    )
+    bubble = _FakeBubble()
+    runner = _FakeRunner()
+    settings = {
+        "memory": {"enabled": True, "deep_memory_enabled": True},
+        "proactive": {
+            "mode": "restrained",
+            "quiet_start_minute": 23 * 60,
+            "quiet_end_minute": 8 * 60,
+            "daily_limit": 2,
+            "paused_local_date": None,
+            "ai_greetings_enabled": False,
+            "contextual_followups_enabled": False,
+        },
+    }
+    controller = ProactiveInteractionController(
+        data=data,
+        bubble=bubble,  # type: ignore[arg-type]
+        generation_runner=runner,  # type: ignore[arg-type]
+        presence_probe=_FakePresence(),
+        settings_reader=lambda: settings,
+        clock=lambda: now,
+        pet_visible=lambda: True,
+        conversation_active=lambda: False,
+        settings_open=lambda: False,
+        data_writable=lambda: True,
+        exiting=lambda: False,
+        pet_geometry=lambda: QRect(),
+        work_areas=lambda: [QRect(0, 0, 100, 100)],
+        provider_configured=lambda: False,
+        provider_metadata=lambda: (None, None),
+        acquire_ai_lane=lambda: True,
+        release_ai_lane=lambda: None,
+        cancel_ai_lane=lambda _wait: True,
+        open_chat=lambda: None,
+        startup_delay_ms=1,
+        poll_interval_ms=60_000,
+    )
+
+    controller.start()
+    qtbot.waitUntil(lambda: bubble.visible)
+
+    assert data.context_calls == []
+    assert data.display_cue_ids == [None]
+    assert "private" not in bubble.text
+    controller.stop()
+
+
+def test_contextual_display_transaction_failure_closes_private_preview_and_falls_back(
+    qtbot,
+) -> None:
+    now = datetime(2026, 8, 3, 10)
+    presentation = ProactivePresentation(
+        preview_text="有件你之前提过的事，我还记着。想继续聊聊吗？",
+        expanded_text="不应在失败气泡中出现的冻结原文",
+        cue_id="cue-race",
+    )
+    data = _FakeData(presentation=presentation)
+    bubble = _FakeBubble()
+    runner = _FakeRunner()
+    settings = {
+        "memory": {"enabled": True, "deep_memory_enabled": True},
+        "proactive": {
+            "mode": "restrained",
+            "quiet_start_minute": 23 * 60,
+            "quiet_end_minute": 8 * 60,
+            "daily_limit": 2,
+            "paused_local_date": None,
+            "ai_greetings_enabled": False,
+            "contextual_followups_enabled": True,
+        },
+    }
+    controller = ProactiveInteractionController(
+        data=data,
+        bubble=bubble,  # type: ignore[arg-type]
+        generation_runner=runner,  # type: ignore[arg-type]
+        presence_probe=_FakePresence(),
+        settings_reader=lambda: settings,
+        clock=lambda: now,
+        pet_visible=lambda: True,
+        conversation_active=lambda: False,
+        settings_open=lambda: False,
+        data_writable=lambda: True,
+        exiting=lambda: False,
+        pet_geometry=lambda: QRect(),
+        work_areas=lambda: [QRect(0, 0, 100, 100)],
+        provider_configured=lambda: False,
+        provider_metadata=lambda: (None, None),
+        acquire_ai_lane=lambda: True,
+        release_ai_lane=lambda: None,
+        cancel_ai_lane=lambda _wait: True,
+        open_chat=lambda: None,
+        startup_delay_ms=1,
+        poll_interval_ms=60_000,
+    )
+
+    controller.start()
+    qtbot.waitUntil(lambda: bubble.visible and data.display_cue_ids == ["cue-race"])
+    controller.persistence_failed("proactive_display", "conflict")
+    qtbot.waitUntil(lambda: len(data.display_cue_ids) == 2)
+
+    assert bubble.visible
+    assert data.display_cue_ids == ["cue-race", None]
+    assert bubble.text != presentation.preview_text
+    assert presentation.expanded_text not in bubble.text
     controller.stop()
 
 

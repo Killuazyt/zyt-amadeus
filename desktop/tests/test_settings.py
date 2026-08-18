@@ -211,7 +211,10 @@ def test_schema_v4_preserves_already_present_p6_values(tmp_path: Path) -> None:
     assert loaded["general"] == legacy["general"]
     assert loaded["pet"] == legacy["pet"]
     assert loaded["persona"] == legacy["persona"]
-    assert loaded["proactive"] == legacy["proactive"]
+    assert loaded["proactive"] == {
+        **legacy["proactive"],
+        "contextual_followups_enabled": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -511,7 +514,7 @@ def test_schema_v9_to_v10_migrates_four_roles_and_keeps_legacy_credential_slots(
 
     loaded = SettingsRepository(path).load()
 
-    assert loaded["schema_version"] == 10
+    assert loaded["schema_version"] == 11
     assignments = loaded["model_providers"]["assignments"]
     assert assignments["conversation"] == "legacy-chat"
     assert assignments["summary"] == "legacy-chat"

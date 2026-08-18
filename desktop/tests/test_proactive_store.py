@@ -81,6 +81,7 @@ def test_display_ledger_is_content_free_counted_by_local_date_and_durable(
         "displayed_at",
         "disposition",
         "message_id",
+        "cue_id",
     }
     assert "content" not in columns
 

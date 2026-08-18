@@ -27,7 +27,12 @@ from amadeus_desktop.proactive import (
     evaluate_proactive_policy,
     validate_generated_greeting,
 )
-from amadeus_desktop.storage_models import ProactiveTrigger as StorageProactiveTrigger
+from amadeus_desktop.storage_models import (
+    ProactivePresentation,
+)
+from amadeus_desktop.storage_models import (
+    ProactiveTrigger as StorageProactiveTrigger,
+)
 from amadeus_desktop.ui.greeting_bubble import GreetingBubble
 
 
@@ -36,6 +41,7 @@ class ProactiveDataGateway(Protocol):
     proactive_event_displayed: Any
     proactive_event_dismissed: Any
     proactive_greeting_persisted: Any
+    proactive_presentation_loaded: Any
 
     def load_proactive_display_count(self, local_date: date) -> bool: ...
 
@@ -46,6 +52,13 @@ class ProactiveDataGateway(Protocol):
         *,
         event_id: str | None = None,
         displayed_at: datetime | None = None,
+        cue_id: str | None = None,
+    ) -> bool: ...
+
+    def load_contextual_proactive_presentation(
+        self,
+        *,
+        include_deep: bool = True,
     ) -> bool: ...
 
     def dismiss_proactive_event(self, event_id: str) -> bool: ...
@@ -142,6 +155,10 @@ class ProactiveInteractionController(QObject):
         self._pending_displayed_count: int | None = None
         self._active_event_id: str | None = None
         self._active_greeting: str | None = None
+        self._active_preview: str | None = None
+        self._active_cue_id: str | None = None
+        self._active_trigger: ProactiveTrigger | None = None
+        self._active_displayed_count = 0
         self._active_provider_metadata: tuple[str | None, str | None] = (None, None)
         self._click_pending = False
         self._dismiss_pending = False
@@ -173,6 +190,9 @@ class ProactiveInteractionController(QObject):
         data.proactive_event_displayed.connect(self._on_event_displayed)
         data.proactive_event_dismissed.connect(self._on_event_dismissed)
         data.proactive_greeting_persisted.connect(self._on_greeting_persisted)
+        presentation_signal = getattr(data, "proactive_presentation_loaded", None)
+        if presentation_signal is not None:
+            presentation_signal.connect(self._on_presentation_loaded)
         bubble.clicked.connect(self._on_bubble_clicked)
         bubble.dismissed.connect(self._on_bubble_dismissed)
 
@@ -239,12 +259,30 @@ class ProactiveInteractionController(QObject):
         self._catalog = catalog
         self._using_local_catalog = True
 
-    def persistence_failed(self, operation: str) -> None:
+    def persistence_failed(self, operation: str, category: str = "") -> None:
         if not operation.startswith("proactive"):
             return
+        if operation == "proactive_context":
+            trigger = self._pending_trigger
+            if trigger is not None and self._pending_date == self._clock().date():
+                self._continue_generic(trigger, self._clock())
+                return
+            self._clear_pending_opportunity()
+            self.status_changed.emit("storage_error")
+            return
         if operation == "proactive_display":
+            trigger = self._active_trigger
+            displayed_count = self._active_displayed_count
+            contextual = self._active_cue_id is not None
             self._bubble.dismiss()
             self._clear_active()
+            if contextual and trigger is not None and self._running and not self._exiting():
+                now = self._clock()
+                self._pending_trigger = trigger
+                self._pending_date = now.date()
+                self._pending_displayed_count = displayed_count
+                self._display_local(trigger, now)
+                return
         elif operation == "proactive_click":
             event_id = self._active_event_id
             self._clear_active()
@@ -314,6 +352,49 @@ class ProactiveInteractionController(QObject):
             self._clear_pending_opportunity()
             self.status_changed.emit(reason.value)
             return
+        root_settings = self._settings_reader()
+        memory_settings = root_settings.get("memory", {})
+        if (
+            bool(settings.get("contextual_followups_enabled", False))
+            and isinstance(memory_settings, Mapping)
+            and bool(memory_settings.get("enabled", True))
+        ):
+            loader = getattr(self._data, "load_contextual_proactive_presentation", None)
+            if callable(loader) and loader(
+                include_deep=bool(memory_settings.get("deep_memory_enabled", True))
+            ):
+                return
+        self._continue_generic(trigger, now)
+
+    @Slot(object)
+    def _on_presentation_loaded(self, value: object) -> None:
+        trigger = self._pending_trigger
+        expected_date = self._pending_date
+        if trigger is None or expected_date is None:
+            return
+        now = self._clock()
+        if now.date() != expected_date:
+            self._clear_pending_opportunity()
+            return
+        if isinstance(value, ProactivePresentation) and value.cue_id is not None:
+            self._display(
+                trigger,
+                now,
+                value.preview_text,
+                expanded_text=value.expanded_text,
+                cue_id=value.cue_id,
+            )
+            return
+        self._continue_generic(trigger, now)
+
+    def _continue_generic(self, trigger: ProactiveTrigger, now: datetime) -> None:
+        """Continue the existing P7 generic greeting path without private context."""
+
+        if self._pending_trigger is not trigger or self._pending_date != now.date():
+            self._clear_pending_opportunity()
+            return
+        settings = self._settings_reader()["proactive"]
+        assert isinstance(settings, Mapping)
         visual_plan = self._build_visual_plan(now, trigger)
         if visual_plan is not None:
             if visual_plan.request is None or self._visual_generation_runner is None:
@@ -427,6 +508,8 @@ class ProactiveInteractionController(QObject):
         greeting: str,
         *,
         provider_metadata: tuple[str | None, str | None] = (None, None),
+        expanded_text: str | None = None,
+        cue_id: str | None = None,
     ) -> None:
         current = self._clock()
         settings = self._settings_reader()["proactive"]
@@ -463,7 +546,11 @@ class ProactiveInteractionController(QObject):
             self._clear_pending_opportunity()
             return
         event_id = uuid4().hex
-        self._active_greeting = greeting
+        self._active_preview = greeting
+        self._active_greeting = expanded_text if expanded_text is not None else greeting
+        self._active_cue_id = cue_id
+        self._active_trigger = trigger
+        self._active_displayed_count = max(0, int(self._pending_displayed_count or 0))
         self._active_event_id = event_id
         self._active_provider_metadata = provider_metadata
         self._click_pending = False
@@ -485,6 +572,7 @@ class ProactiveInteractionController(QObject):
             current.date(),
             event_id=event_id,
             displayed_at=_aware_local_time(current),
+            cue_id=cue_id,
         )
         self._clear_pending_opportunity()
         if not submitted:
@@ -560,6 +648,10 @@ class ProactiveInteractionController(QObject):
     def _clear_active(self) -> None:
         self._active_event_id = None
         self._active_greeting = None
+        self._active_preview = None
+        self._active_cue_id = None
+        self._active_trigger = None
+        self._active_displayed_count = 0
         self._active_provider_metadata = (None, None)
         self._click_pending = False
         self._dismiss_pending = False

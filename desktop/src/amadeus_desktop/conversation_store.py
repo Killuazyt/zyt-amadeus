@@ -9,6 +9,10 @@ from dataclasses import replace
 from datetime import date, datetime
 from uuid import uuid4
 
+from amadeus_desktop.companion_cues import (
+    CompanionCueStore,
+    CompanionCueUnavailableError,
+)
 from amadeus_desktop.database import SQLiteDatabase
 from amadeus_desktop.storage_models import (
     DEFAULT_PROFILE_ID,
@@ -848,8 +852,32 @@ class ConversationStore:
         grouped: dict[str, list[StoredAttachment]] = {identifier: [] for identifier in identifiers}
         for row in attachment_rows:
             grouped[str(row["message_id"])].append(_attachment_from_row(row))
-        return tuple(
+        messages = tuple(
             replace(message, attachments=tuple(grouped[message.message_id])) for message in messages
+        )
+        cue_ids = tuple(
+            dict.fromkeys(
+                message.companion_cue_id
+                for message in messages
+                if message.companion_cue_id is not None
+            )
+        )
+        labels: dict[str, str] = {}
+        if cue_ids:
+            cue_placeholders = ",".join("?" for _ in cue_ids)
+            for row in self._database.connection.execute(
+                f"SELECT id, kind FROM companion_cues WHERE id IN ({cue_placeholders})",
+                cue_ids,
+            ).fetchall():
+                labels[str(row["id"])] = (
+                    "待续话题" if str(row["kind"]) == "conversation_followup" else "已授权记忆"
+                )
+        return tuple(
+            replace(
+                message,
+                companion_source_label=labels.get(message.companion_cue_id or ""),
+            )
+            for message in messages
         )
 
     @staticmethod
@@ -936,10 +964,16 @@ class ProactiveInteractionStore:
         *,
         clock: Clock = utc_now,
         id_factory: IdFactory | None = None,
+        companion_cues: CompanionCueStore | None = None,
     ) -> None:
         self._database = database
         self._clock = clock
         self._id_factory = id_factory or (lambda: uuid4().hex)
+        self._companion_cues = companion_cues or CompanionCueStore(
+            database,
+            clock=clock,
+            id_factory=self._id_factory,
+        )
 
     def record_displayed(
         self,
@@ -949,6 +983,7 @@ class ProactiveInteractionStore:
         profile_id: str = DEFAULT_PROFILE_ID,
         event_id: str | None = None,
         displayed_at: datetime | None = None,
+        cue_id: str | None = None,
     ) -> ProactiveInteractionEvent:
         """Count one greeting only after its bubble was actually displayed."""
 
@@ -957,6 +992,7 @@ class ProactiveInteractionStore:
         profile_id = _required_identifier(profile_id, "profile_id")
         event_id = _required_identifier(event_id or self._id_factory(), "event_id")
         shown_at = encode_utc(displayed_at or self._clock())
+        normalized_cue_id = None if cue_id is None else _required_identifier(cue_id, "cue_id")
         try:
             with self._database.transaction() as connection:
                 if (
@@ -966,14 +1002,30 @@ class ProactiveInteractionStore:
                     is None
                 ):
                     raise StorageNotFoundError("profile does not exist")
+                if normalized_cue_id is not None:
+                    cue = self._companion_cues.mark_surfaced(
+                        normalized_cue_id,
+                        connection=connection,
+                    )
+                    if cue.profile_id != profile_id:
+                        raise StorageConflictError(
+                            "proactive event and companion cue profiles do not match"
+                        )
                 connection.execute(
                     """
                     INSERT INTO proactive_events(
                         id, profile_id, local_date, trigger_kind, displayed_at,
-                        disposition, message_id
-                    ) VALUES (?, ?, ?, ?, ?, 'displayed', NULL)
+                        disposition, message_id, cue_id
+                    ) VALUES (?, ?, ?, ?, ?, 'displayed', NULL, ?)
                     """,
-                    (event_id, profile_id, date_value, trigger_value.value, shown_at),
+                    (
+                        event_id,
+                        profile_id,
+                        date_value,
+                        trigger_value.value,
+                        shown_at,
+                        normalized_cue_id,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise StorageConflictError("proactive event ID already exists") from exc
@@ -1105,16 +1157,28 @@ class ProactiveInteractionStore:
                         raise StorageConflictError(
                             "proactive messages require an active conversation"
                         )
+                    cue_id = event["cue_id"]
+                    if cue_id is not None:
+                        cue = self._companion_cues.authorized_for_click(
+                            str(cue_id),
+                            connection=connection,
+                        )
+                        if cue.profile_id != str(event["profile_id"]):
+                            raise CompanionCueUnavailableError("companion cue profile changed")
+                        if greeting != cue.frozen_text:
+                            raise CompanionCueUnavailableError(
+                                "companion cue text does not match authorization"
+                            )
                     connection.execute(
                         """
                         INSERT INTO messages(
                             id, conversation_id, turn_id, role, origin, content,
                             status, attempt, terminal_reason, provider_name, model_name,
                             failure_code, participates_in_memory, created_at, updated_at,
-                            completed_at
+                            completed_at, companion_cue_id
                         ) VALUES (
                             ?, ?, ?, 'assistant', 'proactive', ?, 'completed', 1,
-                            'completed', ?, ?, NULL, 0, ?, ?, ?
+                            'completed', ?, ?, NULL, 0, ?, ?, ?, ?
                         )
                         """,
                         (
@@ -1127,6 +1191,7 @@ class ProactiveInteractionStore:
                             now,
                             now,
                             now,
+                            cue_id,
                         ),
                     )
                     cursor = connection.execute(
@@ -1153,6 +1218,75 @@ class ProactiveInteractionStore:
             ).fetchone()
         )
         return self.get(event_id), message
+
+    def persist_companion_cue_manual_open(
+        self,
+        cue_id: str,
+        conversation_id: str,
+        *,
+        message_id: str | None = None,
+        opened_at: datetime | None = None,
+    ) -> StoredMessage:
+        """Open authorized frozen text in chat without any provider request."""
+
+        cue_id = _required_identifier(cue_id, "cue_id")
+        conversation_id = _required_identifier(conversation_id, "conversation_id")
+        candidate_message_id = _required_identifier(message_id or self._id_factory(), "message_id")
+        now = encode_utc(opened_at or self._clock())
+        try:
+            with self._database.transaction() as connection:
+                cue = self._companion_cues.authorized_for_manual_open(
+                    cue_id,
+                    connection=connection,
+                )
+                conversation = connection.execute(
+                    "SELECT profile_id, status FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if conversation is None:
+                    raise StorageNotFoundError("conversation does not exist")
+                if str(conversation["profile_id"]) != cue.profile_id:
+                    raise StorageConflictError(
+                        "companion cue and conversation profiles do not match"
+                    )
+                if str(conversation["status"]) != ConversationStatus.NORMAL.value:
+                    raise StorageConflictError("companion cue requires an active conversation")
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id, conversation_id, turn_id, role, origin, content,
+                        status, attempt, terminal_reason, failure_code,
+                        participates_in_memory, created_at, updated_at, completed_at,
+                        companion_cue_id
+                    ) VALUES (
+                        ?, ?, ?, 'assistant', 'proactive', ?, 'completed', 1,
+                        'completed', NULL, 0, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        candidate_message_id,
+                        conversation_id,
+                        f"companion-cue:{cue_id}:{candidate_message_id}",
+                        cue.frozen_text,
+                        now,
+                        now,
+                        now,
+                        cue_id,
+                    ),
+                )
+                ConversationStore._touch_conversation_for_message(
+                    connection,
+                    candidate_message_id,
+                    now,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StorageConflictError("companion cue message could not be persisted") from exc
+        return _message_from_row(
+            self._database.connection.execute(
+                "SELECT * FROM messages WHERE id = ?",
+                (candidate_message_id,),
+            ).fetchone()
+        )
 
     def get(self, event_id: str) -> ProactiveInteractionEvent:
         row = self._database.connection.execute(
@@ -1670,6 +1804,11 @@ def _message_from_row(row: sqlite3.Row) -> StoredMessage:
             if "input_modality" in tuple(row.keys())
             else StoredInputModality.TEXT
         ),
+        companion_cue_id=(
+            str(row["companion_cue_id"])
+            if "companion_cue_id" in tuple(row.keys()) and row["companion_cue_id"] is not None
+            else None
+        ),
     )
 
 
@@ -1703,6 +1842,11 @@ def _proactive_event_from_row(row: sqlite3.Row) -> ProactiveInteractionEvent:
         displayed_at=_required_datetime(row["displayed_at"]),
         disposition=ProactiveDisposition(row["disposition"]),
         message_id=row["message_id"],
+        cue_id=(
+            str(row["cue_id"])
+            if "cue_id" in tuple(row.keys()) and row["cue_id"] is not None
+            else None
+        ),
     )
 
 

@@ -33,6 +33,7 @@ from amadeus_desktop.chat_provider import (
     ChatProviderError,
     ProviderErrorCode,
 )
+from amadeus_desktop.companion_context import build_companion_context_snapshot
 from amadeus_desktop.persona import build_persona_system_prompt
 
 FIRST_CHUNK_TIMEOUT_TEXT = "等待回复首段超时，请重试。"
@@ -299,6 +300,10 @@ class ConversationCoordinator(QObject):
                 role=MessageRole.ASSISTANT,
                 content="",
                 status=MessageStatus.PENDING,
+            ),
+            companion_context=build_companion_context_snapshot(
+                input_modality=input_modality,
+                attachments=attachments,
             ),
         )
         self._turns.append(turn)
@@ -589,6 +594,7 @@ class ConversationCoordinator(QObject):
                 if prepared_prompt.provider_route is ProviderRoute.MULTIMODAL
                 else "conversation"
             ),
+            companion_context=prepared_prompt.companion_context,
         )
         cancellation = CancellationToken()
         thread = QThread(self)
@@ -623,7 +629,10 @@ class ConversationCoordinator(QObject):
 
     def _prompt_messages(self, current_turn_id: str) -> tuple[PromptMessage, ...]:
         recent_messages: list[PromptMessage] = []
+        current_context = None
         for turn in self._turns:
+            if turn.turn_id == current_turn_id:
+                current_context = turn.companion_context
             recent_messages.append(PromptMessage(PromptRole.USER, turn.user_message.content))
             if (
                 turn.turn_id != current_turn_id
@@ -633,7 +642,10 @@ class ConversationCoordinator(QObject):
                     PromptMessage(PromptRole.ASSISTANT, turn.assistant_message.content)
                 )
         return (
-            PromptMessage(PromptRole.SYSTEM, build_persona_system_prompt()),
+            PromptMessage(
+                PromptRole.SYSTEM,
+                build_persona_system_prompt(snapshot=current_context),
+            ),
             *recent_messages[-20:],
         )
 

@@ -9,6 +9,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 from amadeus_desktop.chat_models import (
+    AttachmentSource,
     ChatRequest,
     GenerationOptions,
     GenerationPurpose,
@@ -17,6 +18,10 @@ from amadeus_desktop.chat_models import (
     PromptRole,
     ProviderRoute,
     TextPart,
+)
+from amadeus_desktop.companion_context import (
+    build_proactive_text_context,
+    build_proactive_visual_context,
 )
 from amadeus_desktop.persona import (
     build_capability_safety_boundary,
@@ -141,12 +146,13 @@ def build_proactive_request(now: datetime, trigger: ProactiveTrigger) -> ChatReq
         "不要提及未获得的用户状态，不要复述规则，不要使用引号。"
     )
     request_id = uuid4().hex
+    context = build_proactive_text_context()
     return ChatRequest(
         request_id=request_id,
         turn_id=f"proactive:{request_id}",
         attempt=1,
         messages=(
-            PromptMessage(PromptRole.SYSTEM, build_capability_safety_boundary()),
+            PromptMessage(PromptRole.SYSTEM, build_capability_safety_boundary(context)),
             PromptMessage(PromptRole.SYSTEM, build_persona_core_prompt()),
             PromptMessage(PromptRole.USER, prompt),
         ),
@@ -156,6 +162,7 @@ def build_proactive_request(now: datetime, trigger: ProactiveTrigger) -> ChatReq
             max_output_tokens=80,
         ),
         provider_role="conversation",
+        companion_context=context,
     )
 
 
@@ -178,12 +185,13 @@ def build_proactive_visual_request(
     )
     request_id = uuid4().hex
     encoded = base64.b64encode(frame.png_bytes).decode("ascii")
+    context = build_proactive_visual_context(AttachmentSource(frame.source_kind.value))
     return ChatRequest(
         request_id=request_id,
         turn_id=f"proactive-visual:{request_id}",
         attempt=1,
         messages=(
-            PromptMessage(PromptRole.SYSTEM, build_capability_safety_boundary()),
+            PromptMessage(PromptRole.SYSTEM, build_capability_safety_boundary(context)),
             PromptMessage(PromptRole.SYSTEM, build_persona_core_prompt()),
             PromptMessage(
                 PromptRole.USER,
@@ -203,6 +211,7 @@ def build_proactive_visual_request(
         ),
         provider_route=ProviderRoute.MULTIMODAL,
         provider_role="vision",
+        companion_context=context,
     )
 
 
