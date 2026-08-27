@@ -1,4 +1,4 @@
-"""SQLite schema v7, consistent migration backups, and fail-closed opening."""
+"""SQLite schema v8, consistent migration backups, and fail-closed opening."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 AMADEUS_APPLICATION_ID = int.from_bytes(b"AMDS", "big")
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
@@ -1185,6 +1185,159 @@ def _migrate_to_v7(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+_SCHEMA_V8: tuple[str, ...] = (
+    """
+    CREATE TABLE temporal_commitments (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('chat', 'manual')),
+        source_message_id TEXT,
+        source_conversation_id TEXT,
+        live_source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+        live_source_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+        status TEXT NOT NULL CHECK (status IN (
+            'draft', 'scheduled', 'due', 'surfaced', 'completed', 'cancelled'
+        )),
+        current_version_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        due_detected_at TEXT,
+        surfaced_at TEXT,
+        completed_at TEXT,
+        cancelled_at TEXT,
+        FOREIGN KEY (current_version_id) REFERENCES temporal_commitment_versions(id)
+            ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED,
+        CHECK (
+            (source_kind = 'manual' AND source_message_id IS NULL
+                AND source_conversation_id IS NULL AND live_source_message_id IS NULL
+                AND live_source_conversation_id IS NULL)
+            OR
+            (source_kind = 'chat' AND source_message_id IS NOT NULL
+                AND source_conversation_id IS NOT NULL)
+        ),
+        CHECK (status = 'draft' OR confirmed_at IS NOT NULL),
+        CHECK (status <> 'completed' OR completed_at IS NOT NULL),
+        CHECK (status <> 'cancelled' OR cancelled_at IS NOT NULL)
+    )
+    """,
+    """
+    CREATE TABLE temporal_commitment_versions (
+        id TEXT PRIMARY KEY,
+        commitment_id TEXT NOT NULL
+            REFERENCES temporal_commitments(id) ON DELETE CASCADE,
+        version_number INTEGER NOT NULL CHECK (version_number >= 1),
+        kind TEXT NOT NULL CHECK (kind IN ('reminder', 'scheduled_followup')),
+        content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 500),
+        due_at_utc TEXT,
+        original_local_time TEXT,
+        timezone_name TEXT,
+        utc_offset_minutes INTEGER CHECK (
+            utc_offset_minutes IS NULL OR utc_offset_minutes BETWEEN -840 AND 840
+        ),
+        show_content INTEGER NOT NULL DEFAULT 0 CHECK (show_content IN (0, 1)),
+        origin TEXT NOT NULL CHECK (origin IN ('chat', 'manual', 'edit', 'snooze')),
+        supersedes_version_id TEXT REFERENCES temporal_commitment_versions(id)
+            DEFERRABLE INITIALLY DEFERRED,
+        created_at TEXT NOT NULL,
+        UNIQUE (commitment_id, version_number),
+        CHECK (
+            (due_at_utc IS NULL AND original_local_time IS NULL)
+            OR (due_at_utc IS NOT NULL AND original_local_time IS NOT NULL
+                AND timezone_name IS NOT NULL AND utc_offset_minutes IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE INDEX temporal_commitments_due_idx
+    ON temporal_commitments(profile_id, status, updated_at, id)
+    """,
+    """
+    CREATE INDEX temporal_commitment_versions_due_idx
+    ON temporal_commitment_versions(due_at_utc, commitment_id)
+    """,
+    """
+    CREATE INDEX temporal_commitments_source_conversation_idx
+    ON temporal_commitments(source_conversation_id, status)
+    """,
+    """
+    CREATE UNIQUE INDEX temporal_commitments_source_message_idx
+    ON temporal_commitments(source_message_id)
+    WHERE source_message_id IS NOT NULL
+    """,
+    """
+    CREATE TRIGGER temporal_commitment_versions_are_immutable
+    BEFORE UPDATE ON temporal_commitment_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'temporal commitment versions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER temporal_commitment_versions_no_individual_delete
+    BEFORE DELETE ON temporal_commitment_versions
+    WHEN EXISTS (SELECT 1 FROM temporal_commitments WHERE id = OLD.commitment_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'temporal commitment versions can only be deleted with their group');
+    END
+    """,
+    """
+    CREATE TABLE temporal_commitment_audit_events (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        commitment_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        previous_status TEXT,
+        resulting_status TEXT,
+        version_id TEXT,
+        occurred_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX temporal_commitment_audit_profile_time_idx
+    ON temporal_commitment_audit_events(profile_id, occurred_at DESC)
+    """,
+    """
+    CREATE INDEX temporal_commitment_audit_commitment_time_idx
+    ON temporal_commitment_audit_events(commitment_id, occurred_at DESC)
+    """,
+    """
+    CREATE TRIGGER temporal_commitment_audit_events_are_immutable
+    BEFORE UPDATE ON temporal_commitment_audit_events
+    BEGIN
+        SELECT RAISE(ABORT, 'temporal commitment audit events are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER temporal_commitments_audit_delete
+    BEFORE DELETE ON temporal_commitments
+    BEGIN
+        INSERT INTO temporal_commitment_audit_events (
+            id, profile_id, commitment_id, event_type, reason_code,
+            previous_status, resulting_status, version_id, occurred_at
+        ) VALUES (
+            lower(hex(randomblob(16))), OLD.profile_id, OLD.id, 'deleted',
+            'content_and_sources_removed', OLD.status, NULL, OLD.current_version_id,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        );
+    END
+    """,
+    """
+    ALTER TABLE messages ADD COLUMN temporal_commitment_id TEXT
+        REFERENCES temporal_commitments(id) ON DELETE SET NULL
+    """,
+    """
+    CREATE INDEX messages_temporal_commitment_idx
+    ON messages(temporal_commitment_id)
+    """,
+)
+
+
+def _migrate_to_v8(connection: sqlite3.Connection) -> None:
+    for statement in _SCHEMA_V8:
+        connection.execute(statement)
+
+
 _DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
@@ -1193,6 +1346,7 @@ _DEFAULT_MIGRATIONS: Mapping[int, Migration] = {
     5: _migrate_to_v5,
     6: _migrate_to_v6,
     7: _migrate_to_v7,
+    8: _migrate_to_v8,
 }
 _REQUIRED_TABLES = {
     "profiles",
@@ -1236,6 +1390,9 @@ _REQUIRED_TABLES = {
     "companion_cues",
     "companion_cue_sources",
     "companion_cue_audit_events",
+    "temporal_commitments",
+    "temporal_commitment_versions",
+    "temporal_commitment_audit_events",
 }
 _REQUIRED_TRIGGER_SQL_MARKERS = {
     "memory_versions_are_immutable": (
@@ -1280,6 +1437,18 @@ _REQUIRED_TRIGGER_SQL_MARKERS = {
         "when old.status <> 'proposed'",
         "raise(abort, 'confirmed companion cue text is immutable')",
     ),
+    "temporal_commitment_versions_are_immutable": (
+        "before update on temporal_commitment_versions",
+        "raise(abort, 'temporal commitment versions are immutable')",
+    ),
+    "temporal_commitment_versions_no_individual_delete": (
+        "before delete on temporal_commitment_versions",
+        "raise(abort, 'temporal commitment versions can only be deleted with their group')",
+    ),
+    "temporal_commitment_audit_events_are_immutable": (
+        "before update on temporal_commitment_audit_events",
+        "raise(abort, 'temporal commitment audit events are immutable')",
+    ),
 }
 _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
     "memory_embedding_one_active_idx": (
@@ -1312,6 +1481,11 @@ _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
         "on companion_cues(profile_id, dedupe_key)",
         "where status in ('proposed', 'active', 'surfaced')",
     ),
+    "temporal_commitments_source_message_idx": (
+        "create unique index",
+        "on temporal_commitments(source_message_id)",
+        "where source_message_id is not null",
+    ),
 }
 _REQUIRED_INDEX_SQL_MARKERS = {
     "proactive_events_profile_date_idx": (
@@ -1340,6 +1514,7 @@ _REQUIRED_COLUMNS = {
         "origin",
         "input_modality",
         "companion_cue_id",
+        "temporal_commitment_id",
     },
     "attachments": {
         "id",
@@ -1702,6 +1877,50 @@ _REQUIRED_COLUMNS = {
         "reason_code",
         "previous_status",
         "resulting_status",
+        "occurred_at",
+    },
+    "temporal_commitments": {
+        "id",
+        "profile_id",
+        "source_kind",
+        "source_message_id",
+        "source_conversation_id",
+        "live_source_message_id",
+        "live_source_conversation_id",
+        "status",
+        "current_version_id",
+        "created_at",
+        "updated_at",
+        "confirmed_at",
+        "due_detected_at",
+        "surfaced_at",
+        "completed_at",
+        "cancelled_at",
+    },
+    "temporal_commitment_versions": {
+        "id",
+        "commitment_id",
+        "version_number",
+        "kind",
+        "content",
+        "due_at_utc",
+        "original_local_time",
+        "timezone_name",
+        "utc_offset_minutes",
+        "show_content",
+        "origin",
+        "supersedes_version_id",
+        "created_at",
+    },
+    "temporal_commitment_audit_events": {
+        "id",
+        "profile_id",
+        "commitment_id",
+        "event_type",
+        "reason_code",
+        "previous_status",
+        "resulting_status",
+        "version_id",
         "occurred_at",
     },
 }

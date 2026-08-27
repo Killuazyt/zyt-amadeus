@@ -188,6 +188,8 @@ class ChatMessage:
     input_modality: InputModality = InputModality.TEXT
     companion_cue_id: str | None = None
     companion_source_label: str | None = None
+    temporal_commitment_id: str | None = None
+    temporal_commitment: object | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -48,16 +48,18 @@ def _create_fallback_icon() -> QIcon:
 
 
 class TrayController(QObject):
-    """Own the exact eight-item P6 tray menu and expose intent-only signals."""
+    """Own the P7I tray menu and expose intent-only signals."""
 
     toggle_requested = Signal()
     open_chat_requested = Signal()
     memory_requested = Signal()
+    reminders_requested = Signal()
     settings_requested = Signal()
     always_on_top_changed = Signal(bool)
     pause_proactive_today_changed = Signal(bool)
     launch_at_login_changed = Signal(bool)
     exit_requested = Signal()
+    notification_clicked = Signal(object)
 
     # Transitional P5 signal names remain available until controller composition is
     # switched atomically to the P6 entry points.
@@ -71,12 +73,14 @@ class TrayController(QObject):
     ) -> None:
         super().__init__()
         self._closed = False
+        self._notification_payload: object | None = None
         self._menu = QMenu()
 
         # Product order is intentionally exact; do not insert separators or placeholders.
         self.toggle_action = self._menu.addAction("隐藏宠物")
         self.open_chat_action = self._menu.addAction("打开对话")
         self.memory_action = self._menu.addAction("记忆管理…")
+        self.reminders_action = self._menu.addAction("提醒…")
         self.settings_action = self._menu.addAction("设置…")
         self.always_on_top_action = self._checkable_action("始终置顶")
         self.pause_proactive_today_action = self._checkable_action("今天暂停主动互动")
@@ -93,12 +97,14 @@ class TrayController(QObject):
         self.toggle_action.triggered.connect(self.toggle_requested.emit)
         self.open_chat_action.triggered.connect(self.open_chat_requested.emit)
         self.memory_action.triggered.connect(self.memory_requested.emit)
+        self.reminders_action.triggered.connect(self.reminders_requested.emit)
         self.settings_action.triggered.connect(self._request_settings)
         self.always_on_top_action.toggled.connect(self.always_on_top_changed.emit)
         self.pause_proactive_today_action.toggled.connect(self.pause_proactive_today_changed.emit)
         self.launch_at_login_action.toggled.connect(self.launch_at_login_changed.emit)
         self.exit_action.triggered.connect(self.exit_requested.emit)
         self._tray.activated.connect(self._on_activated)
+        self._tray.messageClicked.connect(self._on_notification_clicked)
 
     @property
     def is_visible(self) -> bool:
@@ -136,6 +142,30 @@ class TrayController(QObject):
     def set_launch_at_login(self, enabled: bool) -> None:
         _set_checked(self.launch_at_login_action, enabled)
 
+    def set_reminder_outstanding_count(self, count: int) -> None:
+        normalized = max(0, int(count))
+        self.reminders_action.setText(
+            f"提醒（{normalized}）…" if normalized else "提醒…"
+        )
+
+    def notify_reminder(self, title: str, body: str, payload: object) -> bool:
+        """Submit one privacy-safe tray notification and retain its click target."""
+
+        if self._closed or not self._tray.isVisible():
+            return False
+        try:
+            self._notification_payload = payload
+            self._tray.showMessage(
+                str(title),
+                str(body),
+                QSystemTrayIcon.MessageIcon.Information,
+                10_000,
+            )
+        except RuntimeError:
+            self._notification_payload = None
+            return False
+        return True
+
     def apply_state(
         self,
         *,
@@ -164,6 +194,12 @@ class TrayController(QObject):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.open_chat_requested.emit()
             self.show_requested.emit()
+
+    def _on_notification_clicked(self) -> None:
+        payload = self._notification_payload
+        self._notification_payload = None
+        if payload is not None:
+            self.notification_clicked.emit(payload)
 
 
 def _set_checked(action: QAction, checked: bool) -> None:

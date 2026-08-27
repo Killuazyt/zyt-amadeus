@@ -28,6 +28,7 @@ from amadeus_desktop.ui.memory_page import MemoryPage
 from amadeus_desktop.ui.persona_page import PersonaPage
 from amadeus_desktop.ui.pet_settings_page import PetSettingsPage
 from amadeus_desktop.ui.proactive_page import ProactivePage
+from amadeus_desktop.ui.reminders_page import RemindersPage
 
 _PAGE_SPECS = (
     ("general", "常规"),
@@ -38,6 +39,7 @@ _PAGE_SPECS = (
     ("persona", "角色"),
     ("history", "聊天历史"),
     ("memory", "长期记忆"),
+    ("reminders", "提醒"),
     ("proactive", "主动互动"),
     ("diagnostics", "诊断"),
 )
@@ -96,6 +98,7 @@ class SettingsWindow(QDialog):
         persona_page: PersonaPage | None = None,
         history_page: HistoryPage | None = None,
         memory_page: MemoryPage | None = None,
+        reminders_page: RemindersPage | None = None,
         proactive_page: ProactivePage | None = None,
         diagnostics_page: DiagnosticsPage | None = None,
         parent: QWidget | None = None,
@@ -120,6 +123,7 @@ class SettingsWindow(QDialog):
         self.persona_page = persona_page or PersonaPage()
         self.history_page = history_page or HistoryPage()
         self.memory_page = memory_page or MemoryPage()
+        self.reminders_page = reminders_page or RemindersPage()
         self.proactive_page = proactive_page or ProactivePage()
         self.diagnostics_page = diagnostics_page or DiagnosticsPage()
         self._pages: tuple[QWidget, ...] = (
@@ -131,6 +135,7 @@ class SettingsWindow(QDialog):
             self.persona_page,
             self.history_page,
             self.memory_page,
+            self.reminders_page,
             self.proactive_page,
             self.diagnostics_page,
         )

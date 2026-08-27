@@ -872,10 +872,36 @@ class ConversationStore:
                 labels[str(row["id"])] = (
                     "待续话题" if str(row["kind"]) == "conversation_followup" else "已授权记忆"
                 )
-        return tuple(
+        messages = tuple(
             replace(
                 message,
                 companion_source_label=labels.get(message.companion_cue_id or ""),
+            )
+            for message in messages
+        )
+        temporal_ids = tuple(
+            dict.fromkeys(
+                message.temporal_commitment_id
+                for message in messages
+                if message.temporal_commitment_id is not None
+            )
+        )
+        temporal_records: dict[str, object] = {}
+        if temporal_ids:
+            from amadeus_desktop.temporal_commitments import TemporalCommitmentStore
+
+            temporal_store = TemporalCommitmentStore(self._database)
+            for temporal_id in temporal_ids:
+                try:
+                    temporal_records[temporal_id] = temporal_store.get(temporal_id)
+                except StorageNotFoundError:
+                    continue
+        return tuple(
+            replace(
+                message,
+                temporal_commitment=temporal_records.get(
+                    message.temporal_commitment_id or ""
+                ),
             )
             for message in messages
         )
@@ -1807,6 +1833,12 @@ def _message_from_row(row: sqlite3.Row) -> StoredMessage:
         companion_cue_id=(
             str(row["companion_cue_id"])
             if "companion_cue_id" in tuple(row.keys()) and row["companion_cue_id"] is not None
+            else None
+        ),
+        temporal_commitment_id=(
+            str(row["temporal_commitment_id"])
+            if "temporal_commitment_id" in tuple(row.keys())
+            and row["temporal_commitment_id"] is not None
             else None
         ),
     )

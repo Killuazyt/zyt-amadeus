@@ -72,6 +72,14 @@ from amadeus_desktop.storage_models import (
     StoredMessageOrigin,
     StoredMessageRole,
     StoredMessageStatus,
+    TemporalCommitment,
+    TemporalCommitmentKind,
+    TemporalCommitmentStatus,
+)
+from amadeus_desktop.temporal_commitments import (
+    TemporalCommitmentStore,
+    TemporalDraftSpec,
+    TemporalDueSnapshot,
 )
 from amadeus_desktop.vector_store import VectorStore
 
@@ -98,6 +106,7 @@ class LocalDataStores:
     proactive: ProactiveInteractionStore
     attachments: AttachmentStore
     companion_cues: CompanionCueStore
+    temporal_commitments: TemporalCommitmentStore
 
     def close(self) -> None:
         self.database.close()
@@ -150,6 +159,14 @@ class MemoryListSnapshot:
     conflict_rows: tuple[dict[str, object], ...] = ()
     cue_rows: tuple[dict[str, object], ...] = ()
     layer_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ReminderListSnapshot:
+    commitments: tuple[TemporalCommitment, ...]
+    query: str = ""
+    status: str = ""
+    outstanding_count: int = 0
 
 
 @dataclass(slots=True)
@@ -262,6 +279,7 @@ def create_local_data_stores(
 
     database = SQLiteDatabase(database_path, backup_dir=backup_directory).open()
     companion_cues = CompanionCueStore(database)
+    temporal_commitments = TemporalCommitmentStore(database)
     return LocalDataStores(
         database=database,
         conversations=ConversationStore(database),
@@ -277,6 +295,7 @@ def create_local_data_stores(
             else AttachmentStore(attachment_directory or database_path.parent / "attachments")
         ),
         companion_cues=companion_cues,
+        temporal_commitments=temporal_commitments,
     )
 
 
@@ -306,6 +325,13 @@ class LocalDataService(QObject):
     proactive_greeting_persisted = Signal(object, object)
     companion_cue_changed = Signal(object)
     companion_cue_opened = Signal(str)
+    reminders_loaded = Signal(object)
+    temporal_commitment_changed = Signal(object)
+    temporal_chat_draft_created = Signal(object)
+    temporal_due_scanned = Signal(object)
+    temporal_outstanding_count_changed = Signal(int)
+    temporal_active_count_loaded = Signal(str, int)
+    temporal_followup_opened = Signal(str)
     _vector_query_completed = Signal(str, object)
 
     def __init__(
@@ -1298,6 +1324,291 @@ class LocalDataService(QObject):
             return
         self._next_before_sequence = value.next_before_sequence
         self.older_messages_loaded.emit(value)
+
+    # Local time commitments ------------------------------------------
+    def create_temporal_chat_draft(self, user_text: str, spec: TemporalDraftSpec) -> bool:
+        conversation_id = self._current_conversation_id
+        if not self._writable or conversation_id is None:
+            self.operation_failed.emit("create_temporal_draft", "DatabaseReadOnlyError")
+            return False
+
+        def operation(
+            stores: LocalDataStores,
+        ) -> tuple[TemporalCommitment, ConversationSnapshot]:
+            commitment = stores.temporal_commitments.create_chat_draft(
+                conversation_id,
+                user_text,
+                spec,
+            )
+            conversation = stores.conversations.get_conversation(conversation_id)
+            return commitment, _conversation_snapshot(stores, conversation)
+
+        def completed(value: tuple[TemporalCommitment, ConversationSnapshot]) -> None:
+            commitment, snapshot = value
+            if self._current_conversation_id == conversation_id:
+                self._on_conversation_loaded(
+                    snapshot,
+                    failure_operation="create_temporal_draft",
+                )
+            self.temporal_chat_draft_created.emit(commitment)
+            self.temporal_commitment_changed.emit(commitment)
+            self.refresh_history()
+            self.refresh_reminders()
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.FOREGROUND,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit(
+                "create_temporal_draft", category
+            ),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("create_temporal_draft")
+            return False
+        return True
+
+    def create_manual_temporal_draft(self, spec: TemporalDraftSpec) -> bool:
+        if not self._writable:
+            self.operation_failed.emit("create_temporal_draft", "DatabaseReadOnlyError")
+            return False
+        return self._temporal_write(
+            "create_temporal_draft",
+            lambda stores: stores.temporal_commitments.create_manual_draft(spec),
+        )
+
+    def refresh_reminders(self, query: str = "", status: str = "") -> None:
+        normalized_status = status.strip()
+
+        def operation(stores: LocalDataStores) -> ReminderListSnapshot:
+            if normalized_status == "outstanding":
+                commitments = tuple(
+                    commitment
+                    for commitment in stores.temporal_commitments.list(query=query)
+                    if commitment.status
+                    in {
+                        TemporalCommitmentStatus.DUE,
+                        TemporalCommitmentStatus.SURFACED,
+                    }
+                )
+            else:
+                commitments = stores.temporal_commitments.list(
+                    query=query,
+                    status=normalized_status or None,
+                )
+            return ReminderListSnapshot(
+                commitments,
+                query=str(query),
+                status=normalized_status,
+                outstanding_count=stores.temporal_commitments.outstanding_count(),
+            )
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.INTERACTIVE,
+            on_success=self._on_reminders_loaded,
+            on_failure=lambda category: self.operation_failed.emit("reminders", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("reminders")
+
+    def confirm_temporal_commitment(
+        self,
+        commitment_id: str,
+        spec: TemporalDraftSpec,
+    ) -> bool:
+        return self._temporal_write(
+            "confirm_temporal_commitment",
+            lambda stores: stores.temporal_commitments.confirm(commitment_id, spec),
+        )
+
+    def revise_temporal_commitment(
+        self,
+        commitment_id: str,
+        spec: TemporalDraftSpec,
+        *,
+        confirm: bool = True,
+    ) -> bool:
+        return self._temporal_write(
+            "revise_temporal_commitment",
+            lambda stores: stores.temporal_commitments.revise(
+                commitment_id,
+                spec,
+                confirm=confirm,
+            ),
+        )
+
+    def cancel_temporal_commitment(self, commitment_id: str) -> bool:
+        return self._temporal_write(
+            "cancel_temporal_commitment",
+            lambda stores: stores.temporal_commitments.cancel(commitment_id),
+        )
+
+    def complete_temporal_commitment(self, commitment_id: str) -> bool:
+        return self._temporal_write(
+            "complete_temporal_commitment",
+            lambda stores: stores.temporal_commitments.complete(commitment_id),
+        )
+
+    def snooze_temporal_commitment(self, commitment_id: str, minutes: int = 10) -> bool:
+        return self._temporal_write(
+            "snooze_temporal_commitment",
+            lambda stores: stores.temporal_commitments.snooze(
+                commitment_id,
+                minutes=minutes,
+            ),
+        )
+
+    def delete_temporal_commitment(self, commitment_id: str) -> bool:
+        def operation(stores: LocalDataStores) -> None:
+            stores.temporal_commitments.delete(commitment_id)
+            stores.database.purge_deleted_content()
+
+        return self._temporal_write("delete_temporal_commitment", operation)
+
+    def scan_due_temporal_commitments(self, *, now: datetime | None = None) -> bool:
+        if not self._writable:
+            return False
+
+        def completed(snapshot: TemporalDueSnapshot) -> None:
+            self.temporal_due_scanned.emit(snapshot)
+            self.temporal_outstanding_count_changed.emit(snapshot.outstanding_count)
+
+        request_id = self.runtime.submit(
+            lambda stores: stores.temporal_commitments.scan_due(now=now),
+            priority=DataPriority.FOREGROUND,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit("scan_reminders", category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("scan_reminders")
+            return False
+        return True
+
+    def mark_temporal_commitments_surfaced(
+        self,
+        commitment_ids: tuple[str, ...],
+        *,
+        reason_code: str,
+    ) -> bool:
+        if not commitment_ids:
+            return False
+
+        def completed(value: object) -> None:
+            commitments = tuple(value) if isinstance(value, tuple) else ()
+            for commitment in commitments:
+                self.temporal_commitment_changed.emit(commitment)
+            self.refresh_reminders()
+
+        request_id = self.runtime.submit(
+            lambda stores: stores.temporal_commitments.mark_surfaced(
+                commitment_ids,
+                reason_code=reason_code,
+            ),
+            priority=DataPriority.FOREGROUND,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit(
+                "surface_reminders", category
+            ),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("surface_reminders")
+            return False
+        return True
+
+    def load_active_temporal_count(self, conversation_id: str | None) -> None:
+        key = "*" if conversation_id is None else str(conversation_id)
+        request_id = self.runtime.submit(
+            lambda stores: stores.temporal_commitments.active_count_for_conversation(
+                conversation_id
+            ),
+            priority=DataPriority.INTERACTIVE,
+            on_success=lambda count: self.temporal_active_count_loaded.emit(key, int(count)),
+            on_failure=lambda category: self.operation_failed.emit(
+                "count_active_reminders", category
+            ),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("count_active_reminders")
+
+    def open_temporal_followup(
+        self,
+        commitment_id: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> bool:
+        target_conversation_id = conversation_id or self._current_conversation_id
+        if not self._writable or target_conversation_id is None:
+            self.operation_failed.emit("open_temporal_followup", "ConversationUnavailable")
+            return False
+
+        def operation(stores: LocalDataStores) -> ConversationSnapshot:
+            stores.temporal_commitments.open_followup_in_chat(
+                commitment_id,
+                target_conversation_id,
+            )
+            conversation = stores.conversations.get_conversation(target_conversation_id)
+            return _conversation_snapshot(stores, conversation)
+
+        def completed(snapshot: ConversationSnapshot) -> None:
+            if self._current_conversation_id == target_conversation_id:
+                self._on_conversation_loaded(
+                    snapshot,
+                    failure_operation="open_temporal_followup",
+                )
+            self.temporal_followup_opened.emit(commitment_id)
+            self.refresh_history()
+            self.refresh_reminders()
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.FOREGROUND,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit(
+                "open_temporal_followup", category
+            ),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed("open_temporal_followup")
+            return False
+        return True
+
+    def _temporal_write(
+        self,
+        operation_name: str,
+        operation: Callable[[LocalDataStores], object],
+    ) -> bool:
+        if not self._writable:
+            self.operation_failed.emit(operation_name, "DatabaseReadOnlyError")
+            return False
+
+        def completed(value: object) -> None:
+            if isinstance(value, TemporalCommitment):
+                self.temporal_commitment_changed.emit(value)
+            self.refresh_reminders()
+            if self._current_conversation_id is not None:
+                self._load_conversation(
+                    self._current_conversation_id,
+                    source_message_id=None,
+                )
+
+        request_id = self.runtime.submit(
+            operation,
+            priority=DataPriority.INTERACTIVE,
+            on_success=completed,
+            on_failure=lambda category: self.operation_failed.emit(operation_name, category),
+        )
+        if request_id is None:
+            self._on_persistence_submission_failed(operation_name)
+            return False
+        return True
+
+    def _on_reminders_loaded(self, value: object) -> None:
+        if not isinstance(value, ReminderListSnapshot):
+            self.operation_failed.emit("reminders", "InvalidReminderSnapshot")
+            return
+        self.temporal_outstanding_count_changed.emit(value.outstanding_count)
+        self.reminders_loaded.emit(value)
 
     # Memory administration --------------------------------------------
     def refresh_memories(
@@ -2293,6 +2604,8 @@ def _chat_message(message: StoredMessage, *, error: str | None = None) -> ChatMe
         input_modality=InputModality(message.input_modality.value),
         companion_cue_id=message.companion_cue_id,
         companion_source_label=message.companion_source_label,
+        temporal_commitment_id=message.temporal_commitment_id,
+        temporal_commitment=message.temporal_commitment,
     )
 
 

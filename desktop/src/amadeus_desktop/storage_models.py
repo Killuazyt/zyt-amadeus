@@ -117,6 +117,32 @@ class CompanionCueReason(StrEnum):
     MEMORY_AUTHORIZED = "memory_authorized"
 
 
+class TemporalCommitmentKind(StrEnum):
+    REMINDER = "reminder"
+    SCHEDULED_FOLLOWUP = "scheduled_followup"
+
+
+class TemporalCommitmentStatus(StrEnum):
+    DRAFT = "draft"
+    SCHEDULED = "scheduled"
+    DUE = "due"
+    SURFACED = "surfaced"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class TemporalVersionOrigin(StrEnum):
+    CHAT = "chat"
+    MANUAL = "manual"
+    EDIT = "edit"
+    SNOOZE = "snooze"
+
+
+class TemporalSourceKind(StrEnum):
+    CHAT = "chat"
+    MANUAL = "manual"
+
+
 class MemoryStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
@@ -219,6 +245,8 @@ class StoredMessage:
     attachments: tuple[StoredAttachment, ...] = ()
     companion_cue_id: str | None = None
     companion_source_label: str | None = None
+    temporal_commitment_id: str | None = None
+    temporal_commitment: TemporalCommitment | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +313,67 @@ class ProactivePresentation:
     expanded_text: str
     cue_id: str | None = None
     source_label: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalCommitmentVersion:
+    version_id: str
+    commitment_id: str
+    version_number: int
+    kind: TemporalCommitmentKind
+    content: str
+    due_at_utc: datetime | None
+    original_local_time: str | None
+    timezone_name: str | None
+    utc_offset_minutes: int | None
+    show_content: bool
+    origin: TemporalVersionOrigin
+    supersedes_version_id: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalCommitment:
+    commitment_id: str
+    profile_id: str
+    source_kind: TemporalSourceKind
+    source_message_id: str | None
+    source_conversation_id: str | None
+    live_source_message_id: str | None
+    live_source_conversation_id: str | None
+    status: TemporalCommitmentStatus
+    current_version: TemporalCommitmentVersion
+    created_at: datetime
+    updated_at: datetime
+    confirmed_at: datetime | None
+    due_detected_at: datetime | None
+    surfaced_at: datetime | None
+    completed_at: datetime | None
+    cancelled_at: datetime | None
+
+    @property
+    def source_deleted(self) -> bool:
+        return self.source_kind is TemporalSourceKind.CHAT and self.live_source_message_id is None
+
+    @property
+    def outstanding(self) -> bool:
+        return self.status in {
+            TemporalCommitmentStatus.DUE,
+            TemporalCommitmentStatus.SURFACED,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalCommitmentAuditEvent:
+    event_id: str
+    profile_id: str
+    commitment_id: str
+    event_type: str
+    reason_code: str
+    previous_status: TemporalCommitmentStatus | None
+    resulting_status: TemporalCommitmentStatus | None
+    version_id: str | None
+    occurred_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

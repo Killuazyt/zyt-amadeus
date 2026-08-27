@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import (
     QEvent,
+    QDate,
+    QDateTime,
     QRect,
     QSignalBlocker,
     QSize,
+    QTime,
     Qt,
     QTimer,
     Signal,
@@ -36,6 +40,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
+    QDateTimeEdit,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -54,6 +60,12 @@ from PySide6.QtWidgets import (
 from amadeus_desktop.chat_geometry import compact_panel_size
 from amadeus_desktop.chat_models import AttachmentKind, AttachmentSnapshot, AttachmentSource
 from amadeus_desktop.focus_mode import FOCUS_STATUS_TOOLTIP
+from amadeus_desktop.storage_models import (
+    TemporalCommitment,
+    TemporalCommitmentKind,
+    TemporalCommitmentStatus,
+)
+from amadeus_desktop.temporal_commitments import TemporalDraftSpec
 
 _ACTIVE_STATES = {"sending", "waiting_first_chunk", "streaming"}
 _STATE_PRESENTATION = {
@@ -77,6 +89,120 @@ _STATUS_PRESENTATION = {
     "failed": "回复失败",
     "error": "回复失败",
 }
+
+
+class ReminderConfirmationCard(QFrame):
+    """Persisted, editable confirmation boundary for one local time commitment."""
+
+    save_requested = Signal(str, object)
+    cancel_requested = Signal(str)
+    open_requested = Signal(str)
+
+    def __init__(self, commitment: TemporalCommitment) -> None:
+        super().__init__()
+        self.commitment_id = commitment.commitment_id
+        version = commitment.current_version
+        terminal = commitment.status in {
+            TemporalCommitmentStatus.COMPLETED,
+            TemporalCommitmentStatus.CANCELLED,
+        }
+        self.setObjectName("reminderConfirmationCard")
+
+        self.kind = QComboBox()
+        self.kind.addItem("精确提醒", TemporalCommitmentKind.REMINDER.value)
+        self.kind.addItem("定时跟进", TemporalCommitmentKind.SCHEDULED_FOLLOWUP.value)
+        self.kind.setCurrentIndex(max(0, self.kind.findData(version.kind.value)))
+        self.content = QPlainTextEdit(version.content)
+        self.content.setObjectName("reminderCardContent")
+        self.content.setMaximumHeight(74)
+        self.content.setPlaceholderText("提醒内容，最多 500 字")
+        self.due = QDateTimeEdit()
+        self.due.setCalendarPopup(True)
+        self.due.setDisplayFormat("yyyy-MM-dd HH:mm")
+        if version.due_at_utc is None:
+            self.due.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+        else:
+            local = version.due_at_utc.astimezone()
+            self.due.setDateTime(
+                QDateTime(
+                    QDate(local.year, local.month, local.day),
+                    QTime(local.hour, local.minute),
+                )
+            )
+        self.show_content = QCheckBox("允许仅此单项的系统通知显示正文")
+        self.show_content.setChecked(version.show_content)
+        self.timezone = QLabel(_temporal_timezone_text(commitment))
+        self.timezone.setObjectName("reminderCardTimezone")
+        self.timezone.setWordWrap(True)
+        self.state = QLabel(f"状态：{_temporal_status_text(commitment.status)}")
+        self.state.setObjectName("reminderCardState")
+
+        self.save_button = QPushButton(
+            "确认并安排"
+            if commitment.status is TemporalCommitmentStatus.DRAFT
+            else "保存并重新安排"
+        )
+        self.cancel_button = QPushButton("取消")
+        self.open_button = QPushButton("打开提醒页")
+        self.save_button.clicked.connect(self._save)
+        self.cancel_button.clicked.connect(
+            lambda: self.cancel_requested.emit(self.commitment_id)
+        )
+        self.open_button.clicked.connect(lambda: self.open_requested.emit(self.commitment_id))
+
+        editable = not terminal
+        for control in (self.kind, self.content, self.due, self.show_content):
+            control.setEnabled(editable)
+        self.save_button.setEnabled(editable)
+        self.cancel_button.setEnabled(editable)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.kind)
+        top.addWidget(self.due, 1)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.addWidget(self.save_button)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.open_button)
+        actions.addStretch(1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+        layout.addLayout(top)
+        layout.addWidget(self.content)
+        layout.addWidget(self.show_content)
+        layout.addWidget(self.timezone)
+        layout.addWidget(self.state)
+        layout.addLayout(actions)
+
+    def _save(self) -> None:
+        content = self.content.toPlainText().strip()
+        if not content or len(content) > 500:
+            self.state.setText("状态：内容须为 1–500 字。")
+            return
+        qvalue = self.due.dateTime()
+        local_due = datetime(
+            qvalue.date().year(),
+            qvalue.date().month(),
+            qvalue.date().day(),
+            qvalue.time().hour(),
+            qvalue.time().minute(),
+        ).astimezone()
+        if local_due.astimezone(UTC) <= datetime.now(UTC):
+            self.state.setText("状态：请选择未来时间。")
+            return
+        offset = local_due.utcoffset()
+        spec = TemporalDraftSpec(
+            TemporalCommitmentKind(str(self.kind.currentData())),
+            content,
+            local_due.astimezone(UTC),
+            local_due.isoformat(timespec="minutes"),
+            local_due.tzname() or "local",
+            None if offset is None else round(offset.total_seconds() / 60),
+            self.show_content.isChecked(),
+        )
+        self.save_requested.emit(self.commitment_id, spec)
 
 
 class ChatInput(QPlainTextEdit):
@@ -115,6 +241,9 @@ class MessageBubble(QFrame):
 
     retry_clicked = Signal(str)
     companion_cue_clicked = Signal(str)
+    temporal_save_requested = Signal(str, object)
+    temporal_cancel_requested = Signal(str)
+    temporal_open_requested = Signal(str)
 
     def __init__(
         self,
@@ -130,6 +259,7 @@ class MessageBubble(QFrame):
         input_modality: object = "text",
         companion_cue_id: str | None = None,
         companion_source_label: str | None = None,
+        temporal_commitment: TemporalCommitment | None = None,
     ) -> None:
         super().__init__()
         self.message_id = message_id
@@ -140,6 +270,7 @@ class MessageBubble(QFrame):
         self._attachments = tuple(attachments)
         self._attachment_root = attachment_root
         self.companion_cue_id = companion_cue_id
+        self.temporal_commitment = temporal_commitment
 
         self.setObjectName("userBubble" if role == "user" else "assistantBubble")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
@@ -200,6 +331,13 @@ class MessageBubble(QFrame):
         layout.addWidget(role_label)
         layout.addWidget(self.attachment_container)
         layout.addWidget(self.text_view)
+        self.temporal_card: ReminderConfirmationCard | None = None
+        if temporal_commitment is not None and role == "assistant":
+            self.temporal_card = ReminderConfirmationCard(temporal_commitment)
+            self.temporal_card.save_requested.connect(self.temporal_save_requested.emit)
+            self.temporal_card.cancel_requested.connect(self.temporal_cancel_requested.emit)
+            self.temporal_card.open_requested.connect(self.temporal_open_requested.emit)
+            layout.addWidget(self.temporal_card)
         layout.addLayout(footer)
 
         self.set_attachments(self._attachments)
@@ -342,6 +480,9 @@ class ChatPanel(QWidget):
     history_requested = Signal()
     load_older_requested = Signal()
     companion_cue_requested = Signal(str)
+    temporal_save_requested = Signal(str, object)
+    temporal_cancel_requested = Signal(str)
+    temporal_open_requested = Signal(str)
     visibility_changed = Signal(bool)
 
     def __init__(self, *, always_on_top: bool = True) -> None:
@@ -805,7 +946,10 @@ class ChatPanel(QWidget):
         if mode not in {"mock", "provider", "unconfigured"}:
             raise ValueError(f"Unsupported chat provider mode: {mode}")
         self._provider_mode = mode
-        self._chat_enabled = mode != "unconfigured"
+        # Text input remains available for deterministic local reminder commands
+        # even when no model profile exists.  The controller still rejects every
+        # non-reminder request at the provider boundary.
+        self._chat_enabled = True
         if mode == "mock":
             banner = "本地模拟模式 · 不会连接网络或使用 API 密钥"
             empty = "还没有消息。\n输入文字，验证本地模拟流式对话。"
@@ -815,9 +959,9 @@ class ChatPanel(QWidget):
             empty = "还没有消息。\n输入文字开始对话。"
             placeholder = "输入消息；Enter 发送，Shift+Enter 换行"
         else:
-            banner = "尚未配置对话模型 · 请先打开模型设置并通过连接测试"
-            empty = "尚未配置可用的对话模型。\n点击右上角“模型设置”完成配置。"
-            placeholder = "请先配置对话模型"
+            banner = "尚未配置对话模型 · 本地提醒仍可使用，普通聊天需先配置模型"
+            empty = "尚未配置可用的对话模型。\n你仍可输入“明天下午三点提醒我…”。"
+            placeholder = "可输入本地提醒；普通聊天需先配置模型"
         self.provider_banner.setText(banner)
         self.provider_banner.setProperty("mode", mode)
         self.provider_banner.style().unpolish(self.provider_banner)
@@ -1013,6 +1157,7 @@ class ChatPanel(QWidget):
         input_modality: object = "text",
         companion_cue_id: str | None = None,
         companion_source_label: str | None = None,
+        temporal_commitment: TemporalCommitment | None = None,
     ) -> MessageBubble:
         if message_id in self._messages:
             raise ValueError(f"A chat message with id {message_id!r} already exists.")
@@ -1028,6 +1173,7 @@ class ChatPanel(QWidget):
             input_modality=input_modality,
             companion_cue_id=companion_cue_id,
             companion_source_label=companion_source_label,
+            temporal_commitment=temporal_commitment,
         )
         self._message_order.append(message_id)
         self.message_layout.addWidget(bubble, 0, _bubble_alignment(bubble.role))
@@ -1081,6 +1227,7 @@ class ChatPanel(QWidget):
             input_modality,
             companion_cue_id,
             companion_source_label,
+            temporal_commitment,
         ) in enumerate(specs):
             bubble = self._create_bubble(
                 message_id,
@@ -1093,6 +1240,7 @@ class ChatPanel(QWidget):
                 input_modality=input_modality,
                 companion_cue_id=companion_cue_id,
                 companion_source_label=companion_source_label,
+                temporal_commitment=temporal_commitment,
             )
             self._message_order.insert(index, message_id)
             self.message_layout.insertWidget(index + 1, bubble, 0, _bubble_alignment(role))
@@ -1162,6 +1310,9 @@ class ChatPanel(QWidget):
                         "companion_cue_id": _member(message, "companion_cue_id", default=None),
                         "companion_source_label": _member(
                             message, "companion_source_label", default=None
+                        ),
+                        "temporal_commitment": _member(
+                            message, "temporal_commitment", default=None
                         ),
                     }
                 )
@@ -1383,6 +1534,7 @@ class ChatPanel(QWidget):
         input_modality: object = "text",
         companion_cue_id: str | None = None,
         companion_source_label: str | None = None,
+        temporal_commitment: TemporalCommitment | None = None,
     ) -> MessageBubble:
         bubble = MessageBubble(
             message_id,
@@ -1396,9 +1548,13 @@ class ChatPanel(QWidget):
             input_modality=input_modality,
             companion_cue_id=companion_cue_id,
             companion_source_label=companion_source_label,
+            temporal_commitment=temporal_commitment,
         )
         bubble.retry_clicked.connect(self.retry_requested.emit)
         bubble.companion_cue_clicked.connect(self.companion_cue_requested.emit)
+        bubble.temporal_save_requested.connect(self.temporal_save_requested.emit)
+        bubble.temporal_cancel_requested.connect(self.temporal_cancel_requested.emit)
+        bubble.temporal_open_requested.connect(self.temporal_open_requested.emit)
         bubble.set_bubble_width(self._bubble_width())
         bubble.set_retry_enabled(not self._turn_locked)
         self._messages[message_id] = bubble
@@ -1423,6 +1579,7 @@ class ChatPanel(QWidget):
             "companion_source_label",
             default=None,
         )
+        temporal_commitment = _member(message, "temporal_commitment", default=None)
         if status is None:
             status = _member(message, "status", default=None)
         if message_id in self._messages:
@@ -1447,6 +1604,11 @@ class ChatPanel(QWidget):
                 companion_cue_id=(None if companion_cue_id is None else str(companion_cue_id)),
                 companion_source_label=(
                     None if companion_source_label is None else str(companion_source_label)
+                ),
+                temporal_commitment=(
+                    temporal_commitment
+                    if isinstance(temporal_commitment, TemporalCommitment)
+                    else None
                 ),
             )
 
@@ -1521,6 +1683,7 @@ def _message_spec(
     object,
     str | None,
     str | None,
+    TemporalCommitment | None,
 ]:
     message_id = str(_member(message, "message_id", "id"))
     role = _normalise_role(_member(message, "role"))
@@ -1532,6 +1695,7 @@ def _message_spec(
     input_modality = _member(message, "input_modality", default="text")
     companion_cue_id = _member(message, "companion_cue_id", default=None)
     companion_source_label = _member(message, "companion_source_label", default=None)
+    temporal_commitment = _member(message, "temporal_commitment", default=None)
     return (
         message_id,
         role,
@@ -1543,6 +1707,9 @@ def _message_spec(
         input_modality,
         None if companion_cue_id is None else str(companion_cue_id),
         None if companion_source_label is None else str(companion_source_label),
+        temporal_commitment
+        if isinstance(temporal_commitment, TemporalCommitment)
+        else None,
     )
 
 
@@ -1602,6 +1769,37 @@ def _attachment_source_text(source: AttachmentSource) -> str:
         AttachmentSource.WINDOW: "窗口",
         AttachmentSource.CAMERA: "相机",
     }[AttachmentSource(source)]
+
+
+def _temporal_status_text(status: TemporalCommitmentStatus) -> str:
+    return {
+        TemporalCommitmentStatus.DRAFT: "待确认（不会触发）",
+        TemporalCommitmentStatus.SCHEDULED: "已安排",
+        TemporalCommitmentStatus.DUE: "已到期",
+        TemporalCommitmentStatus.SURFACED: "待处理",
+        TemporalCommitmentStatus.COMPLETED: "已完成",
+        TemporalCommitmentStatus.CANCELLED: "已取消",
+    }[status]
+
+
+def _temporal_timezone_text(commitment: TemporalCommitment) -> str:
+    version = commitment.current_version
+    if version.original_local_time is None:
+        return "时间尚不明确，请编辑后确认。"
+    offset = version.utc_offset_minutes
+    if offset is None:
+        offset_text = "UTC?"
+    else:
+        sign = "+" if offset >= 0 else "-"
+        absolute = abs(offset)
+        offset_text = f"UTC{sign}{absolute // 60:02d}:{absolute % 60:02d}"
+    current = ""
+    if version.due_at_utc is not None:
+        current = f"；当前时区换算：{version.due_at_utc.astimezone():%Y-%m-%d %H:%M}"
+    return (
+        f"原确认：{version.original_local_time} · "
+        f"{version.timezone_name or 'local'} ({offset_text}){current}"
+    )
 
 
 _PANEL_STYLESHEET = """
@@ -1691,6 +1889,22 @@ QFrame#assistantBubble {
     background: #1e293b;
     border: 1px solid #334155;
     border-radius: 10px;
+}
+QFrame#reminderConfirmationCard {
+    background: #0f172a;
+    border: 1px solid #0e7490;
+    border-radius: 8px;
+}
+QPlainTextEdit#reminderCardContent {
+    background: #111827;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    color: #f8fafc;
+    padding: 5px;
+}
+QLabel#reminderCardTimezone, QLabel#reminderCardState {
+    color: #cbd5e1;
+    font-size: 11px;
 }
 QLabel#messageRole { color: #a5f3fc; font-size: 11px; font-weight: 600; }
 QTextEdit#messageText { background: transparent; color: #f1f5f9; padding: 0; }
