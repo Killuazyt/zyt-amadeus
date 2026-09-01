@@ -41,8 +41,9 @@ from amadeus_desktop.settings import (
     validate_settings_document,
 )
 
-CHAT_EXPORT_FORMAT = "amadeus-chat-export/v3"
+CHAT_EXPORT_FORMAT = "amadeus-chat-export/v4"
 MEMORY_EXPORT_FORMAT = "amadeus-memory-export/v3"
+REMINDER_EXPORT_FORMAT = "amadeus-reminder-export/v1"
 BACKUP_FORMAT = "amadeus-backup/v2"
 LEGACY_BACKUP_FORMAT = "amadeus-backup/v1"
 
@@ -154,6 +155,19 @@ class ChatExportBundle:
     companion_cue_sources: tuple[Mapping[str, object], ...] = ()
     proactive_events: tuple[Mapping[str, object], ...] = ()
     companion_cue_audit_events: tuple[Mapping[str, object], ...] = ()
+    temporal_commitments: tuple[Mapping[str, object], ...] = ()
+    temporal_versions: tuple[Mapping[str, object], ...] = ()
+    temporal_audit_events: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReminderExportBundle:
+    """One complete reminder snapshot with immutable versions and content-free audit."""
+
+    database_schema: int
+    commitments: tuple[Mapping[str, object], ...]
+    versions: tuple[Mapping[str, object], ...]
+    audit_events: tuple[Mapping[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +266,7 @@ class FactoryResetPlan:
 ConsistentBackupSource = Path | Callable[[Path], str | Path | None]
 ChatBundleLoader = Callable[[], ChatExportBundle]
 MemoryBundleLoader = Callable[[], MemoryExportBundle]
+ReminderBundleLoader = Callable[[], ReminderExportBundle]
 ReplaceOperation = Callable[[Path, Path], None]
 RestoreCheckpoint = Callable[[str], None]
 
@@ -286,6 +301,11 @@ class SQLiteExportRepository:
             if "companion_cue_id" in message_columns
             else "NULL AS companion_cue_id"
         )
+        temporal_expression = (
+            "temporal_commitment_id"
+            if "temporal_commitment_id" in message_columns
+            else "NULL AS temporal_commitment_id"
+        )
         conversations = self._rows(
             """
             SELECT id, profile_id, title, status, created_at, updated_at, last_activity_at
@@ -296,7 +316,7 @@ class SQLiteExportRepository:
         messages = self._rows(
             f"""
             SELECT sequence, id, conversation_id, turn_id, role, {origin_expression},
-                   {modality_expression}, {companion_expression},
+                   {modality_expression}, {companion_expression}, {temporal_expression},
                    content, status, attempt, terminal_reason, provider_name, model_name,
                    failure_code, participates_in_memory, created_at, updated_at, completed_at
             FROM messages
@@ -323,6 +343,9 @@ class SQLiteExportRepository:
         companion_cue_sources: tuple[Mapping[str, object], ...] = ()
         proactive_events: tuple[Mapping[str, object], ...] = ()
         companion_cue_audit_events: tuple[Mapping[str, object], ...] = ()
+        temporal_commitments: tuple[Mapping[str, object], ...] = ()
+        temporal_versions: tuple[Mapping[str, object], ...] = ()
+        temporal_audit_events: tuple[Mapping[str, object], ...] = ()
         if {"attachments", "message_attachments"}.issubset(table_names):
             attachments = self._rows(
                 """
@@ -391,6 +414,46 @@ class SQLiteExportRepository:
                 ORDER BY occurred_at, id
                 """
             )
+        if schema >= 8 and {
+            "temporal_commitments",
+            "temporal_commitment_versions",
+            "temporal_commitment_audit_events",
+        }.issubset(table_names):
+            temporal_commitments = self._rows(
+                """
+                SELECT id, profile_id, source_kind, source_message_id,
+                       source_conversation_id, live_source_message_id,
+                       live_source_conversation_id, status, current_version_id,
+                       created_at, updated_at, confirmed_at, due_detected_at,
+                       surfaced_at, completed_at, cancelled_at
+                FROM temporal_commitments
+                WHERE source_kind = 'chat'
+                ORDER BY created_at, id
+                """
+            )
+            temporal_versions = self._rows(
+                """
+                SELECT v.id, v.commitment_id, v.version_number, v.kind, v.content,
+                       v.due_at_utc, v.original_local_time, v.timezone_name,
+                       v.utc_offset_minutes, v.show_content, v.origin,
+                       v.supersedes_version_id, v.created_at
+                FROM temporal_commitment_versions v
+                JOIN temporal_commitments c ON c.id = v.commitment_id
+                WHERE c.source_kind = 'chat'
+                ORDER BY v.commitment_id, v.version_number, v.id
+                """
+            )
+            temporal_audit_events = self._rows(
+                """
+                SELECT a.id, a.profile_id, a.commitment_id, a.event_type,
+                       a.reason_code, a.previous_status, a.resulting_status,
+                       a.version_id, a.occurred_at
+                FROM temporal_commitment_audit_events a
+                JOIN temporal_commitments c ON c.id = a.commitment_id
+                WHERE c.source_kind = 'chat'
+                ORDER BY a.occurred_at, a.id
+                """
+            )
         return ChatExportBundle(
             schema,
             conversations,
@@ -402,7 +465,44 @@ class SQLiteExportRepository:
             companion_cue_sources,
             proactive_events,
             companion_cue_audit_events,
+            temporal_commitments,
+            temporal_versions,
+            temporal_audit_events,
         )
+
+    def load_reminder_bundle(self) -> ReminderExportBundle:
+        schema = self._schema_version()
+        if schema < 8:
+            return ReminderExportBundle(schema, (), (), ())
+        commitments = self._rows(
+            """
+            SELECT id, profile_id, source_kind, source_message_id,
+                   source_conversation_id, live_source_message_id,
+                   live_source_conversation_id, status, current_version_id,
+                   created_at, updated_at, confirmed_at, due_detected_at,
+                   surfaced_at, completed_at, cancelled_at
+            FROM temporal_commitments
+            ORDER BY created_at, id
+            """
+        )
+        versions = self._rows(
+            """
+            SELECT id, commitment_id, version_number, kind, content, due_at_utc,
+                   original_local_time, timezone_name, utc_offset_minutes,
+                   show_content, origin, supersedes_version_id, created_at
+            FROM temporal_commitment_versions
+            ORDER BY commitment_id, version_number, id
+            """
+        )
+        audit_events = self._rows(
+            """
+            SELECT id, profile_id, commitment_id, event_type, reason_code,
+                   previous_status, resulting_status, version_id, occurred_at
+            FROM temporal_commitment_audit_events
+            ORDER BY occurred_at, id
+            """
+        )
+        return ReminderExportBundle(schema, commitments, versions, audit_events)
 
     def load_memory_bundle(self) -> MemoryExportBundle:
         schema = self._schema_version()
@@ -655,6 +755,31 @@ def export_chat_json(
         "companion_cue_sources": list(bundle.companion_cue_sources),
         "proactive_events": list(bundle.proactive_events),
         "companion_cue_audit_events": list(bundle.companion_cue_audit_events),
+        "temporal_commitments": list(bundle.temporal_commitments),
+        "temporal_versions": list(bundle.temporal_versions),
+        "temporal_audit_events": list(bundle.temporal_audit_events),
+    }
+    return _atomic_write_json(Path(destination), payload, error_type=ExportError)
+
+
+def export_reminders_json(
+    destination: str | Path,
+    load_bundle: ReminderBundleLoader,
+    *,
+    exported_at: datetime | None = None,
+) -> Path:
+    """Atomically export reminder records, all text versions, and content-free audit."""
+
+    bundle = load_bundle()
+    if not isinstance(bundle, ReminderExportBundle):
+        raise ExportError("reminder export callback returned an invalid bundle")
+    payload = {
+        "format": REMINDER_EXPORT_FORMAT,
+        "exported_at": _timestamp(exported_at),
+        "database_schema": bundle.database_schema,
+        "commitments": list(bundle.commitments),
+        "versions": list(bundle.versions),
+        "audit_events": list(bundle.audit_events),
     }
     return _atomic_write_json(Path(destination), payload, error_type=ExportError)
 

@@ -26,7 +26,11 @@ from amadeus_desktop.provider_config import ProviderConfig, ProviderPreset
 from amadeus_desktop.provider_profiles import migrate_legacy_provider_settings
 from amadeus_desktop.settings import DEFAULT_SETTINGS, SettingsError, SettingsRepository
 from amadeus_desktop.ui.control_window import ControlWindow
-from amadeus_desktop.ui.tray import TrayController, create_app_icon
+from amadeus_desktop.ui.tray import (
+    NotificationSubmissionResult,
+    TrayController,
+    create_app_icon,
+)
 
 
 class FakeInstanceGuard(QObject):
@@ -44,12 +48,14 @@ class FakeSystemTrayIcon(QObject):
     """Headless tray double; Qt's offscreen plugin cannot own a native tray safely."""
 
     activated = Signal(object)
+    messageClicked = Signal()
 
     def __init__(self, icon: QIcon, parent: QObject) -> None:
         super().__init__(parent)
         del icon
         self._visible = False
         self._menu: QMenu | None = None
+        self.messages: list[tuple[str, str, object, int]] = []
 
     def setToolTip(self, _tooltip: str) -> None:
         pass
@@ -65,6 +71,9 @@ class FakeSystemTrayIcon(QObject):
 
     def isVisible(self) -> bool:
         return self._visible
+
+    def showMessage(self, title: str, body: str, icon: object, timeout: int) -> None:
+        self.messages.append((title, body, icon, timeout))
 
 
 class RecordHandler(logging.Handler):
@@ -194,13 +203,14 @@ def test_tray_double_click_requests_open_chat_and_legacy_show(qtbot) -> None:
         tray.close()
 
 
-def test_tray_has_exact_p6_action_order_and_state_sync_is_signal_safe(qtbot) -> None:
+def test_tray_has_exact_p7i_action_order_and_state_sync_is_signal_safe(qtbot) -> None:
     tray = TrayController(system_tray_factory=FakeSystemTrayIcon)  # type: ignore[arg-type]
     try:
         assert [action.text() for action in tray.actions] == [
             "隐藏宠物",
             "打开对话",
             "记忆管理…",
+            "提醒…",
             "设置…",
             "始终置顶",
             "今天暂停主动互动",
@@ -209,6 +219,7 @@ def test_tray_has_exact_p6_action_order_and_state_sync_is_signal_safe(qtbot) -> 
         ]
         assert all(not action.isSeparator() for action in tray.actions)
         assert [action.isCheckable() for action in tray.actions] == [
+            False,
             False,
             False,
             False,
@@ -247,6 +258,28 @@ def test_tray_has_exact_p6_action_order_and_state_sync_is_signal_safe(qtbot) -> 
         tray.close()
 
 
+def test_tray_reminder_submission_result_count_and_click_payload(qtbot) -> None:
+    tray = TrayController(system_tray_factory=FakeSystemTrayIcon)  # type: ignore[arg-type]
+    payloads: list[object] = []
+    tray.notification_clicked.connect(payloads.append)
+    try:
+        assert (
+            tray.notify_reminder("Amadeus 提醒", "默认隐私正文", {"kind": "single"})
+            is NotificationSubmissionResult.UNAVAILABLE
+        )
+        tray.show()
+        assert (
+            tray.notify_reminder("Amadeus 提醒", "默认隐私正文", {"kind": "single"})
+            is NotificationSubmissionResult.SUBMITTED
+        )
+        tray.set_reminder_outstanding_count(2)
+        assert tray.reminders_action.text() == "提醒（2）…"
+        tray._tray.messageClicked.emit()
+        assert payloads == [{"kind": "single"}]
+    finally:
+        tray.close()
+
+
 def test_model_settings_entry_points_emit(qtbot) -> None:
     window = ControlWindow(tray_available=False)
     qtbot.addWidget(window)
@@ -273,7 +306,7 @@ def test_production_without_credential_is_unconfigured_and_never_invokes_mock(
     qtbot.addWidget(controller.model_settings_window)
     try:
         assert controller.chat_panel.provider_mode == "unconfigured"
-        assert not controller.chat_panel.input.isEnabled()
+        assert controller.chat_panel.input.isEnabled()
 
         controller._send_chat_message("生产模式不得模拟回答")
 
@@ -284,6 +317,30 @@ def test_production_without_credential_is_unconfigured_and_never_invokes_mock(
         controller.show_model_settings()
         controller.show_model_settings()
         assert controller.model_settings_window is first_window
+    finally:
+        controller.request_exit()
+
+
+def test_unconfigured_controller_creates_local_reminder_without_provider(
+    qapp,
+    qtbot,
+    tmp_path,
+) -> None:
+    controller = make_controller(qapp, tmp_path, tray_available=False)
+    qtbot.addWidget(controller.window)
+    qtbot.addWidget(controller.pet_window)
+    qtbot.addWidget(controller.chat_panel)
+    created: list[object] = []
+    controller.data_service.temporal_chat_draft_created.connect(created.append)
+    try:
+        qtbot.waitUntil(lambda: controller._data_initialized, timeout=5_000)
+
+        assert controller._send_chat_message("十分钟后提醒我交报告")
+        qtbot.waitUntil(lambda: len(created) == 1, timeout=5_000)
+
+        assert not controller._chat_available
+        assert created[0].status.value == "draft"
+        assert "确认前不会触发" in controller.chat_panel.status_label.text()
     finally:
         controller.request_exit()
 

@@ -157,3 +157,11 @@ def test_persona_is_a_restrained_desktop_partner_without_fabricated_relationship
     assert "用户已确认" in prompt
     for marker in ("恋爱", "依赖", "占有", "排他"):
         assert marker in prompt
+
+
+def test_capability_boundary_never_claims_unconfirmed_or_background_reminders() -> None:
+    boundary = build_capability_safety_boundary()
+
+    assert "不得自行声称已经创建、确认、取消或修改提醒" in boundary
+    assert "应用退出或设备休眠期间" in boundary
+    assert "下次启动后补发" in boundary

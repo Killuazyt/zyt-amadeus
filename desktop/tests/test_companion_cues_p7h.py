@@ -371,7 +371,7 @@ def test_due_cues_expire_but_keep_until_resolved_survives(cue_fixture) -> None:
     assert cues.get(expiring.cue_id).status is CompanionCueStatus.EXPIRED
 
 
-def test_v6_database_migrates_to_v7_with_empty_cue_tables_and_preserved_rows(tmp_path) -> None:
+def test_v6_database_migrates_to_v8_with_empty_cue_and_temporal_tables(tmp_path) -> None:
     path = tmp_path / "legacy-v6.sqlite3"
     legacy = sqlite3.connect(path)
     legacy.execute("PRAGMA foreign_keys = ON")
@@ -395,7 +395,7 @@ def test_v6_database_migrates_to_v7_with_empty_cue_tables_and_preserved_rows(tmp
 
     database = SQLiteDatabase(path, backup_dir=tmp_path / "backups").open()
     try:
-        assert database.schema_version == SCHEMA_VERSION == 7
+        assert database.schema_version == SCHEMA_VERSION == 8
         assert (
             database.connection.execute(
                 "SELECT display_name FROM profiles WHERE id = 'legacy'"
@@ -406,6 +406,9 @@ def test_v6_database_migrates_to_v7_with_empty_cue_tables_and_preserved_rows(tmp
             "companion_cues",
             "companion_cue_sources",
             "companion_cue_audit_events",
+            "temporal_commitments",
+            "temporal_commitment_versions",
+            "temporal_commitment_audit_events",
         }.issubset(table_names(database.connection))
         assert database.connection.execute("SELECT COUNT(*) FROM companion_cues").fetchone()[0] == 0
         assert database.last_backup_path is not None
@@ -487,7 +490,7 @@ def test_v3_exports_split_chat_and_memory_cues_without_vectors_or_private_delete
     chat = json.loads(chat_path.read_text(encoding="utf-8"))
     exported_memory = json.loads(memory_path.read_text(encoding="utf-8"))
 
-    assert chat["format"] == CHAT_EXPORT_FORMAT == "amadeus-chat-export/v3"
+    assert chat["format"] == CHAT_EXPORT_FORMAT == "amadeus-chat-export/v4"
     assert exported_memory["format"] == MEMORY_EXPORT_FORMAT == "amadeus-memory-export/v3"
     assert {cue["kind"] for cue in chat["companion_cues"]} == {
         CompanionCueKind.CONVERSATION_FOLLOWUP.value

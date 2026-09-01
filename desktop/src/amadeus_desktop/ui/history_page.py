@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QSplitter,
     QTreeWidget,
@@ -292,30 +291,11 @@ class HistoryPage(QWidget):
         conversation_id = self.current_conversation_id
         if conversation_id is None:
             return
-        title = self._conversation_titles.get(conversation_id, "当前会话")
-        answer = QMessageBox.question(
-            self,
-            "永久删除会话？",
-            f"将永久删除“{title}”的全部聊天正文。\n\n"
-            "长期记忆不会随之删除，但相关来源将显示为已删除。此操作无法撤销。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.delete_conversation_requested.emit(conversation_id)
+        self.delete_conversation_requested.emit(conversation_id)
 
     @Slot()
     def _request_clear(self) -> None:
-        answer = QMessageBox.question(
-            self,
-            "清空全部聊天？",
-            "将永久删除所有会话及聊天正文。\n\n"
-            "长期记忆不会随之删除，但相关来源将显示为已删除。此操作无法撤销。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.clear_history_requested.emit()
+        self.clear_history_requested.emit()
 
     @Slot()
     def _request_older_messages(self) -> None:

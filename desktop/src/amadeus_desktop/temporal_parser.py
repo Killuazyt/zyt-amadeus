@@ -73,7 +73,7 @@ def parse_temporal_intent(text: str, *, now: datetime | None = None) -> Temporal
     raw = " ".join(str(text).strip().split())
     if not raw:
         return TemporalParseResult(False)
-    current = (now or datetime.now().astimezone()).astimezone()
+    current = now if now is not None else datetime.now().astimezone()
     if current.tzinfo is None:
         raise ValueError("now must be timezone-aware")
 
@@ -137,6 +137,7 @@ def _parse_due(
     now: datetime,
 ) -> tuple[datetime | None, tuple[tuple[int, int], ...], str | None]:
     relative = re.search(
+        r"(?:(?:在|in)\s*)?"
         r"(?P<n>\d{1,4}|[零〇一二两三四五六七八九十百]+)\s*"
         r"(?P<u>分钟|分|小时|天|minutes?|mins?|hours?|hrs?|days?)\s*(?:后|later|from now)?",
         text,
@@ -153,7 +154,8 @@ def _parse_due(
             delta = timedelta(hours=amount)
         else:
             delta = timedelta(days=amount)
-        return now + delta, (relative.span(),), None
+        due = (now.astimezone(UTC) + delta).astimezone(now.tzinfo)
+        return due, (relative.span(),), None
 
     date_value, date_span, date_explicit, date_issue = _date_component(text, now)
     time_value, time_span, time_issue = _time_component(text)
@@ -165,10 +167,27 @@ def _parse_due(
     if date_value is None:
         date_value = now.date()
     try:
-        candidate = datetime.combine(date_value, time_value, tzinfo=now.tzinfo)
+        candidate, localization_issue = _localized_datetime(
+            date_value,
+            time_value,
+            now,
+        )
     except ValueError:
         return None, spans, "invalid_time"
-    if not date_explicit and candidate <= now:
+    if localization_issue is not None:
+        return None, spans, localization_issue
+    if candidate is None:
+        return None, spans, "invalid_time"
+    if candidate <= now and date_explicit and _is_yearless_month_day(text, date_span):
+        for year in range(candidate.year + 1, candidate.year + 6):
+            try:
+                candidate = candidate.replace(year=year)
+            except ValueError:
+                continue
+            break
+        else:
+            return None, spans, "invalid_date"
+    elif not date_explicit and candidate <= now:
         candidate += timedelta(days=1)
     return candidate, spans, None
 
@@ -281,6 +300,43 @@ def _content_without_tokens(text: str, spans: tuple[tuple[int, int], ...]) -> st
             chars[index] = " "
     value = " ".join("".join(chars).split()).strip("，。,.!?！？:：;；- ")
     return value
+
+
+def _is_yearless_month_day(
+    text: str,
+    span: tuple[int, int] | None,
+) -> bool:
+    if span is None:
+        return False
+    token = text[span[0] : span[1]].strip()
+    return "月" in token or re.fullmatch(r"\d{1,2}[-/]\d{1,2}", token) is not None
+
+
+def _localized_datetime(
+    date_value: date,
+    time_value: time,
+    now: datetime,
+) -> tuple[datetime | None, str | None]:
+    """Reject nonexistent or duplicated DST wall times instead of guessing a fold."""
+
+    zone = now.tzinfo
+    if zone is None:
+        return None, "invalid_time"
+    wall_time = datetime.combine(date_value, time_value)
+    candidates = (
+        wall_time.replace(tzinfo=zone, fold=0),
+        wall_time.replace(tzinfo=zone, fold=1),
+    )
+    valid = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == wall_time
+    )
+    if not valid:
+        return None, "invalid_time"
+    if len({candidate.utcoffset() for candidate in valid}) > 1:
+        return None, "ambiguous_time"
+    return valid[0], None
 
 
 def _number(token: str) -> int:

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 
 from amadeus_desktop.local_data_service import LocalDataService
 from amadeus_desktop.presence import PresenceProbe
@@ -50,6 +50,7 @@ class ReminderScheduler(QObject):
 
         self._nearest_timer = QTimer(self)
         self._nearest_timer.setSingleShot(True)
+        self._nearest_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._nearest_timer.timeout.connect(self.wake)
         self._calibration_timer = QTimer(self)
         self._calibration_timer.setInterval(_CALIBRATION_INTERVAL_MS)
@@ -57,6 +58,7 @@ class ReminderScheduler(QObject):
 
         self._data.temporal_due_scanned.connect(self._on_due_scanned)
         self._data.temporal_commitment_changed.connect(self._on_commitment_changed)
+        self._data.operation_failed.connect(self._on_data_operation_failed)
 
     def start(self) -> None:
         if self._running:
@@ -80,7 +82,16 @@ class ReminderScheduler(QObject):
         if not self._scan_pending:
             self.status_changed.emit("storage_unavailable")
 
-    def _on_commitment_changed(self, _commitment: object) -> None:
+    def _on_commitment_changed(self, commitment: object) -> None:
+        if isinstance(commitment, TemporalCommitment):
+            self._delivery_in_flight.discard(commitment.commitment_id)
+        if self._running:
+            self.wake()
+
+    def _on_data_operation_failed(self, operation: str, _category: str) -> None:
+        if operation != "surface_reminders":
+            return
+        self._delivery_in_flight.clear()
         if self._running:
             self.wake()
 
@@ -119,7 +130,11 @@ class ReminderScheduler(QObject):
             self.status_changed.emit("notification_unavailable")
             return
         self._delivery_in_flight.update(ids)
-        self._data.mark_temporal_commitments_surfaced(ids, reason_code="aggregate_notification")
+        if not self._data.mark_temporal_commitments_surfaced(
+            ids,
+            reason_code="aggregate_notification",
+        ):
+            self._delivery_in_flight.difference_update(ids)
 
     def _surface_one(self, commitment: TemporalCommitment) -> None:
         if commitment.current_version.kind is TemporalCommitmentKind.SCHEDULED_FOLLOWUP:
@@ -137,10 +152,11 @@ class ReminderScheduler(QObject):
             self.status_changed.emit("notification_unavailable")
             return
         self._delivery_in_flight.add(commitment.commitment_id)
-        self._data.mark_temporal_commitments_surfaced(
+        if not self._data.mark_temporal_commitments_surfaced(
             (commitment.commitment_id,),
             reason_code="system_notification",
-        )
+        ):
+            self._delivery_in_flight.discard(commitment.commitment_id)
 
     def _surface_followup(self, commitment: TemporalCommitment) -> None:
         if self._is_locked() or not self._followup_safe():
@@ -149,10 +165,11 @@ class ReminderScheduler(QObject):
             self.status_changed.emit("followup_display_unavailable")
             return
         self._delivery_in_flight.add(commitment.commitment_id)
-        self._data.mark_temporal_commitments_surfaced(
+        if not self._data.mark_temporal_commitments_surfaced(
             (commitment.commitment_id,),
             reason_code="followup_bubble",
-        )
+        ):
+            self._delivery_in_flight.discard(commitment.commitment_id)
 
     def _is_locked(self) -> bool:
         try:

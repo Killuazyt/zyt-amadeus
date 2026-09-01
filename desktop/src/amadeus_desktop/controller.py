@@ -13,7 +13,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +66,7 @@ from amadeus_desktop.data_management import (
     discard_staged_restore,
     export_chat_json,
     export_memory_json,
+    export_reminders_json,
     plan_factory_reset,
     stage_backup_for_restore,
 )
@@ -92,6 +93,7 @@ from amadeus_desktop.local_data_service import (
     LocalDataStores,
     MemoryListSnapshot,
     OlderMessagesSnapshot,
+    ReminderListSnapshot,
     create_local_data_stores,
 )
 from amadeus_desktop.memory_job_coordinator import (
@@ -133,6 +135,7 @@ from amadeus_desktop.provider_profiles import (
     transient_credential_fingerprint,
 )
 from amadeus_desktop.provider_router import ProviderRouter
+from amadeus_desktop.reminder_scheduler import ReminderScheduler
 from amadeus_desktop.settings import (
     CURRENT_SCHEMA_VERSION,
     InvalidSettingsError,
@@ -144,7 +147,20 @@ from amadeus_desktop.settings import (
 from amadeus_desktop.single_instance import SingleInstance
 from amadeus_desktop.speech import MiMoSpeechClient, MiMoSpeechConfig, SpeechToken, VoiceState
 from amadeus_desktop.speech_runtime import SpeechNetworkRuntime
-from amadeus_desktop.storage_models import PersonaKnowledgeDraft
+from amadeus_desktop.storage_models import (
+    PersonaKnowledgeDraft,
+    TemporalCommitment,
+    TemporalCommitmentKind,
+)
+from amadeus_desktop.temporal_commitments import (
+    TemporalDraftSpec,
+    frozen_followup_message,
+)
+from amadeus_desktop.temporal_parser import (
+    is_reminder_cancel_command,
+    is_reminder_list_command,
+    parse_temporal_intent,
+)
 from amadeus_desktop.ui.chat_panel import ChatPanel
 from amadeus_desktop.ui.control_window import ControlWindow
 from amadeus_desktop.ui.greeting_bubble import GreetingBubble
@@ -154,7 +170,7 @@ from amadeus_desktop.ui.provider_settings import (
     ProviderSettingsPage,
 )
 from amadeus_desktop.ui.settings_window import SettingsWindow
-from amadeus_desktop.ui.tray import TrayController
+from amadeus_desktop.ui.tray import NotificationSubmissionResult, TrayController
 from amadeus_desktop.ui.visual_settings import VisualSettingsPage
 from amadeus_desktop.ui.voice_settings import VoiceSettingsPage
 from amadeus_desktop.vector_index import VectorIndexCoordinator, VectorIndexRepositories
@@ -224,11 +240,15 @@ class ApplicationController:
         self.settings = settings
         self.build_info = build_info or load_build_info()
         self._clock = clock
+        self._presence_probe = presence_probe or WindowsPresenceProbe()
         self._exiting = False
         self._shutdown_clean: bool | None = None
         self._restore_scheduled = False
         self._chat_reposition_scheduled = False
         self._pending_companion_cue_selection: str | None = None
+        self._pending_temporal_selection: str | None = None
+        self._pending_temporal_followup_id: str | None = None
+        self._pending_temporal_history_action: tuple[str, str | None] | None = None
         self._turn_started_at: dict[str, float] = {}
         self._active_focus_decision = FocusModeDecision()
         if (
@@ -374,6 +394,7 @@ class ApplicationController:
 
         self.chat_panel = ChatPanel(always_on_top=always_on_top)
         self.greeting_bubble = GreetingBubble(always_on_top=always_on_top)
+        self.reminder_bubble = GreetingBubble(always_on_top=always_on_top)
         self.chat_panel.set_storage_availability(False)
         explicit_provider = chat_provider is not None
         if chat_provider is not None:
@@ -694,6 +715,7 @@ class ApplicationController:
         self.persona_page = self.settings_window.persona_page
         self.history_page = self.settings_window.history_page
         self.memory_page = self.settings_window.memory_page
+        self.reminders_page = self.settings_window.reminders_page
         self.proactive_page = self.settings_window.proactive_page
         self.diagnostics_page = self.settings_window.diagnostics_page
         self._sync_settings_pages()
@@ -721,7 +743,7 @@ class ApplicationController:
             data=self.data_service,
             bubble=self.greeting_bubble,
             generation_runner=self.background_generation,
-            presence_probe=presence_probe or WindowsPresenceProbe(),
+            presence_probe=self._presence_probe,
             settings_reader=lambda: self.settings,
             clock=self._clock,
             pet_visible=self.pet_window.isVisible,
@@ -786,6 +808,8 @@ class ApplicationController:
             self.tray.open_chat_requested.connect(self.show_chat)
             self.tray.exit_requested.connect(self.request_exit)
             self.tray.memory_requested.connect(self.show_memory_settings)
+            self.tray.reminders_requested.connect(self.show_reminders_settings)
+            self.tray.notification_clicked.connect(self._on_reminder_notification_clicked)
             self.tray.settings_requested.connect(self.show_settings)
             self.tray.always_on_top_changed.connect(self._set_always_on_top)
             self.tray.pause_proactive_today_changed.connect(self._set_proactive_paused_today)
@@ -803,6 +827,22 @@ class ApplicationController:
         else:
             self.pet_window.show_without_activate()
             self.window.show_and_activate()
+
+        self.reminder_scheduler = ReminderScheduler(
+            self.data_service,
+            presence_probe=self._presence_probe,
+            notify=self._submit_reminder_notification,
+            show_followup=self._show_temporal_followup_bubble,
+            followup_safe=self._temporal_followup_safe,
+            clock=self._clock,
+            parent=application,
+        )
+        self.reminder_scheduler.status_changed.connect(self._on_reminder_scheduler_status)
+        self.reminder_bubble.clicked.connect(self._open_current_temporal_followup)
+        self.reminder_bubble.dismissed.connect(self._clear_temporal_followup_bubble)
+        self.application.applicationStateChanged.connect(
+            lambda _state: self.reminder_scheduler.wake()
+        )
 
         if mock_chat or (explicit_provider and isinstance(selected_provider, ScriptedChatProvider)):
             self.chat_panel.set_provider_mode("mock")
@@ -925,6 +965,21 @@ class ApplicationController:
 
         self.history_page.export_requested.connect(self._request_chat_export)
         self.memory_page.export_requested.connect(self._request_memory_export)
+        self.reminders_page.export_requested.connect(self._request_reminder_export)
+        self.reminders_page.refresh_requested.connect(self.data_service.refresh_reminders)
+        self.reminders_page.create_requested.connect(self._create_manual_temporal_draft)
+        self.reminders_page.save_requested.connect(self._save_temporal_commitment)
+        self.reminders_page.complete_requested.connect(
+            self.data_service.complete_temporal_commitment
+        )
+        self.reminders_page.cancel_requested.connect(
+            self.data_service.cancel_temporal_commitment
+        )
+        self.reminders_page.snooze_requested.connect(
+            self.data_service.snooze_temporal_commitment
+        )
+        self.reminders_page.delete_requested.connect(self._delete_temporal_commitment)
+        self.reminders_page.source_requested.connect(self.data_service.load_source_context)
         self.memory_page.backup_requested.connect(self._request_backup)
         self.memory_page.clear_all_requested.connect(self._request_clear_all_memories)
         self.diagnostics_page.refresh_requested.connect(self._refresh_diagnostics)
@@ -935,6 +990,8 @@ class ApplicationController:
             self.data_service.refresh_history()
         elif page == "memory":
             self.data_service.refresh_memories()
+        elif page == "reminders":
+            self.data_service.refresh_reminders()
         elif page == "pet":
             self.pet_page.set_assets(
                 self.pet_asset_service.list_installed(),
@@ -1039,6 +1096,7 @@ class ApplicationController:
         self.pet_window.set_always_on_top(enabled)
         self.chat_panel.set_always_on_top(enabled)
         self.greeting_bubble.set_always_on_top(enabled)
+        self.reminder_bubble.set_always_on_top(enabled)
         self.general_page.apply_settings(
             always_on_top=enabled,
             launch_at_login=bool(self.settings["general"]["launch_at_login"]),
@@ -1520,11 +1578,40 @@ class ApplicationController:
         if request_id is None:
             self._on_export_failed("memory", "DataThreadStopped")
 
+    def _request_reminder_export(self) -> None:
+        if self._data_change_state != "idle":
+            return
+        destination, _filter = QFileDialog.getSaveFileName(
+            self.settings_window,
+            "导出提醒",
+            "amadeus-reminder-export.json",
+            "JSON (*.json)",
+        )
+        if not destination:
+            return
+        request_id = self.data_runtime.submit(
+            lambda stores: export_reminders_json(
+                destination,
+                SQLiteExportRepository(
+                    stores.database.connection
+                ).load_reminder_bundle,
+            ),
+            priority=DataPriority.INTERACTIVE,
+            on_success=lambda path: self.reminders_page.set_status(
+                f"提醒已导出到 {Path(path).name}。"
+            ),
+            on_failure=lambda category: self._on_export_failed("reminders", category),
+        )
+        if request_id is None:
+            self._on_export_failed("reminders", "DataThreadStopped")
+
     def _on_export_failed(self, page: str, category: str) -> None:
         self.logger.warning("JSON export failed page=%s error_type=%s", page, category)
         self._last_safe_error_category = "storage_error"
         if page == "memory":
             self.memory_page.set_status("记忆导出失败。", error=True)
+        elif page == "reminders":
+            self.reminders_page.set_status("提醒导出失败。", error=True)
         else:
             self.history_page.set_status("聊天导出失败。", error=True)
 
@@ -1785,6 +1872,8 @@ class ApplicationController:
         self.general_page.factory_reset_button.setEnabled(enabled)
         self.memory_page.backup_button.setEnabled(enabled)
         self.memory_page.clear_all_button.setEnabled(enabled and self._data_writable)
+        self.reminders_page.setEnabled(enabled)
+        self.reminders_page.set_writable(enabled and self._data_writable)
 
     def _begin_data_change(self) -> bool:
         if (
@@ -1800,6 +1889,9 @@ class ApplicationController:
         self.chat_panel.set_conversation_switch_pending(True)
         self.chat_panel.set_storage_availability(False, read_only=True)
         self.memory_maintenance_timer.stop()
+        self.reminder_scheduler.stop()
+        self.reminder_bubble.dismiss()
+        self._pending_temporal_followup_id = None
         proactive_clean = self.proactive_interactions.stop(wait_ms=2_000)
         deep_clean = self.deep_memory_jobs.pause(wait_ms=2_000)
         memory_clean = self.memory_jobs.pause(wait_ms=2_000)
@@ -1820,6 +1912,7 @@ class ApplicationController:
             self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
             self.proactive_interactions.start()
+            self.reminder_scheduler.start()
 
     def _request_factory_reset(self) -> None:
         if not self._can_start_data_change():
@@ -2013,6 +2106,158 @@ class ApplicationController:
         self.settings_window.show_and_activate("memory")
         self.data_service.refresh_memories()
 
+    def show_reminders_settings(self, commitment_id: str | None = None) -> None:
+        if self._exiting:
+            return
+        self._pending_temporal_selection = commitment_id
+        if commitment_id is not None:
+            self.reminders_page.show_all()
+        self.settings_window.show_and_activate("reminders")
+        self.data_service.refresh_reminders()
+
+    def _create_manual_temporal_draft(self) -> None:
+        local_due = self._clock().astimezone() + timedelta(hours=1)
+        offset = local_due.utcoffset()
+        self.data_service.create_manual_temporal_draft(
+            TemporalDraftSpec(
+                TemporalCommitmentKind.REMINDER,
+                "新提醒",
+                local_due.astimezone(UTC),
+                local_due.isoformat(timespec="minutes"),
+                local_due.tzname() or "local",
+                None if offset is None else round(offset.total_seconds() / 60),
+                False,
+            )
+        )
+
+    def _save_temporal_commitment(
+        self,
+        commitment_id: str,
+        spec_object: object,
+    ) -> None:
+        if not isinstance(spec_object, TemporalDraftSpec):
+            self.reminders_page.set_status("提醒字段无效，未保存。", error=True)
+            return
+        self._pending_temporal_selection = commitment_id
+        self.data_service.revise_temporal_commitment(
+            commitment_id,
+            spec_object,
+            confirm=True,
+        )
+
+    def _delete_temporal_commitment(self, commitment_id: str) -> None:
+        answer = QMessageBox.question(
+            self.settings_window,
+            "永久删除提醒？",
+            "这会永久清除该任务及所有历史版本中的正文，并执行安全删除处理。"
+            "此操作无法撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.data_service.delete_temporal_commitment(commitment_id)
+
+    def _on_reminders_loaded(self, snapshot_object: object) -> None:
+        if not isinstance(snapshot_object, ReminderListSnapshot):
+            self.reminders_page.set_status("提醒数据格式无效。", error=True)
+            return
+        self.reminders_page.set_snapshot(snapshot_object)
+        pending = self._pending_temporal_selection
+        if pending and self.reminders_page.select_commitment(pending):
+            self._pending_temporal_selection = None
+
+    def _on_temporal_commitment_changed(self, value: object) -> None:
+        if isinstance(value, TemporalCommitment):
+            self._pending_temporal_selection = value.commitment_id
+            self.reminders_page.set_status("提醒状态已更新。")
+        self.reminder_scheduler.wake()
+
+    def _on_temporal_outstanding_count_changed(self, count: int) -> None:
+        if self.tray is not None:
+            self.tray.set_reminder_outstanding_count(count)
+
+    def _submit_reminder_notification(
+        self,
+        title: str,
+        body: str,
+        payload: object,
+    ) -> bool:
+        if self.tray is None:
+            return False
+        return (
+            self.tray.notify_reminder(title, body, payload)
+            is NotificationSubmissionResult.SUBMITTED
+        )
+
+    def _on_reminder_notification_clicked(self, payload: object) -> None:
+        if not isinstance(payload, Mapping):
+            self.show_reminders_settings()
+            return
+        if payload.get("kind") == "aggregate":
+            self.show_reminders_settings()
+            self.reminders_page.show_outstanding()
+            return
+        identifier = payload.get("commitment_id")
+        self.show_reminders_settings(identifier if isinstance(identifier, str) else None)
+
+    def _temporal_followup_safe(self) -> bool:
+        proactive = self.settings.get("proactive", {})
+        if (
+            not isinstance(proactive, dict)
+            or proactive.get("mode") == "off"
+            or self._proactive_is_paused_today()
+            or not self.pet_window.isVisible()
+            or self.chat_panel.isVisible()
+            or self.settings_window.isVisible()
+            or self._provider_switch_pending
+            or self._pending_foreground_action is not None
+            or self.conversation.state is not ConversationState.IDLE
+            or self.conversation.is_active
+        ):
+            return False
+        now = self._clock().astimezone()
+        minute = now.hour * 60 + now.minute
+        if _minute_in_window(
+            minute,
+            int(proactive.get("quiet_start_minute", 0)),
+            int(proactive.get("quiet_end_minute", 0)),
+        ):
+            return False
+        try:
+            presence = self._presence_probe.snapshot()
+        except Exception:
+            return False
+        return not presence.session_locked and not presence.fullscreen
+
+    def _show_temporal_followup_bubble(self, commitment: TemporalCommitment) -> bool:
+        if self.reminder_bubble.isVisible() or not self._temporal_followup_safe():
+            return False
+        self._pending_temporal_followup_id = commitment.commitment_id
+        try:
+            self.reminder_bubble.show_message(
+                frozen_followup_message(commitment.current_version.content),
+                self.pet_window.geometry(),
+                [screen.availableGeometry() for screen in self.application.screens()],
+                timeout_ms=30_000,
+            )
+        except (RuntimeError, ValueError):
+            self._pending_temporal_followup_id = None
+            return False
+        return True
+
+    def _open_current_temporal_followup(self) -> None:
+        commitment_id = self._pending_temporal_followup_id
+        self._pending_temporal_followup_id = None
+        if commitment_id is not None:
+            self.data_service.open_temporal_followup(commitment_id)
+
+    def _clear_temporal_followup_bubble(self) -> None:
+        self._pending_temporal_followup_id = None
+
+    def _on_reminder_scheduler_status(self, category: str) -> None:
+        if category in {"storage_unavailable", "notification_unavailable"}:
+            self.logger.warning("Reminder delivery deferred category=%s", category)
+
     def _show_companion_cue_from_chat(self, cue_id: str) -> None:
         if self._exiting:
             return
@@ -2040,6 +2285,19 @@ class ApplicationController:
         self.data_service.operation_failed.connect(self._on_data_operation_failed)
         self.data_service.companion_cue_changed.connect(self._on_companion_cue_changed)
         self.data_service.companion_cue_opened.connect(lambda _cue_id: self.show_chat())
+        self.data_service.reminders_loaded.connect(self._on_reminders_loaded)
+        self.data_service.temporal_commitment_changed.connect(
+            self._on_temporal_commitment_changed
+        )
+        self.data_service.temporal_outstanding_count_changed.connect(
+            self._on_temporal_outstanding_count_changed
+        )
+        self.data_service.temporal_active_count_loaded.connect(
+            self._on_temporal_active_count_loaded
+        )
+        self.data_service.temporal_followup_opened.connect(
+            lambda _commitment_id: self.show_chat()
+        )
         self.data_service.index_rebuild_requested.connect(self._request_incremental_index_refresh)
         self.vector_index.status_changed.connect(self.memory_page.set_retrieval_status)
         self.vector_index.status_changed.connect(self._queue_vector_index_status)
@@ -2050,6 +2308,11 @@ class ApplicationController:
         self.chat_panel.new_conversation_requested.connect(self._request_new_conversation)
         self.chat_panel.history_requested.connect(self._show_history_settings_from_chat)
         self.chat_panel.companion_cue_requested.connect(self._show_companion_cue_from_chat)
+        self.chat_panel.temporal_save_requested.connect(self._save_temporal_commitment)
+        self.chat_panel.temporal_cancel_requested.connect(
+            self.data_service.cancel_temporal_commitment
+        )
+        self.chat_panel.temporal_open_requested.connect(self.show_reminders_settings)
         self.history_page.refresh_requested.connect(self.data_service.refresh_history)
         self.history_page.conversation_selected.connect(self._request_conversation_switch)
         self.history_page.new_conversation_requested.connect(self._request_new_conversation)
@@ -2111,6 +2374,8 @@ class ApplicationController:
         )
         self.memory_page.set_memory_enabled(self.data_service.memory_enabled)
         self.memory_page.set_deep_memory_enabled(self.data_service.deep_memory_enabled)
+        self.reminders_page.set_writable(self._data_writable)
+        self.data_service.refresh_reminders()
         self.data_service.refresh_memories()
         self._refresh_persona_summary()
         self._refresh_diagnostics()
@@ -2122,6 +2387,7 @@ class ApplicationController:
             self.data_service.run_memory_maintenance()
             self.memory_maintenance_timer.start()
             self.proactive_interactions.start()
+            self.reminder_scheduler.start()
         if snapshot_object.read_only:
             self.logger.warning(
                 "Local database opened read-only migration_error=%s",
@@ -2137,6 +2403,8 @@ class ApplicationController:
         self._data_writable = False
         self._pending_initial_message = None
         self.chat_panel.set_storage_availability(False, read_only=True)
+        self.reminders_page.set_writable(False)
+        self.reminder_scheduler.stop()
         self._sync_voice_availability()
         self._last_safe_error_category = "database_unavailable"
         self._refresh_diagnostics()
@@ -2144,6 +2412,11 @@ class ApplicationController:
 
     def _on_data_write_availability_changed(self, writable: bool) -> None:
         self._data_writable = writable
+        self.reminders_page.set_writable(writable)
+        if writable and self._data_initialized:
+            self.reminder_scheduler.start()
+        elif not writable:
+            self.reminder_scheduler.stop()
         if not writable and self.memory_jobs.is_accepting:
             # Fail closed without waiting on the Qt thread.  A migration or
             # persistence failure must not leave the scheduler polling writes
@@ -2234,6 +2507,10 @@ class ApplicationController:
     def _request_delete_conversation(self, conversation_id: str) -> None:
         if not self._can_change_conversation():
             return
+        self._pending_temporal_history_action = ("delete", conversation_id)
+        self.data_service.load_active_temporal_count(conversation_id)
+
+    def _execute_delete_conversation(self, conversation_id: str) -> None:
         self._start_conversation_change("delete", conversation_id)
         self.data_service.delete_conversation(
             conversation_id,
@@ -2245,8 +2522,50 @@ class ApplicationController:
     def _request_clear_history(self) -> None:
         if not self._can_change_conversation():
             return
+        self._pending_temporal_history_action = ("clear", None)
+        self.data_service.load_active_temporal_count(None)
+
+    def _execute_clear_history(self) -> None:
         self._start_conversation_change("clear")
         self.data_service.clear_conversations()
+
+    def _on_temporal_active_count_loaded(self, key: str, count: int) -> None:
+        pending = self._pending_temporal_history_action
+        if pending is None:
+            return
+        kind, conversation_id = pending
+        expected = "*" if conversation_id is None else conversation_id
+        if key != expected:
+            return
+        self._pending_temporal_history_action = None
+        reminder_note = (
+            f"\n\n仍有 {count} 项活动提醒与这些聊天关联；聊天删除后提醒会独立保留，"
+            "来源会变为已删除。"
+            if count
+            else "\n\n没有活动提醒与这些聊天关联。"
+        )
+        if kind == "delete" and conversation_id is not None:
+            question = "将永久删除该会话的全部聊天正文。"
+            title = "永久删除会话？"
+        else:
+            question = "将永久删除所有会话及聊天正文。"
+            title = "清空全部聊天？"
+        answer = QMessageBox.question(
+            self.settings_window,
+            title,
+            question
+            + "\n长期记忆不会随之删除，但相关来源将显示为已删除。"
+            + reminder_note
+            + "\n\n此操作无法撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if kind == "delete" and conversation_id is not None:
+            self._execute_delete_conversation(conversation_id)
+        else:
+            self._execute_clear_history()
 
     def _request_older_history_messages(self, conversation_id: str) -> None:
         if conversation_id == self.data_service.current_conversation_id:
@@ -2554,6 +2873,8 @@ class ApplicationController:
         )
         self._last_safe_error_category = "storage_error"
         self.proactive_interactions.persistence_failed(operation, category)
+        if operation == "count_active_reminders":
+            self._pending_temporal_history_action = None
         if operation == "clear_memories":
             self.deep_memory_jobs.resume()
             self.memory_jobs.resume()
@@ -2581,7 +2902,24 @@ class ApplicationController:
             self.chat_panel.set_status(message, kind="error")
         if failed_pending_change:
             self.data_service.refresh_history()
-        if operation.startswith("memory") or operation in {
+        temporal_operations = {
+            "create_temporal_draft",
+            "confirm_temporal_commitment",
+            "revise_temporal_commitment",
+            "cancel_temporal_commitment",
+            "complete_temporal_commitment",
+            "snooze_temporal_commitment",
+            "delete_temporal_commitment",
+            "scan_reminders",
+            "surface_reminders",
+            "open_temporal_followup",
+            "reminders",
+        }
+        if operation in temporal_operations:
+            self.reminders_page.set_status(message, error=True)
+            if operation in {"create_temporal_draft", "open_temporal_followup"}:
+                self.chat_panel.set_status(message, kind="error")
+        elif operation.startswith("memory") or operation in {
             "edit_memory",
             "pin_memory",
             "archive_memory",
@@ -3815,6 +4153,8 @@ class ApplicationController:
 
     def show_chat(self) -> None:
         self.proactive_interactions.dismiss_current()
+        self.reminder_bubble.dismiss()
+        self._pending_temporal_followup_id = None
         self.show_pet()
         self._reposition_chat_panel(force=True)
         self.chat_panel.show_and_focus()
@@ -3836,6 +4176,8 @@ class ApplicationController:
     def toggle_pet(self) -> None:
         if self.pet_window.isVisible():
             self.proactive_interactions.dismiss_current()
+            self.reminder_bubble.dismiss()
+            self._pending_temporal_followup_id = None
             self.hide_chat()
             self.pet_window.hide()
         else:
@@ -3844,6 +4186,8 @@ class ApplicationController:
     def _on_pet_visibility_changed(self, visible: bool) -> None:
         if not visible and hasattr(self, "proactive_interactions"):
             self.proactive_interactions.dismiss_current()
+            self.reminder_bubble.dismiss()
+            self._pending_temporal_followup_id = None
 
     def _import_attachment_paths(self, paths_object: object, source_object: object) -> None:
         if self._data_change_state != "idle":
@@ -4223,6 +4567,50 @@ class ApplicationController:
         if self._data_change_state != "idle":
             self.chat_panel.set_status("本地数据操作进行中，消息未发送。", kind="error")
             return False
+        if not action.attachments and action.input_modality is InputModality.TEXT:
+            if is_reminder_list_command(action.text) or is_reminder_cancel_command(action.text):
+                self.chat_panel.accept_local_submission()
+                self.hide_chat()
+                QTimer.singleShot(0, self.application, self.show_reminders_settings)
+                return True
+            parsed = parse_temporal_intent(action.text, now=self._clock())
+            if parsed.matched:
+                if not self._data_initialized:
+                    self._pending_initial_message = action
+                    self.chat_panel.set_status("正在初始化本地提醒数据，稍后会自动创建草稿。")
+                    return True
+                if not self._data_writable:
+                    self.chat_panel.set_status(
+                        "本地数据当前无法安全写入，提醒草稿未创建。",
+                        kind="error",
+                    )
+                    return False
+                if self._conversation_switch_pending:
+                    self.chat_panel.set_status("会话切换中，请稍候。", kind="error")
+                    return False
+                if parsed.kind is None:
+                    return False
+                accepted = self.data_service.create_temporal_chat_draft(
+                    action.text,
+                    TemporalDraftSpec(
+                        parsed.kind,
+                        parsed.content,
+                        parsed.due_at_utc,
+                        parsed.original_local_time,
+                        parsed.timezone_name,
+                        parsed.utc_offset_minutes,
+                        False,
+                    ),
+                )
+                if accepted:
+                    self.chat_panel.accept_local_submission()
+                    self.chat_panel.set_status(
+                        "已创建待确认提醒草稿；确认前不会触发。"
+                        if parsed.resolved
+                        else "时间信息不完整或有歧义，请在确认卡中编辑。",
+                        kind="success" if parsed.resolved else "neutral",
+                    )
+                return accepted
         if self._provider_switch_pending:
             self.chat_panel.set_status("对话模型切换中，请稍候。", kind="error")
             return False
@@ -4655,6 +5043,7 @@ class ApplicationController:
         self.chat_panel.hide()
         self.settings_window.hide()
         self.greeting_bubble.hide()
+        self.reminder_bubble.hide()
         self.pet_window.hide()
         if self.tray is not None:
             self.tray.close()
@@ -4670,6 +5059,7 @@ class ApplicationController:
             self.chat_panel.hide()
             self.settings_window.hide()
             self.greeting_bubble.hide()
+            self.reminder_bubble.hide()
             self.pet_window.hide()
             self.instance_guard.close()
 
@@ -4681,6 +5071,8 @@ class ApplicationController:
         self._provider_switch_pending = False
         self._provider_switch_generation += 1
         self.memory_maintenance_timer.stop()
+        self.reminder_scheduler.stop()
+        self.reminder_bubble.dismiss()
         self._proactive_pause_retry_timer.stop()
         self._foreground_lane_timer.stop()
         self._pending_foreground_action = None
@@ -4762,6 +5154,14 @@ class ApplicationController:
             and settings_clean
             and data_clean
         )
+
+
+def _minute_in_window(minute: int, start: int, end: int) -> bool:
+    if start == end:
+        return False
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
 
 
 def _install_persona_knowledge(

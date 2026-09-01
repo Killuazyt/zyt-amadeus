@@ -19,7 +19,7 @@ def make_window(qtbot) -> SettingsWindow:
     return window
 
 
-def test_settings_shell_has_p7g_navigation_and_embeds_provider_center(qtbot) -> None:
+def test_settings_shell_has_p7i_navigation_and_embeds_provider_center(qtbot) -> None:
     window = make_window(qtbot)
 
     assert window.page_names == (
@@ -31,10 +31,11 @@ def test_settings_shell_has_p7g_navigation_and_embeds_provider_center(qtbot) -> 
         "persona",
         "history",
         "memory",
+        "reminders",
         "proactive",
         "diagnostics",
     )
-    assert [window.navigation.item(index).text() for index in range(10)] == [
+    assert [window.navigation.item(index).text() for index in range(11)] == [
         "常规",
         "桌宠",
         "模型提供商",
@@ -43,15 +44,17 @@ def test_settings_shell_has_p7g_navigation_and_embeds_provider_center(qtbot) -> 
         "角色",
         "聊天历史",
         "长期记忆",
+        "提醒",
         "主动互动",
         "诊断",
     ]
-    assert window.stack.count() == 10
+    assert window.stack.count() == 11
     assert window.stack.widget(2) is window.model_page
     assert window.stack.widget(3) is window.voice_page
     assert window.stack.widget(4) is window.visual_page
     assert window.stack.widget(6) is window.history_page
     assert window.stack.widget(7) is window.memory_page
+    assert window.stack.widget(8) is window.reminders_page
     assert window.model_page.windowType() == Qt.WindowType.Widget
     assert window.model_page.close_button.isHidden()
     assert not window.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)

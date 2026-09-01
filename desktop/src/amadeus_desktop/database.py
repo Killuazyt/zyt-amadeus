@@ -1449,6 +1449,11 @@ _REQUIRED_TRIGGER_SQL_MARKERS = {
         "before update on temporal_commitment_audit_events",
         "raise(abort, 'temporal commitment audit events are immutable')",
     ),
+    "temporal_commitments_audit_delete": (
+        "before delete on temporal_commitments",
+        "insert into temporal_commitment_audit_events",
+        "'content_and_sources_removed'",
+    ),
 }
 _REQUIRED_PARTIAL_INDEX_SQL_MARKERS = {
     "memory_embedding_one_active_idx": (
@@ -1491,6 +1496,30 @@ _REQUIRED_INDEX_SQL_MARKERS = {
     "proactive_events_profile_date_idx": (
         "create index",
         "on proactive_events(profile_id, local_date, displayed_at)",
+    ),
+    "temporal_commitments_due_idx": (
+        "create index",
+        "on temporal_commitments(profile_id, status, updated_at, id)",
+    ),
+    "temporal_commitment_versions_due_idx": (
+        "create index",
+        "on temporal_commitment_versions(due_at_utc, commitment_id)",
+    ),
+    "temporal_commitments_source_conversation_idx": (
+        "create index",
+        "on temporal_commitments(source_conversation_id, status)",
+    ),
+    "temporal_commitment_audit_profile_time_idx": (
+        "create index",
+        "on temporal_commitment_audit_events(profile_id, occurred_at desc)",
+    ),
+    "temporal_commitment_audit_commitment_time_idx": (
+        "create index",
+        "on temporal_commitment_audit_events(commitment_id, occurred_at desc)",
+    ),
+    "messages_temporal_commitment_idx": (
+        "create index",
+        "on messages(temporal_commitment_id)",
     ),
 }
 _REQUIRED_COLUMNS = {

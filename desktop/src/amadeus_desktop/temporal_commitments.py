@@ -40,6 +40,13 @@ OUTSTANDING_TEMPORAL_STATUSES = (
 )
 
 
+def frozen_followup_message(content: str) -> str:
+    """Return the provider-free Kurisu companion line frozen at delivery time."""
+
+    normalized = " ".join(str(content).strip().split())
+    return f"喂，关于“{normalized}”——所以，做完了吗？"
+
+
 @dataclass(frozen=True, slots=True)
 class TemporalDraftSpec:
     kind: TemporalCommitmentKind
@@ -56,6 +63,7 @@ class TemporalDueSnapshot:
     due: tuple[TemporalCommitment, ...]
     next_due_at_utc: datetime | None
     outstanding_count: int
+    became_due: tuple[TemporalCommitment, ...] = ()
 
 
 class TemporalCommitmentStore:
@@ -440,6 +448,7 @@ class TemporalCommitmentStore:
     def scan_due(self, *, now: datetime | None = None) -> TemporalDueSnapshot:
         current = _aware_utc(now or self._clock())
         encoded_now = encode_utc(current)
+        changed_ids: list[str] = []
         with self._database.transaction() as connection:
             rows = connection.execute(
                 """
@@ -453,7 +462,7 @@ class TemporalCommitmentStore:
                 (DEFAULT_PROFILE_ID, encoded_now),
             ).fetchall()
             for row in rows:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE temporal_commitments
                     SET status = 'due', due_detected_at = COALESCE(due_detected_at, ?),
@@ -462,6 +471,9 @@ class TemporalCommitmentStore:
                     """,
                     (encoded_now, encoded_now, row["id"], row["current_version_id"]),
                 )
+                if cursor.rowcount != 1:
+                    continue
+                changed_ids.append(str(row["id"]))
                 self._insert_audit(
                     connection,
                     str(row["id"]),
@@ -486,6 +498,7 @@ class TemporalCommitmentStore:
             due,
             decode_utc(None if next_row is None else next_row["due_at"]),
             self.outstanding_count(),
+            tuple(self.get(identifier) for identifier in changed_ids),
         )
 
     def mark_surfaced(
@@ -594,7 +607,7 @@ class TemporalCommitmentStore:
                     message_id,
                     conversation_id,
                     f"temporal-followup:{commitment_id}:{message_id}",
-                    commitment.current_version.content,
+                    frozen_followup_message(commitment.current_version.content),
                     now,
                     now,
                     now,

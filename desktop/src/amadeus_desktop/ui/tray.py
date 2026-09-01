@@ -1,13 +1,20 @@
-"""P6 system tray menu and state synchronization."""
+"""P7I system tray menu, reminder notifications, and state synchronization."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+
+class NotificationSubmissionResult(StrEnum):
+    SUBMITTED = "submitted"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
 
 
 def create_app_icon() -> QIcon:
@@ -87,7 +94,7 @@ class TrayController(QObject):
         self.launch_at_login_action = self._checkable_action("开机启动")
         self.exit_action = self._menu.addAction("退出")
 
-        # The old action attribute is retained as a strict alias, not a ninth item.
+        # The old action attribute is retained as a strict alias, not a tenth item.
         self.model_settings_action = self.settings_action
 
         self._tray = system_tray_factory(create_app_icon(), self)
@@ -148,11 +155,16 @@ class TrayController(QObject):
             f"提醒（{normalized}）…" if normalized else "提醒…"
         )
 
-    def notify_reminder(self, title: str, body: str, payload: object) -> bool:
+    def notify_reminder(
+        self,
+        title: str,
+        body: str,
+        payload: object,
+    ) -> NotificationSubmissionResult:
         """Submit one privacy-safe tray notification and retain its click target."""
 
         if self._closed or not self._tray.isVisible():
-            return False
+            return NotificationSubmissionResult.UNAVAILABLE
         try:
             self._notification_payload = payload
             self._tray.showMessage(
@@ -161,10 +173,10 @@ class TrayController(QObject):
                 QSystemTrayIcon.MessageIcon.Information,
                 10_000,
             )
-        except RuntimeError:
+        except (RuntimeError, TypeError):
             self._notification_payload = None
-            return False
-        return True
+            return NotificationSubmissionResult.FAILED
+        return NotificationSubmissionResult.SUBMITTED
 
     def apply_state(
         self,

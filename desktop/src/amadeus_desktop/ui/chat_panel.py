@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import (
-    QEvent,
     QDate,
     QDateTime,
+    QEvent,
     QRect,
     QSignalBlocker,
     QSize,
@@ -39,8 +39,8 @@ from PySide6.QtGui import (
     QTextOption,
 )
 from PySide6.QtWidgets import (
-    QComboBox,
     QCheckBox,
+    QComboBox,
     QDateTimeEdit,
     QFileDialog,
     QFrame,
@@ -1117,6 +1117,23 @@ class ChatPanel(QWidget):
             self._pending_send_attachments = ()
         self._sync_retry_enabled()
         self._sync_conversation_controls()
+        self._sync_action_enabled()
+
+    def accept_local_submission(self) -> None:
+        """Clear a composer submission accepted by a provider-free local action."""
+
+        if (
+            self._pending_send_text is not None
+            and self.input.toPlainText() == self._pending_send_text
+        ):
+            self.input.clear()
+            self.clear_draft_attachments()
+            if self._current_conversation_id is not None:
+                self._conversation_drafts.pop(self._current_conversation_id, None)
+                self._conversation_attachment_drafts.pop(self._current_conversation_id, None)
+        self._send_pending = False
+        self._pending_send_text = None
+        self._pending_send_attachments = ()
         self._sync_action_enabled()
 
     def set_status(self, text: str, *, kind: str = "neutral") -> None:

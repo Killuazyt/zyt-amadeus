@@ -145,6 +145,7 @@ def _inspect(
     if basename in {
         "amadeus-chat-export.json",
         "amadeus-memory-export.json",
+        "amadeus-reminder-export.json",
     } or (suffix == ".json" and _is_local_data_export(payload)):
         violations["local_data_export"] += 1
     if basename == ".env" or basename.startswith(".env."):
@@ -238,9 +239,11 @@ def _is_local_data_export(payload: bytes) -> bool:
         "amadeus-chat-export/v1",
         "amadeus-chat-export/v2",
         "amadeus-chat-export/v3",
+        "amadeus-chat-export/v4",
         "amadeus-memory-export/v1",
         "amadeus-memory-export/v2",
         "amadeus-memory-export/v3",
+        "amadeus-reminder-export/v1",
     }
 
 

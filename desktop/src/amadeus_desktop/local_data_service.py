@@ -1471,6 +1471,15 @@ class LocalDataService(QObject):
             return False
 
         def completed(snapshot: TemporalDueSnapshot) -> None:
+            for commitment in snapshot.became_due:
+                self.temporal_commitment_changed.emit(commitment)
+            if snapshot.became_due:
+                self.refresh_reminders()
+                if self._current_conversation_id is not None:
+                    self._load_conversation(
+                        self._current_conversation_id,
+                        source_message_id=None,
+                    )
             self.temporal_due_scanned.emit(snapshot)
             self.temporal_outstanding_count_changed.emit(snapshot.outstanding_count)
 
@@ -1499,6 +1508,11 @@ class LocalDataService(QObject):
             for commitment in commitments:
                 self.temporal_commitment_changed.emit(commitment)
             self.refresh_reminders()
+            if commitments and self._current_conversation_id is not None:
+                self._load_conversation(
+                    self._current_conversation_id,
+                    source_message_id=None,
+                )
 
         request_id = self.runtime.submit(
             lambda stores: stores.temporal_commitments.mark_surfaced(

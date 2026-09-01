@@ -311,6 +311,9 @@ def test_versioned_exports_are_atomic_utf8_and_do_not_read_settings_or_credentia
         "companion_cue_sources",
         "proactive_events",
         "companion_cue_audit_events",
+        "temporal_commitments",
+        "temporal_versions",
+        "temporal_audit_events",
     }
     assert set(memory) == {
         "format",
@@ -889,7 +892,7 @@ def test_old_v5_database_and_v8_settings_backup_restores_then_migrates_to_p7f(
             backup_dir=paths.directory(AppDirectory.BACKUPS),
         ).open()
         try:
-            assert migrated_database.schema_version == 7
+            assert migrated_database.schema_version == 8
             assert "memory_reflections" in {
                 row[0]
                 for row in migrated_database.connection.execute(

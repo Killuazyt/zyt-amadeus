@@ -247,6 +247,11 @@ class RemindersPage(QWidget):
         if index >= 0:
             self.filter.setCurrentIndex(index)
 
+    def show_all(self) -> None:
+        index = self.filter.findData("")
+        if index >= 0:
+            self.filter.setCurrentIndex(index)
+
     def set_status(self, text: str, *, error: bool = False) -> None:
         self.status.setText(str(text))
         self.status.setStyleSheet("color: #b91c1c;" if error else "color: #475569;")

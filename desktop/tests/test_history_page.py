@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QInputDialog, QMessageBox
+from PySide6.QtWidgets import QInputDialog
 
 from amadeus_desktop.ui.history_page import HistoryPage
 
@@ -131,33 +131,16 @@ def test_rename_trims_title_and_ignores_cancel_or_unchanged(monkeypatch, qtbot) 
     assert renamed == [("c1", "新名称")]
 
 
-def test_delete_and_clear_require_explicit_confirmation(monkeypatch, qtbot) -> None:
+def test_delete_and_clear_delegate_confirmation_to_controller(qtbot) -> None:
     page = make_page(qtbot)
     page.set_conversations([{"id": "c1", "title": "私人会话"}])
     deleted: list[str] = []
     cleared: list[bool] = []
-    prompts: list[str] = []
     page.delete_conversation_requested.connect(deleted.append)
     page.clear_history_requested.connect(lambda: cleared.append(True))
 
-    def decline(*args, **kwargs):
-        prompts.append(str(args[2]))
-        return QMessageBox.StandardButton.No
-
-    monkeypatch.setattr(QMessageBox, "question", decline)
-    page.delete_button.click()
-    page.clear_button.click()
-    assert deleted == []
-    assert cleared == []
-
-    monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
-    )
     page.delete_button.click()
     page.clear_button.click()
 
     assert deleted == ["c1"]
     assert cleared == [True]
-    assert all("长期记忆" in prompt and "无法撤销" in prompt for prompt in prompts)

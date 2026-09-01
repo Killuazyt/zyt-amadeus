@@ -191,6 +191,7 @@ def test_scanner_opens_p6_backup_and_extension_only_pet_archives(tmp_path) -> No
 def test_scanner_rejects_default_exports_and_local_persona_greetings(tmp_path) -> None:
     (tmp_path / "amadeus-chat-export.json").write_text("{}", encoding="utf-8")
     (tmp_path / "amadeus-memory-export.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "amadeus-reminder-export.json").write_text("{}", encoding="utf-8")
     (tmp_path / "renamed.json").write_text(
         json.dumps({"format": "amadeus-chat-export/v1", "conversations": []}),
         encoding="utf-8",
@@ -204,11 +205,15 @@ def test_scanner_rejects_default_exports_and_local_persona_greetings(tmp_path) -
         encoding="utf-8",
     )
     (tmp_path / "renamed-v3.json").write_text(
-        json.dumps({"format": "amadeus-chat-export/v3", "conversations": []}),
+        json.dumps({"format": "amadeus-chat-export/v4", "conversations": []}),
         encoding="utf-8",
     )
     (tmp_path / "renamed-memory-v3.json").write_text(
         json.dumps({"format": "amadeus-memory-export/v3", "profiles": []}),
+        encoding="utf-8",
+    )
+    (tmp_path / "renamed-reminder-v1.json").write_text(
+        json.dumps({"format": "amadeus-reminder-export/v1", "commitments": []}),
         encoding="utf-8",
     )
     greetings = tmp_path / "personas" / "kurisu" / "greetings.json"
@@ -219,6 +224,6 @@ def test_scanner_rejects_default_exports_and_local_persona_greetings(tmp_path) -
 
     assert exit_code == 1
     assert result["violations_by_category"] == {
-        "local_data_export": 7,
+        "local_data_export": 9,
         "private_persona_data": 1,
     }
